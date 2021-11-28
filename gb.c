@@ -1792,642 +1792,642 @@ void exec_ext_op(byte opcode){
 
     // RES 0 of B
     case 0x80:
-      B = bit_clear(B, (byte)0);
+      B = bit_clear(B, 0);
       break;
 
     // RES 0 of C
     case 0x81:
-      C = bit_clear(C, (byte)0);
+      C = bit_clear(C, 0);
       break;
 
     // RES 0 of D
     case 0x82:
-      D = bit_clear(D, (byte)0);
+      D = bit_clear(D, 0);
       break;
 
     // RES 0 of E
     case 0x83:
-      E = bit_clear(E, (byte)0);
+      E = bit_clear(E, 0);
       break;
 
     // RES 0 of H
     case 0x84:
-      H = bit_clear(H, (byte)0);
+      H = bit_clear(H, 0);
       break;
 
     // RES 0 of L
     case 0x85:
-      L = bit_clear(L, (byte)0);
+      L = bit_clear(L, 0);
       break;
 
     // RES 0 of (HL)
     case 0x86:
-      cpu_write(HL(), bit_clear(cpu_read(HL()), (byte)0));
+      cpu_write(HL(), bit_clear(cpu_read(HL()), 0));
       break;
 
     // RES 0 of A
     case 0x87:
-      A = bit_clear(A, (byte)0);
+      A = bit_clear(A, 0);
       break;
 
     // RES 1 of B
     case 0x88:
-      B = bit_clear(B, (byte)1);
+      B = bit_clear(B, 1);
       break;
 
     // RES 1 of C
     case 0x89:
-      C = bit_clear(C, (byte)1);
+      C = bit_clear(C, 1);
       break;
 
     // RES 1 of D
     case 0x8a:
-      D = bit_clear(D, (byte)1);
+      D = bit_clear(D, 1);
       break;
 
     // RES 1 of E
     case 0x8b:
-      E = bit_clear(E, (byte)1);
+      E = bit_clear(E, 1);
       break;
 
     // RES 1 of H
     case 0x8c:
-      H = bit_clear(H, (byte)1);
+      H = bit_clear(H, 1);
       break;
 
     // RES 1 of L
     case 0x8d:
-      L = bit_clear(L, (byte)1);
+      L = bit_clear(L, 1);
       break;
 
     // RES 1 of (HL)
     case 0x8e:
-      cpu_write(HL(), bit_clear(cpu_read(HL()), (byte)1));
+      cpu_write(HL(), bit_clear(cpu_read(HL()), 1));
       break;
 
     // RES 1 of A
     case 0x8f:
-      A = bit_clear(A, (byte)1);
+      A = bit_clear(A, 1);
       break;
 
     // RES 2 of B
     case 0x90:
-      B = bit_clear(B, (byte)2);
+      B = bit_clear(B, 2);
       break;
 
     // RES 2 of C
     case 0x91:
-      C = bit_clear(C, (byte)2);
+      C = bit_clear(C, 2);
       break;
 
     // RES 2 of D
     case 0x92:
-      D = bit_clear(D, (byte)2);
+      D = bit_clear(D, 2);
       break;
 
     // RES 2 of E
     case 0x93:
-      E = bit_clear(E, (byte)2);
+      E = bit_clear(E, 2);
       break;
 
     // RES 2 of H
     case 0x94:
-      H = bit_clear(H, (byte)2);
+      H = bit_clear(H, 2);
       break;
 
     // RES 2 of L
     case 0x95:
-      L = bit_clear(L, (byte)2);
+      L = bit_clear(L, 2);
       break;
 
     // RES 2 of (HL)
     case 0x96:
-      cpu_write(HL(), bit_clear(cpu_read(HL()), (byte)2));
+      cpu_write(HL(), bit_clear(cpu_read(HL()), 2));
       break;
 
     // RES 2 of A
     case 0x97:
-      A = bit_clear(A, (byte)2);
+      A = bit_clear(A, 2);
       break;
 
     // RES 3 of B
     case 0x98:
-      B = bit_clear(B, (byte)3);
+      B = bit_clear(B, 3);
       break;
 
     // RES 3 of C
     case 0x99:
-      C = bit_clear(C, (byte)3);
+      C = bit_clear(C, 3);
       break;
 
     // RES 3 of D
     case 0x9a:
-      D = bit_clear(D, (byte)3);
+      D = bit_clear(D, 3);
       break;
 
     // RES 3 of E
     case 0x9b:
-      E = bit_clear(E, (byte)3);
+      E = bit_clear(E, 3);
       break;
 
     // RES 3 of H
     case 0x9c:
-      H = bit_clear(H, (byte)3);
+      H = bit_clear(H, 3);
       break;
 
     // RES 3 of L
     case 0x9d:
-      L = bit_clear(L, (byte)3);
+      L = bit_clear(L, 3);
       break;
 
     // RES 3 of (HL)
     case 0x9e:
-      cpu_write(HL(), bit_clear(cpu_read(HL()), (byte)3));
+      cpu_write(HL(), bit_clear(cpu_read(HL()), 3));
       break;
 
     // RES 3 of A
     case 0x9f:
-      A = bit_clear(A, (byte)3);
+      A = bit_clear(A, 3);
       break;
 
     // RES 4 of B
     case 0xa0:
-      B = bit_clear(B, (byte)4);
+      B = bit_clear(B, 4);
       break;
 
     // RES 4 of C
     case 0xa1:
-      C = bit_clear(C, (byte)4);
+      C = bit_clear(C, 4);
       break;
 
     // RES 4 of D
     case 0xa2:
-      D = bit_clear(D, (byte)4);
+      D = bit_clear(D, 4);
       break;
 
     // RES 4 of E
     case 0xa3:
-      E = bit_clear(E, (byte)4);
+      E = bit_clear(E, 4);
       break;
 
     // RES 4 of H
     case 0xa4:
-      H = bit_clear(H, (byte)4);
+      H = bit_clear(H, 4);
       break;
 
     // RES 4 of L
     case 0xa5:
-      L = bit_clear(L, (byte)4);
+      L = bit_clear(L, 4);
       break;
 
     // RES 4 of (HL)
     case 0xa6:
-      cpu_write(HL(), bit_clear(cpu_read(HL()), (byte)4));
+      cpu_write(HL(), bit_clear(cpu_read(HL()), 4));
       break;
 
     // RES 4 of A
     case 0xa7:
-      A = bit_clear(A, (byte)4);
+      A = bit_clear(A, 4);
       break;
 
     // RES 5 of B
     case 0xa8:
-      B = bit_clear(B, (byte)5);
+      B = bit_clear(B, 5);
       break;
 
     // RES 5 of C
     case 0xa9:
-      C = bit_clear(C, (byte)5);
+      C = bit_clear(C, 5);
       break;
 
     // RES 5 of D
     case 0xaa:
-      D = bit_clear(D, (byte)5);
+      D = bit_clear(D, 5);
       break;
 
     // RES 5 of E
     case 0xab:
-      E = bit_clear(E, (byte)5);
+      E = bit_clear(E, 5);
       break;
 
     // RES 5 of H
     case 0xac:
-      H = bit_clear(H, (byte)5);
+      H = bit_clear(H, 5);
       break;
 
     // RES 5 of L
     case 0xad:
-      L = bit_clear(L, (byte)5);
+      L = bit_clear(L, 5);
       break;
 
     // RES 5 of (HL)
     case 0xae:
-      cpu_write(HL(), bit_clear(cpu_read(HL()), (byte)5));
+      cpu_write(HL(), bit_clear(cpu_read(HL()), 5));
       break;
 
     // RES 5 of A
     case 0xaf:
-      A = bit_clear(A, (byte)5);
+      A = bit_clear(A, 5);
       break;
 
     // RES 6 of B
     case 0xb0:
-      B = bit_clear(B, (byte)6);
+      B = bit_clear(B, 6);
       break;
 
     // RES 6 of C
     case 0xb1:
-      C = bit_clear(C, (byte)6);
+      C = bit_clear(C, 6);
       break;
 
     // RES 6 of D
     case 0xb2:
-      D = bit_clear(D, (byte)6);
+      D = bit_clear(D, 6);
       break;
 
     // RES 6 of E
     case 0xb3:
-      E = bit_clear(E, (byte)6);
+      E = bit_clear(E, 6);
       break;
 
     // RES 6 of H
     case 0xb4:
-      H = bit_clear(H, (byte)6);
+      H = bit_clear(H, 6);
       break;
 
     // RES 6 of L
     case 0xb5:
-      L = bit_clear(L, (byte)6);
+      L = bit_clear(L, 6);
       break;
 
     // RES 6 of (HL)
     case 0xb6:
-      cpu_write(HL(), bit_clear(cpu_read(HL()), (byte)6));
+      cpu_write(HL(), bit_clear(cpu_read(HL()), 6));
       break;
 
     // RES 6 of A
     case 0xb7:
-      A = bit_clear(A, (byte)6);
+      A = bit_clear(A, 6);
       break;
 
     // RES 7 of B
     case 0xb8:
-      B = bit_clear(B, (byte)7);
+      B = bit_clear(B, 7);
       break;
 
     // RES 7 of C
     case 0xb9:
-      C = bit_clear(C, (byte)7);
+      C = bit_clear(C, 7);
       break;
 
     // RES 7 of D
     case 0xba:
-      D = bit_clear(D, (byte)7);
+      D = bit_clear(D, 7);
       break;
 
     // RES 7 of E
     case 0xbb:
-      E = bit_clear(E, (byte)7);
+      E = bit_clear(E, 7);
       break;
 
     // RES 7 of H
     case 0xbc:
-      H = bit_clear(H, (byte)7);
+      H = bit_clear(H, 7);
       break;
 
     // RES 7 of L
     case 0xbd:
-      L = bit_clear(L, (byte)7);
+      L = bit_clear(L, 7);
       break;
 
     // RES 7 of (HL)
     case 0xbe:
-      cpu_write(HL(), bit_clear(cpu_read(HL()), (byte)7));
+      cpu_write(HL(), bit_clear(cpu_read(HL()), 7));
       break;
 
     // RES 7 of A
     case 0xbf:
-      A = bit_clear(A, (byte)7);
+      A = bit_clear(A, 7);
       break;
 
     // SET 0 of B
     case 0xc0:
-      B = bit_set(B, (byte)0);
+      B = bit_set(B, 0);
       break;
 
     // SET 0 of C
     case 0xc1:
-      C = bit_set(C, (byte)0);
+      C = bit_set(C, 0);
       break;
 
     // SET 0 of D
     case 0xc2:
-      D = bit_set(D, (byte)0);
+      D = bit_set(D, 0);
       break;
 
     // SET 0 of E
     case 0xc3:
-      E = bit_set(E, (byte)0);
+      E = bit_set(E, 0);
       break;
 
     // SET 0 of H
     case 0xc4:
-      H = bit_set(H, (byte)0);
+      H = bit_set(H, 0);
       break;
 
     // SET 0 of L
     case 0xc5:
-      L = bit_set(L, (byte)0);
+      L = bit_set(L, 0);
       break;
 
     // SET 0 of (HL)
     case 0xc6:
-      cpu_write(HL(), bit_set(cpu_read(HL()), (byte)0));
+      cpu_write(HL(), bit_set(cpu_read(HL()), 0));
       break;
 
     // SET 0 of A
     case 0xc7:
-      A = bit_set(A, (byte)0);
+      A = bit_set(A, 0);
       break;
 
     // SET 1 of B
     case 0xc8:
-      B = bit_set(B, (byte)1);
+      B = bit_set(B, 1);
       break;
 
     // SET 1 of C
     case 0xc9:
-      C = bit_set(C, (byte)1);
+      C = bit_set(C, 1);
       break;
 
     // SET 1 of D
     case 0xca:
-      D = bit_set(D, (byte)1);
+      D = bit_set(D, 1);
       break;
 
     // SET 1 of E
     case 0xcb:
-      E = bit_set(E, (byte)1);
+      E = bit_set(E, 1);
       break;
 
     // SET 1 of H
     case 0xcc:
-      H = bit_set(H, (byte)1);
+      H = bit_set(H, 1);
       break;
 
     // SET 1 of L
     case 0xcd:
-      L = bit_set(L, (byte)1);
+      L = bit_set(L, 1);
       break;
 
     // SET 1 of (HL)
     case 0xce:
-      cpu_write(HL(), bit_set(cpu_read(HL()), (byte)1));
+      cpu_write(HL(), bit_set(cpu_read(HL()), 1));
       break;
 
     // SET 1 of A
     case 0xcf:
-      A = bit_set(A, (byte)1);
+      A = bit_set(A, 1);
       break;
 
     // SET 2 of B
     case 0xd0:
-      B = bit_set(B, (byte)2);
+      B = bit_set(B, 2);
       break;
 
     // SET 2 of C
     case 0xd1:
-      C = bit_set(C, (byte)2);
+      C = bit_set(C, 2);
       break;
 
     // SET 2 of D
     case 0xd2:
-      D = bit_set(D, (byte)2);
+      D = bit_set(D, 2);
       break;
 
     // SET 2 of E
     case 0xd3:
-      E = bit_set(E, (byte)2);
+      E = bit_set(E, 2);
       break;
 
     // SET 2 of H
     case 0xd4:
-      H = bit_set(H, (byte)2);
+      H = bit_set(H, 2);
       break;
 
     // SET 2 of L
     case 0xd5:
-      L = bit_set(L, (byte)2);
+      L = bit_set(L, 2);
       break;
 
     // SET 2 of (HL)
     case 0xd6:
-      cpu_write(HL(), bit_set(cpu_read(HL()), (byte)2));
+      cpu_write(HL(), bit_set(cpu_read(HL()), 2));
       break;
 
     // SET 2 of A
     case 0xd7:
-      A = bit_set(A, (byte)2);
+      A = bit_set(A, 2);
       break;
 
     // SET 3 of B
     case 0xd8:
-      B = bit_set(B, (byte)3);
+      B = bit_set(B, 3);
       break;
 
     // SET 3 of C
     case 0xd9:
-      C = bit_set(C, (byte)3);
+      C = bit_set(C, 3);
       break;
 
     // SET 3 of D
     case 0xda:
-      D = bit_set(D, (byte)3);
+      D = bit_set(D, 3);
       break;
 
     // SET 3 of E
     case 0xdb:
-      E = bit_set(E, (byte)3);
+      E = bit_set(E, 3);
       break;
 
     // SET 3 of H
     case 0xdc:
-      H = bit_set(H, (byte)3);
+      H = bit_set(H, 3);
       break;
 
     // SET 3 of L
     case 0xdd:
-      L = bit_set(L, (byte)3);
+      L = bit_set(L, 3);
       break;
 
     // SET 3 of (HL)
     case 0xde:
-      cpu_write(HL(), bit_set(cpu_read(HL()), (byte)3));
+      cpu_write(HL(), bit_set(cpu_read(HL()), 3));
       break;
 
     // SET 3 of A
     case 0xdf:
-      A = bit_set(A, (byte)3);
+      A = bit_set(A, 3);
       break;
 
     // SET 4 of B
     case 0xe0:
-      B = bit_set(B, (byte)4);
+      B = bit_set(B, 4);
       break;
 
     // SET 4 of C
     case 0xe1:
-      C = bit_set(C, (byte)4);
+      C = bit_set(C, 4);
       break;
 
     // SET 4 of D
     case 0xe2:
-      D = bit_set(D, (byte)4);
+      D = bit_set(D, 4);
       break;
 
     // SET 4 of E
     case 0xe3:
-      E = bit_set(E, (byte)4);
+      E = bit_set(E, 4);
       break;
 
     // SET 4 of H
     case 0xe4:
-      H = bit_set(H, (byte)4);
+      H = bit_set(H, 4);
       break;
 
     // SET 4 of L
     case 0xe5:
-      L = bit_set(L, (byte)4);
+      L = bit_set(L, 4);
       break;
 
     // SET 4 of (HL)
     case 0xe6:
-      cpu_write(HL(), bit_set(cpu_read(HL()), (byte)4));
+      cpu_write(HL(), bit_set(cpu_read(HL()), 4));
       break;
 
     // SET 4 of A
     case 0xe7:
-      A = bit_set(A, (byte)4);
+      A = bit_set(A, 4);
       break;
 
     // SET 5 of B
     case 0xe8:
-      B = bit_set(B, (byte)5);
+      B = bit_set(B, 5);
       break;
 
     // SET 5 of C
     case 0xe9:
-      C = bit_set(C, (byte)5);
+      C = bit_set(C, 5);
       break;
 
     // SET 5 of D
     case 0xea:
-      D = bit_set(D, (byte)5);
+      D = bit_set(D, 5);
       break;
 
     // SET 5 of E
     case 0xeb:
-      E = bit_set(E, (byte)5);
+      E = bit_set(E, 5);
       break;
 
     // SET 5 of H
     case 0xec:
-      H = bit_set(H, (byte)5);
+      H = bit_set(H, 5);
       break;
 
     // SET 5 of L
     case 0xed:
-      L = bit_set(L, (byte)5);
+      L = bit_set(L, 5);
       break;
 
     // SET 5 of (HL)
     case 0xee:
-      cpu_write(HL(), bit_set(cpu_read(HL()), (byte)5));
+      cpu_write(HL(), bit_set(cpu_read(HL()), 5));
       break;
 
     // SET 5 of A
     case 0xef:
-      A = bit_set(A, (byte)5);
+      A = bit_set(A, 5);
       break;
 
     // SET 6 of B
     case 0xf0:
-      B = bit_set(B, (byte)6);
+      B = bit_set(B, 6);
       break;
 
     // SET 6 of C
     case 0xf1:
-      C = bit_set(C, (byte)6);
+      C = bit_set(C, 6);
       break;
 
     // SET 6 of D
     case 0xf2:
-      D = bit_set(D, (byte)6);
+      D = bit_set(D, 6);
       break;
 
     // SET 6 of E
     case 0xf3:
-      E = bit_set(E, (byte)6);
+      E = bit_set(E, 6);
       break;
 
     // SET 6 of H
     case 0xf4:
-      H = bit_set(H, (byte)6);
+      H = bit_set(H, 6);
       break;
 
     // SET 6 of L
     case 0xf5:
-      L = bit_set(L, (byte)6);
+      L = bit_set(L, 6);
       break;
 
     // SET 6 of (HL)
     case 0xf6:
-      cpu_write(HL(), bit_set(cpu_read(HL()), (byte)6));
+      cpu_write(HL(), bit_set(cpu_read(HL()), 6));
       break;
 
     // SET 6 of A
     case 0xf7:
-      A = bit_set(A, (byte)6);
+      A = bit_set(A, 6);
       break;
 
     // SET 7 of B
     case 0xf8:
-      B = bit_set(B, (byte)7);
+      B = bit_set(B, 7);
       break;
 
     // SET 7 of C
     case 0xf9:
-      C = bit_set(C, (byte)7);
+      C = bit_set(C, 7);
       break;
 
     // SET 7 of D
     case 0xfa:
-      D = bit_set(D, (byte)7);
+      D = bit_set(D, 7);
       break;
 
     // SET 7 of E
     case 0xfb:
-      E = bit_set(E, (byte)7);
+      E = bit_set(E, 7);
       break;
 
     // SET 7 of H
     case 0xfc:
-      H = bit_set(H, (byte)7);
+      H = bit_set(H, 7);
       break;
 
     // SET 7 of L
     case 0xfd:
-      L = bit_set(L, (byte)7);
+      L = bit_set(L, 7);
       break;
 
     // SET 7 of (HL)
     case 0xfe:
-      cpu_write(HL(), bit_set(cpu_read(HL()), (byte)7));
+      cpu_write(HL(), bit_set(cpu_read(HL()), 7));
       break;
 
     // SET 7 of A
     case 0xff:
-      A = bit_set(A, (byte)7);
+      A = bit_set(A, 7);
       break;
 
 // END EX GENERATED
@@ -2447,7 +2447,7 @@ void exec_next(){
 
 //
 // SDL boilerplate
-// 
+//
 
 SDL_Window* window;
 SDL_Renderer* renderer;
@@ -2531,7 +2531,7 @@ void sdl_main_impl(void){
 
   SDL_Event event;
   while(run) {
-      while (SDL_PollEvent(&event)) {  
+      while (SDL_PollEvent(&event)) {
           if (event.type == SDL_QUIT) {
               printf("got quit event\n");
               run = false;

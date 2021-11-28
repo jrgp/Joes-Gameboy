@@ -365,13 +365,13 @@ for op, info in ops['cbprefixed'].items():
             genex.append("""
     // {mnemonic} {operand1} of {operand2}
     case {op}:
-      {operand2} = bit_clear({operand2}, (byte){operand1});
+      {operand2} = bit_clear({operand2}, {operand1});
       break;""".format(op=op, func=info['mnemonic'].lower().capitalize(), **info))
         elif info['operand2'] == '(HL)':
             genex.append("""
     // {mnemonic} {operand1} of {operand2}
     case {op}:
-      cpu_write(HL(), bit_clear(cpu_read(HL()), (byte){operand1}));
+      cpu_write(HL(), bit_clear(cpu_read(HL()), {operand1}));
       break;""".format(op=op, func=info['mnemonic'].lower().capitalize(), **info))
 
     elif info['mnemonic'] == 'SET':
@@ -379,13 +379,13 @@ for op, info in ops['cbprefixed'].items():
             genex.append("""
     // {mnemonic} {operand1} of {operand2}
     case {op}:
-      {operand2} = bit_set({operand2}, (byte){operand1});
+      {operand2} = bit_set({operand2}, {operand1});
       break;""".format(op=op, func=info['mnemonic'].lower().capitalize(), **info))
         elif info['operand2'] == '(HL)':
             genex.append("""
     // {mnemonic} {operand1} of {operand2}
     case {op}:
-      cpu_write(HL(), bit_set(cpu_read(HL()), (byte){operand1}));
+      cpu_write(HL(), bit_set(cpu_read(HL()), {operand1}));
       break;""".format(op=op, func=info['mnemonic'].lower().capitalize(), **info))
     elif info['mnemonic'] == 'RL':
         if len(info['operand1']) == 1:
