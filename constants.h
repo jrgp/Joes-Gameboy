@@ -1,0 +1,9 @@
+#define LCDC 0xFF40
+#define SCY 0xFF42
+#define SCX 0xFF43
+#define LY 0xFF44
+#define LYC 0xFF45
+#define WY 0xFF4A
+#define WX 0xFF4B
+#define BGP 0xFF47
+#define FPS 60
