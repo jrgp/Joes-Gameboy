@@ -20,7 +20,7 @@ byte VRAM[0xffff + 1];
 
 uint32_t *pixels;
 
-#define SET_PIXEL(x,y,c) pixels[(y * surface->w) + x] = c;
+#define set_pixel(x,y,c) pixels[(y * surface->w) + x] = c;
 
 void gpu_init(){
     memset(VRAM, 0, 0xffff + 1);
@@ -33,6 +33,10 @@ byte gpu_read(int pos){
 
 void gpu_write(int pos, byte data){
     VRAM[pos] = data;
+}
+
+void gpu_drawline(byte ly){
+
 }
 
 void gpu_step(int _cycles){
@@ -49,9 +53,8 @@ void gpu_step(int _cycles){
             } else if (ly > 153) {
                 VRAM[LY] = 0;
             } else if (ly < 144) {
-                // draw line
-                // System.out.println("Would draw line "+lyint);
-                //drawLine(lyint);
+                // draw scanline
+                gpu_drawline(ly);
             }
         }
     }

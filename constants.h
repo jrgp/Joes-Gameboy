@@ -6,4 +6,12 @@
 #define WY 0xFF4A
 #define WX 0xFF4B
 #define BGP 0xFF47
+
 #define FPS 60
+
+uint32_t pallette[4] = {
+    0xffffff,
+    0xaaaaaa,
+    0x555555,
+    0,
+};
