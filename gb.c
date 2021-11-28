@@ -72,24 +72,23 @@ void gpu_write(int pos, byte data){
 }
 
 uint32_t gpu_pallete_color(byte number, int paletteIndex) {
-	byte config = VRAM[paletteIndex];
-	byte resultindex = 0;
+    byte config = VRAM[paletteIndex];
+    byte resultindex = 0;
 
-	byte b1 = number * 2;
-	byte b2 = (number * 2) + 1;
+    byte b1 = number * 2;
+    byte b2 = (number * 2) + 1;
 
-  if(bit_check(config, b1)){
-		resultindex |= (1 << 1);
-	}
+    if(bit_check(config, b1)){
+        resultindex = bit_set(resultindex, 1);
+    }
 
-  if(bit_check(config, b2)){
-		resultindex |= (1 << 0);
-	}
+    if(bit_check(config, b2)){
+        resultindex = bit_set(resultindex, 0);
+    }
 
+    uint32_t color = pallette[resultindex];
 
-	uint32_t color = pallette[resultindex];
-
-  return color;
+    return color;
 }
 
 void gpu_draw_bg(byte ly){
@@ -2515,12 +2514,12 @@ bool frame(){
 
     sdl_display();
 
-		uint32_t diff = SDL_GetTicks() - start_ticks;
+    uint32_t diff = SDL_GetTicks() - start_ticks;
 
-		if (diff < 1000/FPS) {
-			uint32_t nap_time = (1000 / FPS) - diff;
-			SDL_Delay(nap_time);
-		}
+    if (diff < 1000/FPS) {
+        uint32_t nap_time = (1000 / FPS) - diff;
+        SDL_Delay(nap_time);
+    }
 
     return true;
 }
