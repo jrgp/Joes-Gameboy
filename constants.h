@@ -15,3 +15,9 @@ uint32_t pallette[4] = {
     0x555555,
     0,
 };
+
+#define VIEWPORT_WIDTH 160
+#define VIEWPORT_HEIGHT 144
+
+#define WIDTH 256
+#define HEIGHT 256

@@ -43,14 +43,12 @@ void gpu_parse_control(byte control){
         gpu_control.BgWindowTileData = 0x8800;
         gpu_control.BgTileDataSigned = true;
     }
-    printf("bg tile map %x\n", gpu_control.BgWindowTileData);
 
     if(bit_check(control, 3)){
       gpu_control.bgtilemap = 0x9C00;
     } else {
       gpu_control.bgtilemap = 0x9800;
     }
-    printf("bgtilemap: %x\n", gpu_control.bgtilemap);
 }
 
 #define set_pixel(x,y,c) pixels[(y * surface->w) + x] = c;
@@ -102,38 +100,25 @@ void gpu_draw_bg(byte ly){
             // Start of tile data
             int start = gpu_control.BgWindowTileData + (16 * tileIndex);
 
-            if(tileIndex>0) {
-                #if 0
-                printf("got tile index from map  %x\n", tileIndex);
+            byte high = VRAM[start + ((ly % 8)*2)];
+            byte low = VRAM[start + ((ly % 8)*2)+1];
+            byte x = 7;
+            for (byte i = 0; i < 8; i++) {
+              byte wat = 0;
+              if(bit_check(low, i)){
+                wat |= (1 << 1);
+              }
+              if(bit_check(high, i)){
+                wat |= (1 << 0);
+              }
 
-                // Debug dump maybe?
-                printf("starting at %x\n", start);
-                for (int i = 0; i<16;i++) {
-                    printf("%02x ", VRAM[start+i]);
-                }
-                printf("\n");
-                #endif
-
-                byte high = VRAM[start + ((ly % 8)*2)];
-                byte low = VRAM[start + ((ly % 8)*2)+1];
-                byte x = 7;
-                for (byte i = 0; i < 8; i++) {
-                  byte wat = 0;
-                  if(bit_check(low, i)){
-                    wat |= (1 << 1);
-                  }
-                  if(bit_check(high, i)){
-                    wat |= (1 << 0);
-                  }
-
-                  set_pixel((tile*8)+x, ly, gpu_pallete_color(wat, BGP));
-                  x--;
-                }
+              set_pixel((tile*8)+x, ly, gpu_pallete_color(wat, BGP));
+              x--;
             }
         }
 
     } else {
-        for (int i = 0; i<256; i++) {
+        for (int i = 0; i<WIDTH; i++) {
             set_pixel(i, ly, 0xffffff);
         }
     }
@@ -2469,7 +2454,7 @@ SDL_Renderer* renderer;
 SDL_Texture* texture;
 
 void sdl_init(){
-    window = SDL_CreateWindow("Joe's GB", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 256, 256, SDL_WINDOW_SHOWN);
+    window = SDL_CreateWindow("Joe's GB", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, SDL_WINDOW_SHOWN);
 
     if (window == NULL) {
         printf("Window could not be created! SDL Error: %s\n", SDL_GetError());
@@ -2484,17 +2469,12 @@ void sdl_init(){
         exit(1);
     }
 
-    surface = SDL_CreateRGBSurface(0, 256, 256, 32, 0, 0, 0, 0);
+    surface = SDL_CreateRGBSurface(0, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, 32, 0, 0, 0, 0);
     if (surface == NULL) {
           printf("Surface could not be created! SDL Error: %s\n", SDL_GetError());
           exit(1);
     }
     pixels = (uint32_t*)surface->pixels;
-    for (int x = 0; x<256;x++) {
-        for (int y = 0; y<256;y++) {
-            set_pixel(x,y,0xffffff);
-        }
-    }
 }
 
 void sdl_display(){
@@ -2503,7 +2483,11 @@ void sdl_display(){
           printf("Texture could not be created! SDL Error: %s\n", SDL_GetError());
           exit(1);
     }
-    SDL_RenderCopy(renderer, texture, NULL, NULL);
+
+    // Implement scrolling
+    SDL_Rect srcr = {.x = VRAM[SCX], .y = VRAM[SCY], .w = VIEWPORT_WIDTH, .h = VIEWPORT_HEIGHT};
+
+    SDL_RenderCopy(renderer, texture, &srcr, NULL);
     SDL_RenderPresent(renderer);
     SDL_DestroyTexture(texture);
     texture = NULL;
@@ -2523,8 +2507,9 @@ bool frame(){
                 break;
         //        return false;
             }
+            int prevcycles = cycles;
             exec_next();
-            gpu_step(cycles);
+            gpu_step(cycles-prevcycles);
         }
     }
 
