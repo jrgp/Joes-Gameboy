@@ -18,7 +18,40 @@ typedef uint8_t byte;
 int gpu_cycles;
 byte VRAM[0xffff + 1];
 
+SDL_Surface* surface;
 uint32_t *pixels;
+
+typedef struct {
+    bool enabled, bg, window, sprite;
+    int windowtilemap, BgWindowTileData;
+    bool BgTileDataSigned;
+    int bgtilemap;
+} GPUCONTROL;
+
+GPUCONTROL gpu_control;
+
+void gpu_parse_control(byte control){
+    gpu_control.enabled = bit_check(control, 7);
+    gpu_control.window = bit_check(control, 5);
+    gpu_control.sprite = bit_check(control, 1);
+    gpu_control.bg = bit_check(control, 0);
+
+    if (bit_check(control, 4)) {
+        gpu_control.BgWindowTileData = 0x8000;
+        gpu_control.BgTileDataSigned = false;
+    } else {
+        gpu_control.BgWindowTileData = 0x8800;
+        gpu_control.BgTileDataSigned = true;
+    }
+    printf("bg tile map %x\n", gpu_control.BgWindowTileData);
+
+    if(bit_check(control, 3)){
+      gpu_control.bgtilemap = 0x9C00;
+    } else {
+      gpu_control.bgtilemap = 0x9800;
+    }
+    printf("bgtilemap: %x\n", gpu_control.bgtilemap);
+}
 
 #define set_pixel(x,y,c) pixels[(y * surface->w) + x] = c;
 
@@ -33,14 +66,85 @@ byte gpu_read(int pos){
 
 void gpu_write(int pos, byte data){
     VRAM[pos] = data;
+    if (pos == LCDC) {
+        gpu_parse_control(data);
+    } else if (data > 0) {
+ //       printf("wrote %x to %x\n", data, pos);
+    }
+}
+
+uint32_t gpu_pallete_color(byte number, int paletteIndex) {
+	byte config = VRAM[paletteIndex];
+	byte resultindex = 0;
+
+	byte b1 = number * 2;
+	byte b2 = (number * 2) + 1;
+
+  if(bit_check(config, b1)){
+		resultindex |= (1 << 1);
+	}
+
+  if(bit_check(config, b2)){
+		resultindex |= (1 << 0);
+	}
+
+
+	uint32_t color = pallette[resultindex];
+
+  return color;
+}
+
+void gpu_draw_bg(byte ly){
+    if (gpu_control.bg) {
+        for (int tile = 0; tile < 32; tile++) {
+            // Index of tile from sprite map
+            int tileIndex = VRAM[gpu_control.bgtilemap + ((ly / 8)*32) + tile];
+            // Start of tile data
+            int start = gpu_control.BgWindowTileData + (16 * tileIndex);
+
+            if(tileIndex>0) {
+                #if 0
+                printf("got tile index from map  %x\n", tileIndex);
+
+                // Debug dump maybe?
+                printf("starting at %x\n", start);
+                for (int i = 0; i<16;i++) {
+                    printf("%02x ", VRAM[start+i]);
+                }
+                printf("\n");
+                #endif
+
+                byte high = VRAM[start + ((ly / 8)*2)];
+                byte low = VRAM[start + ((ly / 8)*2)+1];
+                byte x = 7;
+                for (byte i = 0; i < 8; i++) {
+                  byte wat = 0;
+                  if(bit_check(low, i)){
+                    wat |= (1 << 1);
+                  }
+                  if(bit_check(high, i)){
+                    wat |= (1 << 0);
+                  }
+
+                  set_pixel((tile*8)+x, ly, gpu_pallete_color(wat, BGP));
+                  x--;
+                }
+            }
+        }
+
+    } else {
+        for (int i = 0; i<256; i++) {
+            set_pixel(i, ly, 0xffffff);
+        }
+    }
 }
 
 void gpu_drawline(byte ly){
-
+    gpu_draw_bg(ly);
 }
 
 void gpu_step(int _cycles){
-    if (bit_check(VRAM[LCDC], 7)) {
+    if (gpu_control.enabled) {
         gpu_cycles += _cycles;
         if (gpu_cycles >= 456) {
             gpu_cycles = 0;
@@ -2363,7 +2467,6 @@ void exec_next(){
 SDL_Window* window;
 SDL_Renderer* renderer;
 SDL_Texture* texture;
-SDL_Surface* surface;
 
 void sdl_init(){
     window = SDL_CreateWindow("Joe's GB", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 256, 256, SDL_WINDOW_SHOWN);
@@ -2372,6 +2475,8 @@ void sdl_init(){
         printf("Window could not be created! SDL Error: %s\n", SDL_GetError());
         exit(1);
     }
+
+    SDL_SetWindowResizable(window, true);
 
     renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
     if (renderer == NULL) {
@@ -2385,7 +2490,11 @@ void sdl_init(){
           exit(1);
     }
     pixels = (uint32_t*)surface->pixels;
-    SET_PIXEL(10, 10, 0x00ff00);
+    for (int x = 0; x<256;x++) {
+        for (int y = 0; y<256;y++) {
+            set_pixel(x,y,0xffffff);
+        }
+    }
 }
 
 void sdl_display(){
