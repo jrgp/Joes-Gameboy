@@ -160,6 +160,21 @@ for op, info in ops['unprefixed'].items():
     case {op}:
       {operand1} = Add(cpu_read(HL()));
       break;""".format(op=op, **info))
+        elif info['operand1'] == 'HL' and len(info.get('operand2')) == 2:
+            # credit: https://github.com/daveallie/rustyboy/blob/master/src/register/alu.rs#L116
+            gen.append("""
+    // {mnemonic} {operand1} += {operand2}
+    case {op}:
+        {{
+            word target = HL();
+            word source = {source};
+            word result = target + source;
+            setHL(result);
+            setFlag(FLAG_N, false);
+            setFlag(FLAG_C, (0xFFFF-target) < source);
+            setFlag(FLAG_H, (target&0x07FF)+(source&0x07FF) > 0x07FF);
+        }}
+      break;""".format(op=op, source=('SP' if info['operand2'] == 'SP' else info['operand2']+'()'), **info))
     elif info['mnemonic'] == 'SUB':
         if len(info['operand1']) == 1 and not info.get('operand2'):
             gen.append("""
@@ -274,6 +289,12 @@ for op, info in ops['unprefixed'].items():
           PC = pos;
       }}
       break;""".format(op=op, cond=cond, **info))
+        elif info.get('operand1') == '(HL)':
+            gen.append("""
+    // {mnemonic} {operand1}
+    case {op}:
+      PC = HL();
+      break;""".format(op=op, **info))
     elif info['mnemonic'] == 'CALL':
         if info['operand1'] == 'a16':
             gen.append("""

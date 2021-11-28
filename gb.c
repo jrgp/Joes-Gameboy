@@ -11,6 +11,7 @@
 #include"constants.h"
 
 typedef uint8_t byte;
+typedef uint16_t word;
 
 //
 // GPU
@@ -265,7 +266,7 @@ byte F, A, C, B, E, D, L, H;
 
 int cycles;
 int PC;
-int SP;
+word SP;
 bool interrupts;
 
 void cpu_init(){
@@ -291,59 +292,59 @@ void push_stack(int data) {
     mem_write(SP + 1, f2);
 }
 
-int pop_stack() {
+word pop_stack() {
     byte hi = mem_read(SP);
     byte lo = mem_read(SP + 1);
     SP += 2;
     return hi | (lo << 8);
 }
 
-int AF() {
+word AF() {
     return F | (A << 8);
 }
 
-int HL() {
+word HL() {
     return L | (H << 8);
 }
 
-int DE() {
+word DE() {
     return E | (D << 8);
 }
 
-int BC() {
+word BC() {
     return C | (B << 8);
 }
 
 
-void setAF(int data) {
+void setAF(word data) {
     F = (byte) ((byte) (data & 0x00ff) & 0xf0);
     A = (byte) ((byte) data & 0xff00 >> 8);
 }
 
-void setBC(int data) {
+void setBC(word data) {
     B = (byte) (data >> 8);
     C = (byte) data;
 }
 
-void setDE(int data) {
+void setDE(word data) {
     D = (byte) (data >> 8);
     E = (byte) (data);
 }
 
-void setHL(int data) {
+void setHL(word data) {
     H = (byte) (data >> 8);
     L = (byte) data;
 }
 
-int HLDec() {
-    int hl = HL();
+word HLDec() {
+    word hl = HL();
     setHL(hl - 1);
     // System.out.println("Old HL: 0x"+Integer.toHexString(hl));
     return hl;
 }
 
-int HLInc() {
-    int hl = HL();
+word HLInc() {
+    word hl = HL();
     setHL(hl + 1);
     return hl;
 }
@@ -363,7 +364,7 @@ byte cpu_read_next() {
   return data;
 }
 
-int cpu_read16() {
+word cpu_read16() {
   byte lo = cpu_read_next();
   byte hi = cpu_read_next();
   return lo | (hi << 8);
@@ -521,6 +522,19 @@ void exec_op(byte opcode){
       B = cpu_read_next();
       break;
 
+    // ADD HL += BC
+    case 0x09:
+        {
+            word target = HL();
+            word source = BC();
+            word result = target + source;
+            setHL(result);
+            setFlag(FLAG_N, false);
+            setFlag(FLAG_C, (0xFFFF-target) < source);
+            setFlag(FLAG_H, (target&0x07FF)+(source&0x07FF) > 0x07FF);
+        }
+      break;
+
     // LD A <- (BC)
     case 0x0a:
       A = cpu_read(BC());
@@ -589,6 +603,19 @@ void exec_op(byte opcode){
       offset = cpu_read_next();
       PC += (int8_t) offset;
       cycles += 4;
+      break;
+
+    // ADD HL += DE
+    case 0x19:
+        {
+            word target = HL();
+            word source = DE();
+            word result = target + source;
+            setHL(result);
+            setFlag(FLAG_N, false);
+            setFlag(FLAG_C, (0xFFFF-target) < source);
+            setFlag(FLAG_H, (target&0x07FF)+(source&0x07FF) > 0x07FF);
+        }
       break;
 
     // LD A <- (DE)
@@ -666,6 +693,19 @@ void exec_op(byte opcode){
       }
       break;
 
+    // ADD HL += HL
+    case 0x29:
+        {
+            word target = HL();
+            word source = HL();
+            word result = target + source;
+            setHL(result);
+            setFlag(FLAG_N, false);
+            setFlag(FLAG_C, (0xFFFF-target) < source);
+            setFlag(FLAG_H, (target&0x07FF)+(source&0x07FF) > 0x07FF);
+        }
+      break;
+
     // LD A <- (HL+)
     case 0x2a:
       A = cpu_read(HLInc());
@@ -734,6 +774,19 @@ void exec_op(byte opcode){
           cycles += 4;
           PC += (int8_t) offset;
       }
+      break;
+
+    // ADD HL += SP
+    case 0x39:
+        {
+            word target = HL();
+            word source = SP;
+            word result = target + source;
+            setHL(result);
+            setFlag(FLAG_N, false);
+            setFlag(FLAG_C, (0xFFFF-target) < source);
+            setFlag(FLAG_H, (target&0x07FF)+(source&0x07FF) > 0x07FF);
+        }
       break;
 
     // LD A <- (HL-)
@@ -1516,6 +1569,11 @@ void exec_op(byte opcode){
     // RST 20H
     case 0xe7:
       PC = 0x20;
+      break;
+
+    // JP (HL)
+    case 0xe9:
+      PC = HL();
       break;
 
     // LD (a16) <- A
@@ -2643,7 +2701,7 @@ void exec_ext_op(byte opcode){
 
 void exec_next(){
     byte op = cpu_read_next();
- //   printf("executing %x at $%x\n", op, PC-1);
+    //printf("executing %x at $%x\n", op, PC-1);
     exec_op(op);
 }
 
