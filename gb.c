@@ -114,8 +114,8 @@ void gpu_draw_bg(byte ly){
                 printf("\n");
                 #endif
 
-                byte high = VRAM[start + ((ly / 8)*2)];
-                byte low = VRAM[start + ((ly / 8)*2)+1];
+                byte high = VRAM[start + ((ly % 8)*2)];
+                byte low = VRAM[start + ((ly % 8)*2)+1];
                 byte x = 7;
                 for (byte i = 0; i < 8; i++) {
                   byte wat = 0;
