@@ -127,6 +127,12 @@ for op, info in ops['unprefixed'].items():
     case {op}:
       cpu_write(cpu_read16(), {operand2});
       break;""".format(op=op, **info))
+        elif info['operand1'] == '(HL)' and info.get('operand2') == 'd8':
+            gen.append("""
+    // {mnemonic} {operand1} <- {operand2}
+    case {op}:
+      cpu_write(HL(), cpu_read_next());
+      break;""".format(op=op, **info))
     elif info['mnemonic'] == 'LDH':
         if len(info['operand2']) == 1 and info.get('operand1') == '(a8)':
             gen.append("""
@@ -180,6 +186,25 @@ for op, info in ops['unprefixed'].items():
     case {op}:
       A = {func}(cpu_read(HL()));
       break;""".format(op=op, func=info['mnemonic'].lower().capitalize(), **info))
+        elif info['operand1'] == 'd8':
+            gen.append("""
+    // {mnemonic} A & {operand1}
+    case {op}:
+      A = {func}(cpu_read_next());
+      break;""".format(op=op, func=info['mnemonic'].lower().capitalize(), **info))
+    elif info['mnemonic'] == 'OR':
+        if len(info['operand1']) == 1 and not info.get('operand2'):
+            gen.append("""
+    // {mnemonic} A | {operand1}
+    case {op}:
+      A = {func}({operand1});
+      break;""".format(op=op, func=info['mnemonic'].lower().capitalize(), **info))
+        elif info['operand1'] == '(HL)':
+            gen.append("""
+    // {mnemonic} A | {operand1}
+    case {op}:
+      A = {func}(cpu_read(HL()));
+      break;""".format(op=op, func=info['mnemonic'].lower().capitalize(), **info))
     elif info['mnemonic'] == 'XOR':
         if len(info['operand1']) == 1 and not info.get('operand2'):
             gen.append("""
@@ -223,6 +248,30 @@ for op, info in ops['unprefixed'].items():
       if ({cond}) {{
           cycles += 4;
           PC += (int8_t) offset;
+      }}
+      break;""".format(op=op, cond=cond, **info))
+    elif info['mnemonic'] == 'JP':
+        if info['operand1'] == 'a16':
+            gen.append("""
+    // {mnemonic} {operand1}
+    case {op}:
+      PC = cpu_read16();
+      cycles += 4;
+      break;""".format(op=op, **info))
+        elif info.get('operand2') == 'a16':
+            cond = {
+                "NZ": "!CheckFlag(FLAG_Z)",
+                "NC": "!CheckFlag(FLAG_C)",
+                "Z": "CheckFlag(FLAG_Z)",
+                "C": "CheckFlag(FLAG_C)",
+            }[info['operand1']]
+            gen.append("""
+    // {mnemonic} {operand1}
+    case {op}:
+      pos = cpu_read16();
+      if ({cond}) {{
+          cycles += 4;
+          PC = pos;
       }}
       break;""".format(op=op, cond=cond, **info))
     elif info['mnemonic'] == 'CALL':
@@ -316,6 +365,30 @@ for op, info in ops['unprefixed'].items():
     case {op}:
       {func}(cpu_read(HL()));
       break;""".format(op=op, func=info['mnemonic'], **info))
+    elif info['mnemonic'] == 'DI':
+        gen.append("""
+    // {mnemonic}
+    case {op}:
+      interrupts = false;
+      break;""".format(op=op, **info))
+    elif info['mnemonic'] == 'EI':
+        gen.append("""
+    // {mnemonic}
+    case {op}:
+      interrupts = true;
+      break;""".format(op=op, **info))
+    elif info['mnemonic'] == 'CPL':
+        gen.append("""
+    // {mnemonic}
+    case {op}:
+      A = ~A;
+      break;""".format(op=op, **info))
+    elif info['mnemonic'] == 'RST':
+        gen.append("""
+    // {mnemonic} {operand1}
+    case {op}:
+      PC = 0x{loc};
+      break;""".format(op=op, loc=info['operand1'][:2], func=info['mnemonic'], **info))
 
 if doit:
     path = 'gb.c'
@@ -400,6 +473,19 @@ for op, info in ops['cbprefixed'].items():
     case {op}:
       cpu_write(HL(), RL(cpu_read(HL())));
       break;""".format(op=op, func=info['mnemonic'], **info))
+    elif info['mnemonic'] == 'SWAP':
+        if len(info['operand1']) == 1:
+            genex.append("""
+    // {mnemonic} {operand1}
+    case {op}:
+      {operand1} = {func}({operand1});
+      break;""".format(op=op, func=info['mnemonic'].lower().capitalize(), **info))
+        elif info['operand1'] == '(HL)':
+            genex.append("""
+    // {mnemonic} {operand1}
+    case {op}:
+      cpu_write(HL(), {func}(cpu_read(HL())));
+      break;""".format(op=op, func=info['mnemonic'].lower().capitalize(), **info))
 
 
 if doit:

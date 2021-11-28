@@ -249,7 +249,7 @@ void mem_init(){
     memset(RAM, 0, 0xffff + 1);
     inBios = true;
     bailAfterBios = true;
-    //bailAfterBios = false;
+    bailAfterBios = false;
 }
 
 //
@@ -266,6 +266,7 @@ byte F, A, C, B, E, D, L, H;
 int cycles;
 int PC;
 int SP;
+bool interrupts;
 
 void cpu_init(){
     F = 0;
@@ -413,16 +414,31 @@ byte Add(byte arg) {
 }
 
 byte And(byte arg) {
-    byte v = (byte) (A & arg);
+    byte v = A & arg;
+    clearFlags();
     setFlag(FLAG_Z, v == 0);
-    // FIXME: flags + signing + etc
+    setFlag(FLAG_H, true);
+    return v;
+}
+
+byte Or(byte arg) {
+    byte v = A | arg;
+    clearFlags();
+    setFlag(FLAG_Z, v == 0);
     return v;
 }
 
 byte Xor(byte arg) {
-    byte v = (byte) (A ^ arg);
+    byte v = A ^ arg;
+    clearFlags();
     setFlag(FLAG_Z, v == 0);
-    // FIXME: flags + signing + etc
+    return v;
+}
+
+byte Swap(byte arg) {
+    byte v = ((arg & 0x0F)<<4 | (arg & 0xF0)>>4);
+    clearFlags();
+    setFlag(FLAG_Z, v == 0);
     return v;
 }
 
@@ -676,6 +692,11 @@ void exec_op(byte opcode){
       L = cpu_read_next();
       break;
 
+    // CPL
+    case 0x2f:
+      A = ~A;
+      break;
+
     // JR NC
     case 0x30:
       offset = cpu_read_next();
@@ -699,6 +720,11 @@ void exec_op(byte opcode){
     case 0x33:
       SP++;
       cycles += 4;
+      break;
+
+    // LD (HL) <- d8
+    case 0x36:
+      cpu_write(HL(), cpu_read_next());
       break;
 
     // JR C
@@ -1204,6 +1230,46 @@ void exec_op(byte opcode){
       A = Xor(A);
       break;
 
+    // OR A | B
+    case 0xb0:
+      A = Or(B);
+      break;
+
+    // OR A | C
+    case 0xb1:
+      A = Or(C);
+      break;
+
+    // OR A | D
+    case 0xb2:
+      A = Or(D);
+      break;
+
+    // OR A | E
+    case 0xb3:
+      A = Or(E);
+      break;
+
+    // OR A | H
+    case 0xb4:
+      A = Or(H);
+      break;
+
+    // OR A | L
+    case 0xb5:
+      A = Or(L);
+      break;
+
+    // OR A | (HL)
+    case 0xb6:
+      A = Or(cpu_read(HL()));
+      break;
+
+    // OR A | A
+    case 0xb7:
+      A = Or(A);
+      break;
+
     // CP B
     case 0xb8:
       CP(B);
@@ -1259,6 +1325,21 @@ void exec_op(byte opcode){
       cycles += 8;
       break;
 
+    // JP NZ
+    case 0xc2:
+      pos = cpu_read16();
+      if (!CheckFlag(FLAG_Z)) {
+          cycles += 4;
+          PC = pos;
+      }
+      break;
+
+    // JP a16
+    case 0xc3:
+      PC = cpu_read16();
+      cycles += 4;
+      break;
+
     // CALL NZ
     case 0xc4:
       pos = cpu_read16();
@@ -1275,6 +1356,11 @@ void exec_op(byte opcode){
       cycles += 12;
       break;
 
+    // RST 00H
+    case 0xc7:
+      PC = 0x00;
+      break;
+
     // RET Z
     case 0xc8:
       cycles += 4;
@@ -1288,6 +1374,15 @@ void exec_op(byte opcode){
     case 0xc9:
       cycles += 12;
       PC = pop_stack();
+      break;
+
+    // JP Z
+    case 0xca:
+      pos = cpu_read16();
+      if (CheckFlag(FLAG_Z)) {
+          cycles += 4;
+          PC = pos;
+      }
       break;
 
     // CALL Z
@@ -1308,6 +1403,11 @@ void exec_op(byte opcode){
       cycles += 12;
       break;
 
+    // RST 08H
+    case 0xcf:
+      PC = 0x08;
+      break;
+
     // RET NC
     case 0xd0:
       cycles += 4;
@@ -1321,6 +1421,15 @@ void exec_op(byte opcode){
     case 0xd1:
       setDE(pop_stack());
       cycles += 8;
+      break;
+
+    // JP NC
+    case 0xd2:
+      pos = cpu_read16();
+      if (!CheckFlag(FLAG_C)) {
+          cycles += 4;
+          PC = pos;
+      }
       break;
 
     // CALL NC
@@ -1339,12 +1448,26 @@ void exec_op(byte opcode){
       cycles += 12;
       break;
 
+    // RST 10H
+    case 0xd7:
+      PC = 0x10;
+      break;
+
     // RET C
     case 0xd8:
       cycles += 4;
       if (CheckFlag(FLAG_C)) {
           cycles += 12;
           PC = pop_stack();
+      }
+      break;
+
+    // JP C
+    case 0xda:
+      pos = cpu_read16();
+      if (CheckFlag(FLAG_C)) {
+          cycles += 4;
+          PC = pos;
       }
       break;
 
@@ -1356,6 +1479,11 @@ void exec_op(byte opcode){
           PC = pos;
           cycles += 12;
       }
+      break;
+
+    // RST 18H
+    case 0xdf:
+      PC = 0x18;
       break;
 
     // LDH (a8) <- A
@@ -1380,6 +1508,16 @@ void exec_op(byte opcode){
       cycles += 12;
       break;
 
+    // AND A & d8
+    case 0xe6:
+      A = And(cpu_read_next());
+      break;
+
+    // RST 20H
+    case 0xe7:
+      PC = 0x20;
+      break;
+
     // LD (a16) <- A
     case 0xea:
       cpu_write(cpu_read16(), A);
@@ -1388,6 +1526,11 @@ void exec_op(byte opcode){
     // XOR A ^ d8
     case 0xee:
       A = Xor(cpu_read_next());
+      break;
+
+    // RST 28H
+    case 0xef:
+      PC = 0x28;
       break;
 
     // LDH A <- (a8)
@@ -1406,15 +1549,35 @@ void exec_op(byte opcode){
       A = cpu_read(C + 0xFF00);
       break;
 
+    // DI
+    case 0xf3:
+      interrupts = false;
+      break;
+
     // PUSH AF
     case 0xf5:
       push_stack(AF());
       cycles += 12;
       break;
 
+    // RST 30H
+    case 0xf7:
+      PC = 0x30;
+      break;
+
+    // EI
+    case 0xfb:
+      interrupts = true;
+      break;
+
     // CP d8
     case 0xfe:
       CP(cpu_read_next());
+      break;
+
+    // RST 38H
+    case 0xff:
+      PC = 0x38;
       break;
 
 // END GENERATED
@@ -1467,6 +1630,46 @@ void exec_ext_op(byte opcode){
     // RL A
     case 0x17:
       A = RL(A);
+      break;
+
+    // SWAP B
+    case 0x30:
+      B = Swap(B);
+      break;
+
+    // SWAP C
+    case 0x31:
+      C = Swap(C);
+      break;
+
+    // SWAP D
+    case 0x32:
+      D = Swap(D);
+      break;
+
+    // SWAP E
+    case 0x33:
+      E = Swap(E);
+      break;
+
+    // SWAP H
+    case 0x34:
+      H = Swap(H);
+      break;
+
+    // SWAP L
+    case 0x35:
+      L = Swap(L);
+      break;
+
+    // SWAP (HL)
+    case 0x36:
+      cpu_write(HL(), Swap(cpu_read(HL())));
+      break;
+
+    // SWAP A
+    case 0x37:
+      A = Swap(A);
       break;
 
     // BIT 0 of B
