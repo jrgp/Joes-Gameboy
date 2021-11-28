@@ -2453,7 +2453,7 @@ SDL_Renderer* renderer;
 SDL_Texture* texture;
 
 void sdl_init(){
-    window = SDL_CreateWindow("Joe's GB", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, SDL_WINDOW_SHOWN);
+    window = SDL_CreateWindow("Joe's GB", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, VIEWPORT_WIDTH*2, VIEWPORT_HEIGHT*2, SDL_WINDOW_SHOWN);
 
     if (window == NULL) {
         printf("Window could not be created! SDL Error: %s\n", SDL_GetError());
