@@ -9,6 +9,7 @@
 #include"bios.h"
 #include"bits.h"
 #include"constants.h"
+#include"opnames.h"
 
 typedef uint8_t byte;
 typedef uint16_t word;
@@ -396,6 +397,7 @@ byte Inc(byte reg) {
 byte Dec(byte reg) {
     reg--;
     setFlag(FLAG_Z, reg == 0);
+    setFlag(FLAG_N, true);
     // FIXME: flags + signing + etc
     return reg;
 }
@@ -403,6 +405,7 @@ byte Dec(byte reg) {
 byte Sub(byte arg) {
     int result = A - arg;
     setFlag(FLAG_Z, (byte) result == 0);
+    setFlag(FLAG_N, true);
     // FIXME: flags + signing + etc
     return (byte) result;
 }
@@ -2701,7 +2704,7 @@ void exec_ext_op(byte opcode){
 
 void exec_next(){
     byte op = cpu_read_next();
-    //printf("executing %x at $%x\n", op, PC-1);
+    printf("executing %x (%s) at $%x\n", op, opnames[op], PC-1);
     exec_op(op);
 }
 
