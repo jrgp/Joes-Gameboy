@@ -403,7 +403,8 @@ word HLInc() {
 }
 
 byte cpu_read(int loc) {
-  return mem_read(loc);
+    cycles += 4;
+    return mem_read(loc);
 }
 
 void cpu_write(int loc, byte value) {
