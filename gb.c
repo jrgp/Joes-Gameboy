@@ -239,6 +239,7 @@ void mem_write(int pos, byte data) {
         default:
             if (pos == 0xFF50 && inBios) {
                 inBios = false;
+                printf("bios disabled\n");
             } else if ((pos >= 0xA000 && pos <= 0xBFFF) || (pos >= 0x8000 && pos <= 0x9FFF)) {
                 gpu_write(pos, data);
             } else {
@@ -284,9 +285,9 @@ void cpu_init(){
     SP = 0;
 }
 
-void push_stack(int data) {
-    byte f1 = (byte) data;
-    byte f2 = (byte) (data >> 8);
+void push_stack(word data) {
+    byte f1 = data & 0x00ff;
+    byte f2 = (data & 0xff00) >> 8;
 
     SP -= 2;
     mem_write(SP, f1);
@@ -294,10 +295,16 @@ void push_stack(int data) {
 }
 
 word pop_stack() {
-    byte hi = mem_read(SP);
-    byte lo = mem_read(SP + 1);
+    word f1 = mem_read(SP);
+    word f2 = mem_read(SP + 1);
     SP += 2;
-    return hi | (lo << 8);
+    return (f2 << 8) | f1;
+}
+
+word peek_stack() {
+    word f1 = mem_read(SP);
+    word f2 = mem_read(SP + 1);
+    return (f2 << 8) | f1;
 }
 
 word AF() {
@@ -1414,6 +1421,8 @@ void exec_op(byte opcode){
 
     // RST 00H
     case 0xc7:
+      push_stack(PC);
+      cycles += 12;
       PC = 0x00;
       break;
 
@@ -1461,6 +1470,8 @@ void exec_op(byte opcode){
 
     // RST 08H
     case 0xcf:
+      push_stack(PC);
+      cycles += 12;
       PC = 0x08;
       break;
 
@@ -1506,6 +1517,8 @@ void exec_op(byte opcode){
 
     // RST 10H
     case 0xd7:
+      push_stack(PC);
+      cycles += 12;
       PC = 0x10;
       break;
 
@@ -1539,6 +1552,8 @@ void exec_op(byte opcode){
 
     // RST 18H
     case 0xdf:
+      push_stack(PC);
+      cycles += 12;
       PC = 0x18;
       break;
 
@@ -1571,6 +1586,8 @@ void exec_op(byte opcode){
 
     // RST 20H
     case 0xe7:
+      push_stack(PC);
+      cycles += 12;
       PC = 0x20;
       break;
 
@@ -1591,6 +1608,8 @@ void exec_op(byte opcode){
 
     // RST 28H
     case 0xef:
+      push_stack(PC);
+      cycles += 12;
       PC = 0x28;
       break;
 
@@ -1623,6 +1642,8 @@ void exec_op(byte opcode){
 
     // RST 30H
     case 0xf7:
+      push_stack(PC);
+      cycles += 12;
       PC = 0x30;
       break;
 
@@ -1638,6 +1659,8 @@ void exec_op(byte opcode){
 
     // RST 38H
     case 0xff:
+      push_stack(PC);
+      cycles += 12;
       PC = 0x38;
       break;
 

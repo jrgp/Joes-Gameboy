@@ -408,6 +408,8 @@ for op, info in ops['unprefixed'].items():
         gen.append("""
     // {mnemonic} {operand1}
     case {op}:
+      push_stack(PC);
+      cycles += 12;
       PC = 0x{loc};
       break;""".format(op=op, loc=info['operand1'][:2], func=info['mnemonic'], **info))
 
