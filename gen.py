@@ -31,6 +31,16 @@ for op, info in ops['unprefixed'].items():
       set{operand1}({operand1}() {symbol} 1);
       cycles += 4;
       break;""".format(op=op, symbol='+' if info['mnemonic'] == 'INC'  else '-', func=info['mnemonic'].lower().capitalize(), **info))
+        elif info['operand1'] == '(HL)':
+            gen.append("""
+    // {mnemonic} {operand1}
+    case {op}:
+      {{
+          byte source = cpu_read(HL());
+          byte result = {func}(source);
+          cpu_write(HL(), result);
+      }}
+      break;""".format(op=op, symbol='+' if info['mnemonic'] == 'INC'  else '-', func=info['mnemonic'].lower().capitalize(), **info))
         elif info['operand1'] == 'SP':
             gen.append("""
     // {mnemonic} {operand1}

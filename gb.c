@@ -248,9 +248,6 @@ byte mem_read(int pos) {
 }
 
 void mem_write(int pos, byte data) {
-    if (pos == 0xff80){
-        printf("writing %x to %x\n", data, pos);
-    }
     switch (pos) {
         case BGP:
         case LCDC:
@@ -809,6 +806,24 @@ void exec_op(byte opcode){
     case 0x33:
       SP++;
       cycles += 4;
+      break;
+
+    // INC (HL)
+    case 0x34:
+      {
+          byte source = cpu_read(HL());
+          byte result = Inc(source);
+          cpu_write(HL(), result);
+      }
+      break;
+
+    // DEC (HL)
+    case 0x35:
+      {
+          byte source = cpu_read(HL());
+          byte result = Dec(source);
+          cpu_write(HL(), result);
+      }
       break;
 
     // LD (HL) <- d8
@@ -2772,9 +2787,6 @@ void exec_ext_op(byte opcode){
 bool debug = false;
 
 void exec_next(){
-    if (PC==0x2cf){
-        debug = true;
-    }
     if (debug){
         dump_regs();
     }
