@@ -497,6 +497,18 @@ byte Add(byte arg) {
     return (byte) result;
 }
 
+byte Adc(byte arg) {
+    // FIXME: this may be very wrong
+    if(CheckFlag(FLAG_C)){
+        arg++;
+    }
+    int result = A + arg;
+    setFlag(FLAG_N, false);
+    setFlag(FLAG_C, (result > 0xff));
+    setFlag(FLAG_H, (((A&0xf)+(arg&0xf))&0x10) == 0x10);
+    return (byte)result;
+}
+
 byte And(byte arg) {
     byte v = A & arg;
     clearFlags();
@@ -536,6 +548,18 @@ byte RL(byte arg) {
     setFlag(FLAG_C, oldC);
     setFlag(FLAG_Z, arg == 0); // For RLA this is later set to false.
     // FIXME: this could be very wrong
+    return arg;
+}
+
+byte Rlc(byte arg) {
+    // FIXME: this may be very wrong
+    bool oldC = (arg & 0x80) == 0x80;
+    arg <<= 1;
+    if(oldC){
+        arg |= 0x01;
+    }
+    clearFlags();
+    setFlag(FLAG_C, oldC);
     return arg;
 }
 
@@ -622,6 +646,11 @@ void exec_op(byte opcode){
     // LD B <- d8
     case 0x06:
       B = cpu_read_next();
+      break;
+
+    // RLCA
+    case 0x07:
+      A = Rlc(A);
       break;
 
     // ADD HL += BC
@@ -1283,6 +1312,46 @@ void exec_op(byte opcode){
       A = Add(A);
       break;
 
+    // ADC A += B
+    case 0x88:
+      A = Adc(B);
+      break;
+
+    // ADC A += C
+    case 0x89:
+      A = Adc(C);
+      break;
+
+    // ADC A += D
+    case 0x8a:
+      A = Adc(D);
+      break;
+
+    // ADC A += E
+    case 0x8b:
+      A = Adc(E);
+      break;
+
+    // ADC A += H
+    case 0x8c:
+      A = Adc(H);
+      break;
+
+    // ADC A += L
+    case 0x8d:
+      A = Adc(L);
+      break;
+
+    // ADC A += (HL)
+    case 0x8e:
+      A = Add(cpu_read(HL()));
+      break;
+
+    // ADC A += A
+    case 0x8f:
+      A = Adc(A);
+      break;
+
     // SUB A -= B
     case 0x90:
       A = Sub(B);
@@ -1583,6 +1652,11 @@ void exec_op(byte opcode){
       cycles += 12;
       break;
 
+    // ADC A += d8
+    case 0xce:
+      A = Adc(cpu_read_next());
+      break;
+
     // RST 08H
     case 0xcf:
       push_stack(PC);
@@ -1628,6 +1702,11 @@ void exec_op(byte opcode){
     case 0xd5:
       push_stack(DE());
       cycles += 12;
+      break;
+
+    // SUB A -= d8
+    case 0xd6:
+      A = Sub(cpu_read_next());
       break;
 
     // RST 10H

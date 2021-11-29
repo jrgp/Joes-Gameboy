@@ -163,7 +163,7 @@ for op, info in ops['unprefixed'].items():
       {operand1} = cpu_read(cpu_read_next() + 0xFF00);
       break;""".format(op=op, **info))
 
-    elif info['mnemonic'] == 'ADD':
+    elif info['mnemonic'] in ['ADD', 'ADC']:
         if len(info['operand1']) == 1 and len(info.get('operand2', '')) == 1:
             gen.append("""
     // {mnemonic} {operand1} += {operand2}
@@ -182,7 +182,7 @@ for op, info in ops['unprefixed'].items():
     case {op}:
       {operand1} = Add(cpu_read(HL()));
       break;""".format(op=op, **info))
-        elif info['operand1'] == 'HL' and len(info.get('operand2')) == 2:
+        elif info['mnemonic'] == 'ADD' and info['operand1'] == 'HL' and len(info.get('operand2')) == 2:
             # credit: https://github.com/daveallie/rustyboy/blob/master/src/register/alu.rs#L116
             gen.append("""
     // {mnemonic} {operand1} += {operand2}
@@ -210,6 +210,12 @@ for op, info in ops['unprefixed'].items():
     case {op}:
       A = Sub(cpu_read(HL()));
       break;""".format(op=op, **info))
+        elif info.get('operand1') == 'd8':
+            gen.append("""
+    // {mnemonic} A -= {operand1}
+    case {op}:
+      A = {func}(cpu_read_next());
+      break;""".format(op=op, func=info['mnemonic'].lower().capitalize(), **info))
     elif info['mnemonic'] == 'AND':
         if len(info['operand1']) == 1 and not info.get('operand2'):
             gen.append("""
@@ -448,6 +454,12 @@ for op, info in ops['unprefixed'].items():
       cycles += 12;
       PC = 0x{loc};
       break;""".format(op=op, loc=info['operand1'][:2], func=info['mnemonic'], **info))
+    elif info['mnemonic'] == 'RLCA':
+        gen.append("""
+    // {mnemonic}
+    case {op}:
+      A = Rlc(A);
+      break;""".format(op=op, **info))
 
 if doit:
     path = 'gb.c'
