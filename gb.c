@@ -61,6 +61,7 @@ void gpu_init(){
 }
 
 byte gpu_read(int pos){
+    printf("reading from gpu %x\n", pos);
     return VRAM[pos];
 }
 
@@ -1647,6 +1648,11 @@ void exec_op(byte opcode){
       PC = 0x30;
       break;
 
+    // LD A <- (a16)
+    case 0xfa:
+      A = cpu_read(cpu_read16());
+      break;
+
     // EI
     case 0xfb:
       interrupts = true;
@@ -2727,7 +2733,7 @@ void exec_ext_op(byte opcode){
 
 void exec_next(){
     byte op = cpu_read_next();
-    printf("executing %x (%s) at $%x\n", op, opnames[op], PC-1);
+    //printf("executing %x (%s) at $%x\n", op, opnames[op], PC-1);
     exec_op(op);
 }
 

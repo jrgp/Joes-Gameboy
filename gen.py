@@ -127,6 +127,12 @@ for op, info in ops['unprefixed'].items():
     case {op}:
       cpu_write(cpu_read16(), {operand2});
       break;""".format(op=op, **info))
+        elif len(info['operand1']) == 1 and info.get('operand2') == '(a16)':
+            gen.append("""
+    // {mnemonic} {operand1} <- {operand2}
+    case {op}:
+      {operand1} = cpu_read(cpu_read16());
+      break;""".format(op=op, **info))
         elif info['operand1'] == '(HL)' and info.get('operand2') == 'd8':
             gen.append("""
     // {mnemonic} {operand1} <- {operand2}
