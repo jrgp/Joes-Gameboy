@@ -362,6 +362,14 @@ for op, info in ops['unprefixed'].items():
       cycles += 12;
       PC = pop_stack();
       break;""".format(op=op, **info))
+    elif info['mnemonic'] == 'RETI':
+        gen.append("""
+    // {mnemonic}
+    case {op}:
+      cycles += 12;
+      PC = pop_stack();
+      interrupts = true;
+      break;""".format(op=op, **info))
     elif info['mnemonic'] == 'PUSH':
         gen.append("""
     // {mnemonic} {operand1}

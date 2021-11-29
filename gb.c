@@ -15,6 +15,11 @@ typedef uint8_t byte;
 typedef uint16_t word;
 
 //
+// Forward declare some prototypes
+//
+void request_interrupt(byte interrupt);
+
+//
 // GPU
 //
 int gpu_cycles;
@@ -220,6 +225,10 @@ byte RAM[0xffff + 1];
 bool inBios;
 bool bailAfterBios;
 
+void request_interrupt(byte interrupt){
+    RAM[INTERRUPT_FLAGS] |= interrupt;
+}
+
 byte mem_read(int pos) {
     if (pos < 256 && inBios) {
         return bios[pos];
@@ -349,14 +358,14 @@ word BC() {
 }
 
 void dump_regs() {
-	printf("REGS: AF: %04x BC: %04x DE: %04x HL: %04x SP: %04x PC: %04x\n",
-		AF(),
-		BC(),
-		DE(),
-		HL(),
-		SP,
-		PC
-	);
+  printf("REGS: AF: %04x BC: %04x DE: %04x HL: %04x SP: %04x PC: %04x\n",
+    AF(),
+    BC(),
+    DE(),
+    HL(),
+    SP,
+    PC
+  );
 }
 
 
@@ -414,6 +423,34 @@ word cpu_read16() {
   return lo | (hi << 8);
 }
 
+void do_interrupts(){
+  if (interrupts) {
+    byte enabled_bits = mem_read(INTERRUPT_ENABLE);
+    if(enabled_bits > 0){
+      byte flag_bits = mem_read(INTERRUPT_FLAGS);
+      byte enabled = flag_bits & enabled_bits;
+
+      // If we have any, disable them as we run them
+      if(enabled > 0){
+        interrupts = false;
+
+        for (int i = 0; i<5; i++) {
+          byte interrupt = INTERRUPT_PRIORITY[i];
+          if ((enabled & interrupt) != 0) {
+            flag_bits = flag_bits & ~interrupt;
+
+            printf("Doing interrupt %d (%x)\n", interrupt, INTERRUPT_OFFSETS[i]);
+            push_stack(PC);
+
+            PC = INTERRUPT_OFFSETS[i];
+          }
+        }
+
+        RAM[INTERRUPT_FLAGS] = flag_bits;
+      }
+    }
+  }
+}
 
 //
 // ALGS
@@ -1583,6 +1620,13 @@ void exec_op(byte opcode){
           cycles += 12;
           PC = pop_stack();
       }
+      break;
+
+    // RETI
+    case 0xd9:
+      cycles += 12;
+      PC = pop_stack();
+      interrupts = true;
       break;
 
     // JP C
@@ -2787,6 +2831,9 @@ void exec_ext_op(byte opcode){
 bool debug = false;
 
 void exec_next(){
+    if(PC == 0x02dd) {
+      //  debug = true;
+    }
     if (debug){
         dump_regs();
     }
@@ -2861,9 +2908,12 @@ bool frame(){
             }
             int prevcycles = cycles;
             exec_next();
+            do_interrupts();
             gpu_step(cycles-prevcycles);
         }
     }
+
+    request_interrupt(INTERRUPT_VBLANK);
 
     sdl_display();
 
