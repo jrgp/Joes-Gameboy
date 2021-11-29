@@ -61,7 +61,7 @@ void gpu_init(){
 }
 
 byte gpu_read(int pos){
-    printf("reading from gpu %x\n", pos);
+    //printf("reading from gpu %x\n", pos);
     return VRAM[pos];
 }
 
@@ -196,6 +196,24 @@ void cart_load(char *path) {
 }
 
 //
+// Joypad
+//
+
+byte joypad_read(){
+  byte foo = 0;
+  // Fake not pressing any buttons
+  foo = bit_set(foo, 3);
+  foo = bit_set(foo, 2);
+  foo = bit_set(foo, 1);
+  foo = bit_set(foo, 0);
+  return foo;
+}
+
+void joypad_write(byte data){
+  printf("writing %x to joypad\n", data);
+}
+
+//
 // RAM
 //
 byte RAM[0xffff + 1];
@@ -221,6 +239,8 @@ byte mem_read(int pos) {
             case WX:
             case WY:
                 return gpu_read(pos);
+            case JOYPAD:
+                return joypad_read();
             default:
                 return RAM[pos];
         }
@@ -228,6 +248,9 @@ byte mem_read(int pos) {
 }
 
 void mem_write(int pos, byte data) {
+    if (pos == 0xff80){
+        printf("writing %x to %x\n", data, pos);
+    }
     switch (pos) {
         case BGP:
         case LCDC:
@@ -237,6 +260,10 @@ void mem_write(int pos, byte data) {
         case WX:
         case WY:
             gpu_write(pos, data);
+            break;
+        case JOYPAD:
+            joypad_write(data);
+            break;
         default:
             if (pos == 0xFF50 && inBios) {
                 inBios = false;
@@ -324,10 +351,21 @@ word BC() {
     return C | (B << 8);
 }
 
+void dump_regs() {
+	printf("REGS: AF: %04x BC: %04x DE: %04x HL: %04x SP: %04x PC: %04x\n",
+		AF(),
+		BC(),
+		DE(),
+		HL(),
+		SP,
+		PC
+	);
+}
+
 
 void setAF(word data) {
-    F = (byte) ((byte) (data & 0x00ff) & 0xf0);
-    A = (byte) ((byte) data & 0xff00 >> 8);
+    F = (data & 0x00ff) & 0xf0;
+    A = (data & 0xff00) >> 8;
 }
 
 void setBC(word data) {
@@ -474,7 +512,7 @@ void Bit(byte target, int bit) {
 }
 
 void CP(byte to) {
-    int result = A - to;
+    int result = (int)A - (int)to;
     setFlag(FLAG_N, true);
     setFlag(FLAG_C, result < 0);
     setFlag(FLAG_Z, result == 0);
@@ -2731,9 +2769,19 @@ void exec_ext_op(byte opcode){
     }
 }
 
+bool debug = false;
+
 void exec_next(){
+    if (PC==0x2cf){
+        debug = true;
+    }
+    if (debug){
+        dump_regs();
+    }
     byte op = cpu_read_next();
-    //printf("executing %x (%s) at $%x\n", op, opnames[op], PC-1);
+    if(debug) {
+        printf("executing %x (%s) at $%x\n", op, opnames[op], PC-1);
+    }
     exec_op(op);
 }
 

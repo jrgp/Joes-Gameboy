@@ -6,6 +6,7 @@
 #define WY 0xFF4A
 #define WX 0xFF4B
 #define BGP 0xFF47
+#define JOYPAD 0xFF00
 
 #define FPS 60
 
