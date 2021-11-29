@@ -558,6 +558,20 @@ for op, info in ops['cbprefixed'].items():
     case {op}:
       cpu_write(HL(), {func}(cpu_read(HL())));
       break;""".format(op=op, func=info['mnemonic'].lower().capitalize(), **info))
+    elif info['mnemonic'] == 'SRL':
+        if len(info['operand1']) == 1:
+            genex.append("""
+    // {mnemonic} {operand1}
+    case {op}:
+      {operand1} = {func}({operand1});
+      break;""".format(op=op, func=info['mnemonic'].lower().capitalize(), **info))
+        elif info['operand1'] == '(HL)':
+            genex.append("""
+    // {mnemonic} {operand1}
+    case {op}:
+      cpu_write(HL(), {func}(cpu_read(HL())));
+      break;""".format(op=op, func=info['mnemonic'].lower().capitalize(), **info))
+
 
 
 if doit:

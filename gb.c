@@ -548,6 +548,16 @@ byte Sla(byte arg) {
     return v;
 }
 
+byte Srl(byte arg) {
+    // FIXME: this may be very wrong
+    clearFlags();
+    // FIXME: C flag
+    byte v = arg >> 1;
+    setFlag(FLAG_Z, v == 0);
+    return v;
+}
+
+
 void Bit(byte target, int bit) {
     setFlag(FLAG_Z, !bit_check(target, (byte) bit));
     setFlag(FLAG_N, false);
@@ -1918,6 +1928,46 @@ void exec_ext_op(byte opcode){
       A = Swap(A);
       break;
 
+    // SRL B
+    case 0x38:
+      B = Srl(B);
+      break;
+
+    // SRL C
+    case 0x39:
+      C = Srl(C);
+      break;
+
+    // SRL D
+    case 0x3a:
+      D = Srl(D);
+      break;
+
+    // SRL E
+    case 0x3b:
+      E = Srl(E);
+      break;
+
+    // SRL H
+    case 0x3c:
+      H = Srl(H);
+      break;
+
+    // SRL L
+    case 0x3d:
+      L = Srl(L);
+      break;
+
+    // SRL (HL)
+    case 0x3e:
+      cpu_write(HL(), Srl(cpu_read(HL())));
+      break;
+
+    // SRL A
+    case 0x3f:
+      A = Srl(A);
+      break;
+
     // BIT 0 of B
     case 0x40:
       Bit(B, 0);
@@ -2881,7 +2931,7 @@ void exec_ext_op(byte opcode){
 // END EX GENERATED
 
         default:
-            printf("Unimplemented EX opcode %x\n", opcode);
+            printf("Unimplemented EX opcode %x at %x\n", opcode, PC - 2);
             exit(1);
             break;
     }
