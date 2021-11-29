@@ -539,6 +539,15 @@ byte RL(byte arg) {
     return arg;
 }
 
+byte Sla(byte arg) {
+    // FIXME: this may be very wrong
+    clearFlags();
+	  setFlag(FLAG_C, bit_check(arg, 7));
+    byte v = arg << 1;
+    setFlag(FLAG_Z, v == 0);
+    return v;
+}
+
 void Bit(byte target, int bit) {
     setFlag(FLAG_Z, !bit_check(target, (byte) bit));
     setFlag(FLAG_N, false);
@@ -1510,6 +1519,11 @@ void exec_op(byte opcode){
       cycles += 12;
       break;
 
+    // ADD A += d8
+    case 0xc6:
+      A = Add(cpu_read_next());
+      break;
+
     // RST 00H
     case 0xc7:
       push_stack(PC);
@@ -1738,6 +1752,11 @@ void exec_op(byte opcode){
       cycles += 12;
       break;
 
+    // OR A | d8
+    case 0xf6:
+      A = Or(cpu_read_next());
+      break;
+
     // RST 30H
     case 0xf7:
       push_stack(PC);
@@ -1817,6 +1836,46 @@ void exec_ext_op(byte opcode){
     // RL A
     case 0x17:
       A = RL(A);
+      break;
+
+    // SLA B
+    case 0x20:
+      B = Sla(B);
+      break;
+
+    // SLA C
+    case 0x21:
+      C = Sla(C);
+      break;
+
+    // SLA D
+    case 0x22:
+      D = Sla(D);
+      break;
+
+    // SLA E
+    case 0x23:
+      E = Sla(E);
+      break;
+
+    // SLA H
+    case 0x24:
+      H = Sla(H);
+      break;
+
+    // SLA L
+    case 0x25:
+      L = Sla(L);
+      break;
+
+    // SLA (HL)
+    case 0x26:
+      cpu_write(HL(), Sla(cpu_read(HL())));
+      break;
+
+    // SLA A
+    case 0x27:
+      A = Sla(A);
       break;
 
     // SWAP B

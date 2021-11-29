@@ -170,6 +170,12 @@ for op, info in ops['unprefixed'].items():
     case {op}:
       {operand1} = {func}({operand2});
       break;""".format(op=op, func=info['mnemonic'].lower().capitalize(), **info))
+        elif len(info['operand1']) == 1 and info.get('operand2') == 'd8':
+            gen.append("""
+    // {mnemonic} {operand1} += {operand2}
+    case {op}:
+      {operand1} = {func}(cpu_read_next());
+      break;""".format(op=op, func=info['mnemonic'].lower().capitalize(), **info))
         elif len(info['operand1']) == 1 and info.get('operand2') == '(HL)':
             gen.append("""
     // {mnemonic} {operand1} += {operand2}
@@ -235,6 +241,12 @@ for op, info in ops['unprefixed'].items():
     // {mnemonic} A | {operand1}
     case {op}:
       A = {func}(cpu_read(HL()));
+      break;""".format(op=op, func=info['mnemonic'].lower().capitalize(), **info))
+        elif info['operand1'] == 'd8':
+            gen.append("""
+    // {mnemonic} A | {operand1}
+    case {op}:
+      A = {func}(cpu_read_next());
       break;""".format(op=op, func=info['mnemonic'].lower().capitalize(), **info))
     elif info['mnemonic'] == 'XOR':
         if len(info['operand1']) == 1 and not info.get('operand2'):
@@ -521,6 +533,19 @@ for op, info in ops['cbprefixed'].items():
       cpu_write(HL(), RL(cpu_read(HL())));
       break;""".format(op=op, func=info['mnemonic'], **info))
     elif info['mnemonic'] == 'SWAP':
+        if len(info['operand1']) == 1:
+            genex.append("""
+    // {mnemonic} {operand1}
+    case {op}:
+      {operand1} = {func}({operand1});
+      break;""".format(op=op, func=info['mnemonic'].lower().capitalize(), **info))
+        elif info['operand1'] == '(HL)':
+            genex.append("""
+    // {mnemonic} {operand1}
+    case {op}:
+      cpu_write(HL(), {func}(cpu_read(HL())));
+      break;""".format(op=op, func=info['mnemonic'].lower().capitalize(), **info))
+    elif info['mnemonic'] == 'SLA':
         if len(info['operand1']) == 1:
             genex.append("""
     // {mnemonic} {operand1}
