@@ -161,6 +161,7 @@ void gpu_step(int _cycles){
 //
 
 char cart_name[30];
+byte cart_type;
 byte *cart_data;
 byte cart_read(int pos){
   // TODO: banking obviously
@@ -196,8 +197,14 @@ void cart_load(char *path) {
         cart_name[i] = c;
     }
     cart_name[i+1] = '\0';
+    cart_type = cart_data[0x147];
 
     printf("Loaded %s\n", cart_name);
+
+    if (cart_type !=0){
+        printf("Invalid romtype %x: MBC not yet supported\n", cart_type);
+        exit(1);
+    }
 }
 
 //
@@ -677,6 +684,13 @@ void exec_op(byte opcode){
     // RLCA
     case 0x07:
       A = Rlc(A);
+      break;
+
+    // LD (a16) <- SP
+    case 0x08:
+      pos = cpu_read16();
+      cpu_write(pos, SP&0x00ff);
+      cpu_write(pos+1, (SP&0xff00)>>8);
       break;
 
     // ADD HL += BC

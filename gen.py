@@ -149,6 +149,14 @@ for op, info in ops['unprefixed'].items():
     case {op}:
       cpu_write(HL(), cpu_read_next());
       break;""".format(op=op, **info))
+        elif info['operand1'] == '(a16)' and info.get('operand2') == 'SP':
+            gen.append("""
+    // {mnemonic} {operand1} <- {operand2}
+    case {op}:
+      pos = cpu_read16();
+      cpu_write(pos, SP&0x00ff);
+      cpu_write(pos+1, (SP&0xff00)>>8);
+      break;""".format(op=op, **info))
     elif info['mnemonic'] == 'LDH':
         if len(info['operand2']) == 1 and info.get('operand1') == '(a8)':
             gen.append("""
