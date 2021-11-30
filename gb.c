@@ -582,6 +582,31 @@ byte Srl(byte arg) {
     return v;
 }
 
+byte DAA(byte reg) {
+    //
+    // Ripped from https://forums.nesdev.com/viewtopic.php?t=15944#p196282
+    //
+    if (!CheckFlag(FLAG_N)) { // after an addition, adjust if (half-)carry occurred or if result is out of bounds
+        if (CheckFlag(FLAG_C) || reg > 0x99) {
+            reg += 0x60;
+            setFlag(FLAG_C, true);
+        }
+        if (CheckFlag(FLAG_H) || (reg&0x0f) > 0x09) {
+            reg += 0x6;
+        }
+    } else { // after a subtraction, only adjust if (half-)carry occurred
+        if (CheckFlag(FLAG_C)) {
+            reg -= 0x60;
+        }
+        if (CheckFlag(FLAG_H)) {
+            reg -= 0x6;
+        }
+    }
+    // these flags are always updated
+    setFlag(FLAG_Z, reg == 0);
+    setFlag(FLAG_H, false);
+    return reg;
+}
 
 void Bit(byte target, int bit) {
     setFlag(FLAG_Z, !bit_check(target, (byte) bit));
@@ -814,6 +839,11 @@ void exec_op(byte opcode){
     // LD H <- d8
     case 0x26:
       H = cpu_read_next();
+      break;
+
+    // DAA
+    case 0x27:
+      A = DAA(A);
       break;
 
     // JR Z

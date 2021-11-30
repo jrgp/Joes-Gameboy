@@ -460,6 +460,12 @@ for op, info in ops['unprefixed'].items():
     case {op}:
       A = Rlc(A);
       break;""".format(op=op, **info))
+    elif info['mnemonic'] == 'DAA':
+        gen.append("""
+    // {mnemonic}
+    case {op}:
+      A = DAA(A);
+      break;""".format(op=op, **info))
 
 if doit:
     path = 'gb.c'
