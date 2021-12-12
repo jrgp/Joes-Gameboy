@@ -82,11 +82,11 @@ void gpu_write(int pos, byte data){
 }
 
 uint32_t gpu_pallete_color(byte number, int paletteIndex) {
-    byte config = VRAM[paletteIndex];
+    const byte config = VRAM[paletteIndex];
     byte resultindex = 0;
 
-    byte b1 = number * 2;
-    byte b2 = (number * 2) + 1;
+    const byte b1 = number * 2;
+    const byte b2 = (number * 2) + 1;
 
     if(bit_check(config, b1)){
         resultindex = bit_set(resultindex, 1);
@@ -96,7 +96,7 @@ uint32_t gpu_pallete_color(byte number, int paletteIndex) {
         resultindex = bit_set(resultindex, 0);
     }
 
-    uint32_t color = pallette[resultindex];
+    const uint32_t color = pallette[resultindex];
 
     return color;
 }
@@ -104,10 +104,10 @@ uint32_t gpu_pallete_color(byte number, int paletteIndex) {
 void gpu_render_tile(byte ly, int xprefix, int tileIndex, int paletteIndex, bool flipx, bool flipy){
 
     // Start of tile data
-    int start = gpu_control.BgWindowTileData + (16 * tileIndex);
+    const int start = gpu_control.BgWindowTileData + (16 * tileIndex);
 
-    byte high = VRAM[start + ((ly % 8)*2)];
-    byte low = VRAM[start + ((ly % 8)*2)+1];
+    const byte high = VRAM[start + ((ly % 8)*2)];
+    const byte low = VRAM[start + ((ly % 8)*2)+1];
     byte x = 7;
     for (byte i = 0; i < 8; i++) {
       byte wat = 0;
@@ -128,7 +128,7 @@ void gpu_draw_bg(byte ly){
     if (gpu_control.bg) {
         for (int tile = 0; tile < 32; tile++) {
             // Index of tile from sprite map
-            int tileIndex = VRAM[gpu_control.bgtilemap + ((ly / 8)*32) + tile];
+            const int tileIndex = VRAM[gpu_control.bgtilemap + ((ly / 8)*32) + tile];
             gpu_render_tile(ly, (tile*8), tileIndex, BGP, false, false);
         }
 
@@ -144,22 +144,25 @@ void gpu_draw_sprites(byte ly){
         // Iterate through all 40 sprites, looking for
         // ones that overlap within the current LY value
         for (int i = 0; i < 40; i++) {
-            int start = 0xFE00 + (i * 4);
-            byte y = VRAM[start + 1];
-            byte x = VRAM[start];
+            const int start = 0xFE00 + (i * 4);
+            const byte y = VRAM[start + 1];
+            const byte x = VRAM[start];
 
             // does not overlap with our scanline; skip.
             if (y < ly || (y + 8) >= ly) {
+                if (y != 0 || x != 0){
+                    printf("SKIPPING sprite at %d %d (LY: %d)\n", y, x, ly);
+                }
                 continue;
             }
 
            // printf("not skpping sprite at %d %d (LY: %d)", y, x, ly);
             printf("NOT SKIPPING sprite at %d %d (LY: %d)\n", y, x, ly);
 
-            byte tileIndex = VRAM[start + 2];
-            byte flags = VRAM[start + 3];
-            bool flipy = bit_check(flags, 6);
-            bool flipx = bit_check(flags, 5);
+            const byte tileIndex = VRAM[start + 2];
+            const byte flags = VRAM[start + 3];
+            const bool flipy = bit_check(flags, 6);
+            const bool flipx = bit_check(flags, 5);
             int paletteIndex;
             if (bit_check(flags, 4)) {
                 paletteIndex = OBP1;
@@ -185,7 +188,7 @@ void gpu_step(int _cycles){
             gpu_cycles = 0;
 
             VRAM[LY]++;
-            byte ly = VRAM[LY];
+            const byte ly = VRAM[LY];
 
             if (ly == 144) {
 
@@ -233,7 +236,7 @@ void cart_load(char *path) {
     int i = 0;
 
     for (int pos = 0x0134; pos <= 0x0144; pos++, i++) {
-        byte c = cart_data[pos];
+        const byte c = cart_data[pos];
         if (c == 0 || (char) c == ' ') {
             break;
         }
@@ -280,7 +283,7 @@ void request_interrupt(byte interrupt){
 }
 
 void mem_dma(byte data) {
-	int start = (int)data * 100;
+	const int start = (int)data * 100;
 	for (int i = 0; i <= 0x9f; i++) {
     mem_write(0xFE00+i, mem_read(start+i));
 	}
@@ -380,8 +383,8 @@ void cpu_init(){
 }
 
 void push_stack(word data) {
-    byte f1 = data & 0x00ff;
-    byte f2 = (data & 0xff00) >> 8;
+    const byte f1 = data & 0x00ff;
+    const byte f2 = (data & 0xff00) >> 8;
 
     SP -= 2;
     mem_write(SP, f1);
@@ -389,15 +392,15 @@ void push_stack(word data) {
 }
 
 word pop_stack() {
-    word f1 = mem_read(SP);
-    word f2 = mem_read(SP + 1);
+    const word f1 = mem_read(SP);
+    const word f2 = mem_read(SP + 1);
     SP += 2;
     return (f2 << 8) | f1;
 }
 
 word peek_stack() {
-    word f1 = mem_read(SP);
-    word f2 = mem_read(SP + 1);
+    const word f1 = mem_read(SP);
+    const word f2 = mem_read(SP + 1);
     return (f2 << 8) | f1;
 }
 
@@ -450,14 +453,14 @@ void setHL(word data) {
 }
 
 word HLDec() {
-    word hl = HL();
+    const word hl = HL();
     setHL(hl - 1);
     // System.out.println("Old HL: 0x"+Integer.toHexString(hl));
     return hl;
 }
 
 word HLInc() {
-    word hl = HL();
+    const word hl = HL();
     setHL(hl + 1);
     return hl;
 }
@@ -473,14 +476,14 @@ void cpu_write(int loc, byte value) {
 }
 
 byte cpu_read_next() {
-  byte data = cpu_read(PC);
+  const byte data = cpu_read(PC);
   PC++;
   return data;
 }
 
 word cpu_read16() {
-  byte lo = cpu_read_next();
-  byte hi = cpu_read_next();
+  const byte lo = cpu_read_next();
+  const byte hi = cpu_read_next();
   return lo | (hi << 8);
 }
 
@@ -544,7 +547,7 @@ byte Dec(byte reg) {
 }
 
 byte Sub(byte arg) {
-    int result = A - arg;
+    const int result = A - arg;
     setFlag(FLAG_Z, (byte) result == 0);
     setFlag(FLAG_N, true);
     // FIXME: flags + signing + etc
@@ -552,7 +555,7 @@ byte Sub(byte arg) {
 }
 
 byte Add(byte arg) {
-    byte result = A + arg;
+    const byte result = A + arg;
     setFlag(FLAG_Z, result == 0);
     setFlag(FLAG_N, false);
     setFlag(FLAG_H, ((arg & 0x0f) + 1) == 0x10);
@@ -572,7 +575,7 @@ byte Adc(byte arg) {
 }
 
 byte And(byte arg) {
-    byte v = A & arg;
+    const byte v = A & arg;
     clearFlags();
     setFlag(FLAG_Z, v == 0);
     setFlag(FLAG_H, true);
@@ -580,21 +583,21 @@ byte And(byte arg) {
 }
 
 byte Or(byte arg) {
-    byte v = A | arg;
+    const byte v = A | arg;
     clearFlags();
     setFlag(FLAG_Z, v == 0);
     return v;
 }
 
 byte Xor(byte arg) {
-    byte v = A ^ arg;
+    const byte v = A ^ arg;
     clearFlags();
     setFlag(FLAG_Z, v == 0);
     return v;
 }
 
 byte Swap(byte arg) {
-    byte v = ((arg & 0x0F)<<4 | (arg & 0xF0)>>4);
+    const byte v = ((arg & 0x0F)<<4 | (arg & 0xF0)>>4);
     clearFlags();
     setFlag(FLAG_Z, v == 0);
     return v;
@@ -629,7 +632,7 @@ byte Rlc(byte arg) {
 byte Sla(byte arg) {
     // XXX: may be correct per https://github.com/daveallie/rustyboy/blob/master/src/register/alu.rs
     clearFlags();
-    byte v = arg << 1;
+    const byte v = arg << 1;
     setFlag(FLAG_C, (arg & 0x80) == 0x80);
     setFlag(FLAG_Z, v == 0);
     return v;
@@ -638,7 +641,7 @@ byte Sla(byte arg) {
 byte Srl(byte arg) {
     // XXX: may be correct per https://github.com/daveallie/rustyboy/blob/master/src/register/alu.rs
     clearFlags();
-    byte v = arg >> 1;
+    const byte v = arg >> 1;
     setFlag(FLAG_C, (arg & 0x1) == 0x1);
     setFlag(FLAG_Z, v == 0);
     return v;
@@ -677,7 +680,7 @@ void Bit(byte target, int bit) {
 }
 
 void CP(byte to) {
-    int result = (int)A - (int)to;
+    const int result = (int)A - (int)to;
     setFlag(FLAG_N, true);
     setFlag(FLAG_C, result < 0);
     setFlag(FLAG_Z, result == 0);
@@ -751,9 +754,9 @@ void exec_op(byte opcode){
     // ADD HL += BC
     case 0x09:
         {
-            word target = HL();
-            word source = BC();
-            word result = target + source;
+            const word target = HL();
+            const word source = BC();
+            const word result = target + source;
             setHL(result);
             setFlag(FLAG_N, false);
             setFlag(FLAG_C, (0xFFFF-target) < source);
@@ -834,9 +837,9 @@ void exec_op(byte opcode){
     // ADD HL += DE
     case 0x19:
         {
-            word target = HL();
-            word source = DE();
-            word result = target + source;
+            const word target = HL();
+            const word source = DE();
+            const word result = target + source;
             setHL(result);
             setFlag(FLAG_N, false);
             setFlag(FLAG_C, (0xFFFF-target) < source);
@@ -927,9 +930,9 @@ void exec_op(byte opcode){
     // ADD HL += HL
     case 0x29:
         {
-            word target = HL();
-            word source = HL();
-            word result = target + source;
+            const word target = HL();
+            const word source = HL();
+            const word result = target + source;
             setHL(result);
             setFlag(FLAG_N, false);
             setFlag(FLAG_C, (0xFFFF-target) < source);
@@ -996,8 +999,8 @@ void exec_op(byte opcode){
     // INC (HL)
     case 0x34:
       {
-          byte source = cpu_read(HL());
-          byte result = Inc(source);
+          const byte source = cpu_read(HL());
+          const byte result = Inc(source);
           cpu_write(HL(), result);
       }
       break;
@@ -1005,8 +1008,8 @@ void exec_op(byte opcode){
     // DEC (HL)
     case 0x35:
       {
-          byte source = cpu_read(HL());
-          byte result = Dec(source);
+          const byte source = cpu_read(HL());
+          const byte result = Dec(source);
           cpu_write(HL(), result);
       }
       break;
@@ -1028,9 +1031,9 @@ void exec_op(byte opcode){
     // ADD HL += SP
     case 0x39:
         {
-            word target = HL();
-            word source = SP;
-            word result = target + source;
+            const word target = HL();
+            const word source = SP;
+            const word result = target + source;
             setHL(result);
             setFlag(FLAG_N, false);
             setFlag(FLAG_C, (0xFFFF-target) < source);
@@ -3172,7 +3175,7 @@ void sdl_display(){
     }
 
     // Implement scrolling
-    SDL_Rect srcr = {.x = VRAM[SCX], .y = VRAM[SCY], .w = VIEWPORT_WIDTH, .h = VIEWPORT_HEIGHT};
+    const SDL_Rect srcr = {.x = VRAM[SCX], .y = VRAM[SCY], .w = VIEWPORT_WIDTH, .h = VIEWPORT_HEIGHT};
 
     SDL_RenderCopy(renderer, texture, &srcr, NULL);
     SDL_RenderPresent(renderer);
@@ -3182,7 +3185,7 @@ void sdl_display(){
 
 
 bool frame(){
-    uint32_t start_ticks = SDL_GetTicks();
+    const uint32_t start_ticks = SDL_GetTicks();
 
     if (bailAfterBios && !inBios) {
 
@@ -3205,10 +3208,10 @@ bool frame(){
 
     sdl_display();
 
-    uint32_t diff = SDL_GetTicks() - start_ticks;
+    const uint32_t diff = SDL_GetTicks() - start_ticks;
 
     if (diff < 1000/FPS) {
-        uint32_t nap_time = (1000 / FPS) - diff;
+        const uint32_t nap_time = (1000 / FPS) - diff;
         SDL_Delay(nap_time);
     }
 

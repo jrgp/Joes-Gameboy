@@ -36,8 +36,8 @@ for op, info in ops['unprefixed'].items():
     // {mnemonic} {operand1}
     case {op}:
       {{
-          byte source = cpu_read(HL());
-          byte result = {func}(source);
+          const byte source = cpu_read(HL());
+          const byte result = {func}(source);
           cpu_write(HL(), result);
       }}
       break;""".format(op=op, symbol='+' if info['mnemonic'] == 'INC'  else '-', func=info['mnemonic'].lower().capitalize(), **info))
@@ -196,9 +196,9 @@ for op, info in ops['unprefixed'].items():
     // {mnemonic} {operand1} += {operand2}
     case {op}:
         {{
-            word target = HL();
-            word source = {source};
-            word result = target + source;
+            const word target = HL();
+            const word source = {source};
+            const word result = target + source;
             setHL(result);
             setFlag(FLAG_N, false);
             setFlag(FLAG_C, (0xFFFF-target) < source);
