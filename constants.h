@@ -8,6 +8,11 @@
 #define BGP 0xFF47
 #define JOYPAD 0xFF00
 
+#define DMA 0xff46
+
+#define OBP0 0xFF48
+#define OBP1 0xFF49
+
 #define INTERRUPT_ENABLE 0xFFFF
 #define INTERRUPT_FLAGS  0xFF0F
 

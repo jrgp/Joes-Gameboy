@@ -18,6 +18,8 @@ typedef uint16_t word;
 // Forward declare some prototypes
 //
 void request_interrupt(byte interrupt);
+byte mem_read(int pos);
+void mem_write(int pos, byte data);
 
 //
 // GPU
@@ -99,7 +101,7 @@ uint32_t gpu_pallete_color(byte number, int paletteIndex) {
     return color;
 }
 
-void gpu_render_tile(byte ly, int xprefix, int tileIndex, int paletteIndex){
+void gpu_render_tile(byte ly, int xprefix, int tileIndex, int paletteIndex, bool flipx, bool flipy){
 
     // Start of tile data
     int start = gpu_control.BgWindowTileData + (16 * tileIndex);
@@ -127,7 +129,7 @@ void gpu_draw_bg(byte ly){
         for (int tile = 0; tile < 32; tile++) {
             // Index of tile from sprite map
             int tileIndex = VRAM[gpu_control.bgtilemap + ((ly / 8)*32) + tile];
-            gpu_render_tile(ly, (tile*8), tileIndex, BGP);
+            gpu_render_tile(ly, (tile*8), tileIndex, BGP, false, false);
         }
 
     } else {
@@ -141,6 +143,33 @@ void gpu_draw_sprites(byte ly){
     if (gpu_control.sprite) {
         // Iterate through all 40 sprites, looking for
         // ones that overlap within the current LY value
+        for (int i = 0; i < 40; i++) {
+            int start = 0xFE00 + (i * 4);
+            byte y = VRAM[start + 1];
+            byte x = VRAM[start];
+
+            // does not overlap with our scanline; skip.
+            if (y < ly || (y + 8) >= ly) {
+                continue;
+            }
+
+           // printf("not skpping sprite at %d %d (LY: %d)", y, x, ly);
+            printf("NOT SKIPPING sprite at %d %d (LY: %d)\n", y, x, ly);
+
+            byte tileIndex = VRAM[start + 2];
+            byte flags = VRAM[start + 3];
+            bool flipy = bit_check(flags, 6);
+            bool flipx = bit_check(flags, 5);
+            int paletteIndex;
+            if (bit_check(flags, 4)) {
+                paletteIndex = OBP1;
+            } else {
+                paletteIndex = OBP0;
+            }
+
+            printf("drawing tile at %d %d\n", ly, x);
+            gpu_render_tile(ly, x, tileIndex, paletteIndex, flipx, flipy);
+        }
     }
 }
 
@@ -250,6 +279,13 @@ void request_interrupt(byte interrupt){
     RAM[INTERRUPT_FLAGS] |= interrupt;
 }
 
+void mem_dma(byte data) {
+	int start = (int)data * 100;
+	for (int i = 0; i <= 0x9f; i++) {
+    mem_write(0xFE00+i, mem_read(start+i));
+	}
+}
+
 byte mem_read(int pos) {
     if (pos < 256 && inBios) {
         return bios[pos];
@@ -291,6 +327,9 @@ void mem_write(int pos, byte data) {
         case JOYPAD:
             joypad_write(data);
             break;
+        case DMA:
+            mem_dma(data);
+        break;
         default:
             if (pos == 0xFF50 && inBios) {
                 inBios = false;
