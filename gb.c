@@ -99,29 +99,35 @@ uint32_t gpu_pallete_color(byte number, int paletteIndex) {
     return color;
 }
 
+void gpu_render_tile(byte ly, int xprefix, int tileIndex, int paletteIndex){
+
+    // Start of tile data
+    int start = gpu_control.BgWindowTileData + (16 * tileIndex);
+
+    byte high = VRAM[start + ((ly % 8)*2)];
+    byte low = VRAM[start + ((ly % 8)*2)+1];
+    byte x = 7;
+    for (byte i = 0; i < 8; i++) {
+      byte wat = 0;
+      if(bit_check(low, i)){
+        wat |= (1 << 1);
+      }
+      if(bit_check(high, i)){
+        wat |= (1 << 0);
+      }
+
+      set_pixel(xprefix+x, ly, gpu_pallete_color(wat, paletteIndex));
+      x--;
+    }
+
+}
+
 void gpu_draw_bg(byte ly){
     if (gpu_control.bg) {
         for (int tile = 0; tile < 32; tile++) {
             // Index of tile from sprite map
             int tileIndex = VRAM[gpu_control.bgtilemap + ((ly / 8)*32) + tile];
-            // Start of tile data
-            int start = gpu_control.BgWindowTileData + (16 * tileIndex);
-
-            byte high = VRAM[start + ((ly % 8)*2)];
-            byte low = VRAM[start + ((ly % 8)*2)+1];
-            byte x = 7;
-            for (byte i = 0; i < 8; i++) {
-              byte wat = 0;
-              if(bit_check(low, i)){
-                wat |= (1 << 1);
-              }
-              if(bit_check(high, i)){
-                wat |= (1 << 0);
-              }
-
-              set_pixel((tile*8)+x, ly, gpu_pallete_color(wat, BGP));
-              x--;
-            }
+            gpu_render_tile(ly, (tile*8), tileIndex, BGP);
         }
 
     } else {
@@ -131,8 +137,16 @@ void gpu_draw_bg(byte ly){
     }
 }
 
+void gpu_draw_sprites(byte ly){
+    if (gpu_control.sprite) {
+        // Iterate through all 40 sprites, looking for
+        // ones that overlap within the current LY value
+    }
+}
+
 void gpu_drawline(byte ly){
     gpu_draw_bg(ly);
+    gpu_draw_sprites(ly);
 }
 
 void gpu_step(int _cycles){
