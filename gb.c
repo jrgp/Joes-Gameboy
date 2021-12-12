@@ -552,10 +552,11 @@ byte Sub(byte arg) {
 }
 
 byte Add(byte arg) {
-    int result = A + arg;
-    setFlag(FLAG_Z, (byte) result == 0);
-    // FIXME: flags + signing + etc
-    return (byte) result;
+    byte result = A + arg;
+    setFlag(FLAG_Z, result == 0);
+    setFlag(FLAG_N, false);
+    setFlag(FLAG_H, ((arg & 0x0f) + 1) == 0x10);
+    return result;
 }
 
 byte Adc(byte arg) {
@@ -600,20 +601,20 @@ byte Swap(byte arg) {
 }
 
 byte RL(byte arg) {
+    // XXX: may be correct per https://github.com/daveallie/rustyboy/blob/master/src/register/alu.rs
     bool oldC = (arg & 0x80) == 0x80;
     arg <<= 1;
     if (CheckFlag(FLAG_C)) {
-        arg ^= 1;
+        arg |= 1;
     }
     clearFlags();
     setFlag(FLAG_C, oldC);
     setFlag(FLAG_Z, arg == 0); // For RLA this is later set to false.
-    // FIXME: this could be very wrong
     return arg;
 }
 
 byte Rlc(byte arg) {
-    // FIXME: this may be very wrong
+    // XXX: may be correct per https://github.com/daveallie/rustyboy/blob/master/src/register/alu.rs
     bool oldC = (arg & 0x80) == 0x80;
     arg <<= 1;
     if(oldC){
@@ -621,23 +622,24 @@ byte Rlc(byte arg) {
     }
     clearFlags();
     setFlag(FLAG_C, oldC);
+    setFlag(FLAG_Z, arg == 0);
     return arg;
 }
 
 byte Sla(byte arg) {
-    // FIXME: this may be very wrong
+    // XXX: may be correct per https://github.com/daveallie/rustyboy/blob/master/src/register/alu.rs
     clearFlags();
-	  setFlag(FLAG_C, bit_check(arg, 7));
     byte v = arg << 1;
+    setFlag(FLAG_C, (arg & 0x80) == 0x80);
     setFlag(FLAG_Z, v == 0);
     return v;
 }
 
 byte Srl(byte arg) {
-    // FIXME: this may be very wrong
+    // XXX: may be correct per https://github.com/daveallie/rustyboy/blob/master/src/register/alu.rs
     clearFlags();
-    // FIXME: C flag
     byte v = arg >> 1;
+    setFlag(FLAG_C, (arg & 0x1) == 0x1);
     setFlag(FLAG_Z, v == 0);
     return v;
 }
