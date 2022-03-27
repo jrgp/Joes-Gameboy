@@ -257,18 +257,33 @@ void cart_load(char *path) {
 // Joypad
 //
 
+byte joypad;
+
+void joypad_init(){
+  // Start all buttons off as pressed
+  joypad = bit_set(joypad, 3);
+  joypad = bit_set(joypad, 2);
+  joypad = bit_set(joypad, 1);
+  joypad = bit_set(joypad, 0);
+}
+
 byte joypad_read(){
-  byte foo = 0;
-  // Fake not pressing any buttons
-  foo = bit_set(foo, 3);
-  foo = bit_set(foo, 2);
-  foo = bit_set(foo, 1);
-  foo = bit_set(foo, 0);
-  return foo;
+  // maybe add more logic here?
+  return joypad;
 }
 
 void joypad_write(byte data){
-  printf("writing %x to joypad\n", data);
+  // Only allow setting the RW bits
+  if (bit_check(data, 5)) {
+    joypad = bit_set(joypad, 5);
+  } else {
+    joypad = bit_clear(joypad, 5);
+  }
+  if (bit_check(data, 4)) {
+    joypad = bit_set(joypad, 4);
+  } else {
+    joypad = bit_clear(joypad, 4);
+  }
 }
 
 //
@@ -3220,15 +3235,76 @@ bool frame(){
 
 void sdl_main_impl(void){
   bool run = true;
+  byte old;
+  bool req_interrupt ;
 
 
   SDL_Event event;
   while(run) {
       while (SDL_PollEvent(&event)) {
-          if (event.type == SDL_QUIT) {
-              printf("got quit event\n");
-              run = false;
-              return;
+          switch (event.type) {
+              case SDL_QUIT:
+                  printf("got quit event\n");
+                  run = false;
+                  return;
+              case SDL_KEYDOWN:
+              case SDL_KEYUP:
+                  old = joypad;
+                  req_interrupt = false;
+                  switch (event.key.keysym.sym) {
+                      case SDLK_RIGHT: // RIGHT
+                        if (bit_check(joypad, 4)){
+                            joypad = bit_def(joypad, 0, event.key.type == SDL_KEYUP);
+                            req_interrupt = (old != joypad);
+                        }
+                      break;
+                      case SDLK_LEFT: // LEFT
+                        if (bit_check(joypad, 4)){
+                            joypad = bit_def(joypad, 1, event.key.type == SDL_KEYUP);
+                            req_interrupt = (old != joypad);
+                        }
+                      break;
+                      case SDLK_UP: // UP
+                        if (bit_check(joypad, 4)){
+                            joypad = bit_def(joypad, 2, event.key.type == SDL_KEYUP);
+                            req_interrupt = (old != joypad);
+                        }
+                      break;
+                      case SDLK_DOWN: // DOWN
+                        if (bit_check(joypad, 4)){
+                            joypad = bit_def(joypad, 3, event.key.type == SDL_KEYUP);
+                            req_interrupt = (old != joypad);
+                        }
+                      break;
+                      case SDLK_a: // A
+                        if (bit_check(joypad, 5)){
+                            joypad = bit_def(joypad, 0, event.key.type == SDL_KEYUP);
+                            req_interrupt = (old != joypad);
+                        }
+                      break;
+                      case SDLK_s: // B
+                        if (bit_check(joypad, 5)){
+                            joypad = bit_def(joypad, 1, event.key.type == SDL_KEYUP);
+                            req_interrupt = (old != joypad);
+                        }
+                      break;
+                      case SDLK_RSHIFT: // SELECT
+                        if (bit_check(joypad, 5)){
+                            joypad = bit_def(joypad, 2, event.key.type == SDL_KEYUP);
+                            req_interrupt = (old != joypad);
+                        }
+                      break;
+                      case SDLK_RETURN: // ENTER
+                        if (bit_check(joypad, 5)){
+                            joypad = bit_def(joypad, 3, event.key.type == SDL_KEYUP);
+                            req_interrupt = (old != joypad);
+                        }
+                      break;
+                  }
+                  if (req_interrupt) {
+                      request_interrupt(INTERRUPT_JOYPAD);
+                  }
+                  break;
           }
       }
 
@@ -3243,6 +3319,7 @@ int main(){
   cpu_init();
   gpu_init();
   sdl_init();
+  joypad_init();
 
   sdl_main_impl();
 
