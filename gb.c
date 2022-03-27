@@ -259,17 +259,43 @@ void cart_load(char *path) {
 
 byte joypad;
 
+typedef struct {
+  bool A, B, SELECT, START,
+    UP, DOWN, LEFT, RIGHT;
+} JOYPADBUTTONS;
+
+JOYPADBUTTONS joypad_buttons;
+
 void joypad_init(){
-  // Start all buttons off as pressed
-  joypad = bit_set(joypad, 3);
-  joypad = bit_set(joypad, 2);
-  joypad = bit_set(joypad, 1);
-  joypad = bit_set(joypad, 0);
+  joypad_buttons.START = false;
+  joypad_buttons.SELECT = false;
+  joypad_buttons.A = false;
+  joypad_buttons.B = false;
+  joypad_buttons.UP = false;
+  joypad_buttons.DOWN = false;
+  joypad_buttons.LEFT = false;
+  joypad_buttons.RIGHT = false;
 }
 
 byte joypad_read(){
-  // maybe add more logic here?
-  return joypad;
+  // Want button keys
+  byte result = 0;
+  if (!bit_check(joypad, 5)){
+      result = bit_def(result, 3, !joypad_buttons.START);
+      result = bit_def(result, 2, !joypad_buttons.SELECT);
+      result = bit_def(result, 1, !joypad_buttons.B);
+      result = bit_def(result, 0, !joypad_buttons.A);
+  }
+
+  // Want arrows
+  if (!bit_check(joypad, 4)){
+      result = bit_def(result, 3, !joypad_buttons.DOWN);
+      result = bit_def(result, 2, !joypad_buttons.UP);
+      result = bit_def(result, 1, !joypad_buttons.LEFT);
+      result = bit_def(result, 0, !joypad_buttons.RIGHT);
+  }
+
+  return result;
 }
 
 void joypad_write(byte data){
@@ -285,6 +311,7 @@ void joypad_write(byte data){
     joypad = bit_clear(joypad, 4);
   }
 }
+
 
 //
 // RAM
@@ -3235,9 +3262,8 @@ bool frame(){
 
 void sdl_main_impl(void){
   bool run = true;
-  byte old;
-  bool req_interrupt ;
-
+  bool *joypad_key;
+  bool joypad_last;
 
   SDL_Event event;
   while(run) {
@@ -3249,59 +3275,35 @@ void sdl_main_impl(void){
                   return;
               case SDL_KEYDOWN:
               case SDL_KEYUP:
-                  old = joypad;
-                  req_interrupt = false;
                   switch (event.key.keysym.sym) {
                       case SDLK_RIGHT: // RIGHT
-                        if (bit_check(joypad, 4)){
-                            joypad = bit_def(joypad, 0, event.key.type == SDL_KEYUP);
-                            req_interrupt = (old != joypad);
-                        }
+                        joypad_key = &joypad_buttons.RIGHT;
                       break;
                       case SDLK_LEFT: // LEFT
-                        if (bit_check(joypad, 4)){
-                            joypad = bit_def(joypad, 1, event.key.type == SDL_KEYUP);
-                            req_interrupt = (old != joypad);
-                        }
+                        joypad_key = &joypad_buttons.LEFT;
                       break;
                       case SDLK_UP: // UP
-                        if (bit_check(joypad, 4)){
-                            joypad = bit_def(joypad, 2, event.key.type == SDL_KEYUP);
-                            req_interrupt = (old != joypad);
-                        }
+                        joypad_key = &joypad_buttons.UP;
                       break;
                       case SDLK_DOWN: // DOWN
-                        if (bit_check(joypad, 4)){
-                            joypad = bit_def(joypad, 3, event.key.type == SDL_KEYUP);
-                            req_interrupt = (old != joypad);
-                        }
+                        joypad_key = &joypad_buttons.DOWN;
                       break;
                       case SDLK_a: // A
-                        if (bit_check(joypad, 5)){
-                            joypad = bit_def(joypad, 0, event.key.type == SDL_KEYUP);
-                            req_interrupt = (old != joypad);
-                        }
+                        joypad_key = &joypad_buttons.A;
                       break;
                       case SDLK_s: // B
-                        if (bit_check(joypad, 5)){
-                            joypad = bit_def(joypad, 1, event.key.type == SDL_KEYUP);
-                            req_interrupt = (old != joypad);
-                        }
+                        joypad_key = &joypad_buttons.B;
                       break;
                       case SDLK_RSHIFT: // SELECT
-                        if (bit_check(joypad, 5)){
-                            joypad = bit_def(joypad, 2, event.key.type == SDL_KEYUP);
-                            req_interrupt = (old != joypad);
-                        }
+                        joypad_key = &joypad_buttons.SELECT;
                       break;
-                      case SDLK_RETURN: // ENTER
-                        if (bit_check(joypad, 5)){
-                            joypad = bit_def(joypad, 3, event.key.type == SDL_KEYUP);
-                            req_interrupt = (old != joypad);
-                        }
+                      case SDLK_RETURN: // START
+                        joypad_key = &joypad_buttons.START;
                       break;
                   }
-                  if (req_interrupt) {
+                  joypad_last = *joypad_key;
+                  *joypad_key = event.key.type == SDL_KEYDOWN;
+                  if (joypad_last != *joypad_key) {
                       request_interrupt(INTERRUPT_JOYPAD);
                   }
                   break;
