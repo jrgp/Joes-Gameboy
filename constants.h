@@ -30,6 +30,14 @@ char INTERRUPT_PRIORITY[5] = {
 	INTERRUPT_JOYPAD
 };
 
+char *INTERRUPT_NAMES[5] = {
+	"VBLANK",
+	"STAT",
+	"TIMER",
+	"SERIAL",
+	"JOYPAD"
+};
+
 uint16_t INTERRUPT_OFFSETS[5] = {
 	0x40,
 	0x48,

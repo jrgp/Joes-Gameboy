@@ -503,7 +503,7 @@ void do_interrupts(){
           if ((enabled & interrupt) != 0) {
             flag_bits = flag_bits & ~interrupt;
 
-            printf("Doing interrupt %d (%x)\n", interrupt, INTERRUPT_OFFSETS[i]);
+            printf("Doing interrupt %s (%x)\n", INTERRUPT_NAMES[i], INTERRUPT_OFFSETS[i]);
             push_stack(PC);
 
             PC = INTERRUPT_OFFSETS[i];
