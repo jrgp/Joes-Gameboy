@@ -931,6 +931,11 @@ void exec_op(byte opcode){
       E = cpu_read_next();
       break;
 
+    // RRA
+    case 0x1f:
+      A = Rr(A, true);
+      break;
+
     // JR NZ
     case 0x20:
       offset = cpu_read_next();

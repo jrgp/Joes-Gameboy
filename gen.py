@@ -474,6 +474,12 @@ for op, info in ops['unprefixed'].items():
     case {op}:
       A = DAA(A);
       break;""".format(op=op, **info))
+    elif info['mnemonic'] == 'RRA':
+        gen.append("""
+    // {mnemonic}
+    case {op}:
+      A = {func}(A, true);
+      break;""".format(op=op, func='RR'.lower().capitalize(), **info))
 
 if doit:
     path = 'gb.c'
