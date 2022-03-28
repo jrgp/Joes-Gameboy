@@ -545,7 +545,7 @@ void do_interrupts(){
           if ((enabled & interrupt) != 0) {
             flag_bits = flag_bits & ~interrupt;
 
-            printf("Doing interrupt %s (%x)\n", INTERRUPT_NAMES[i], INTERRUPT_OFFSETS[i]);
+            //printf("Doing interrupt %s (%x)\n", INTERRUPT_NAMES[i], INTERRUPT_OFFSETS[i]);
             push_stack(PC);
 
             PC = INTERRUPT_OFFSETS[i];
@@ -3275,6 +3275,7 @@ void sdl_main_impl(void){
                   return;
               case SDL_KEYDOWN:
               case SDL_KEYUP:
+                  joypad_key = NULL;
                   switch (event.key.keysym.sym) {
                       case SDLK_RIGHT: // RIGHT
                         joypad_key = &joypad_buttons.RIGHT;
@@ -3301,10 +3302,12 @@ void sdl_main_impl(void){
                         joypad_key = &joypad_buttons.START;
                       break;
                   }
-                  joypad_last = *joypad_key;
-                  *joypad_key = event.key.type == SDL_KEYDOWN;
-                  if (joypad_last != *joypad_key) {
-                      request_interrupt(INTERRUPT_JOYPAD);
+                  if (joypad_key != NULL) {
+                      joypad_last = *joypad_key;
+                      *joypad_key = event.key.type == SDL_KEYDOWN;
+                      if (joypad_last != *joypad_key) {
+                          request_interrupt(INTERRUPT_JOYPAD);
+                      }
                   }
                   break;
           }
