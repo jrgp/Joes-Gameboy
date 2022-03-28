@@ -658,6 +658,22 @@ byte RL(byte arg) {
     return arg;
 }
 
+byte Rr(byte arg, bool isA) {
+    // XXX: may be correct per https://github.com/drhelius/Gearboy/blob/master/src/Processor_inline.h#L586
+    byte carry = CheckFlag(FLAG_C) ? 0x80 : 0x00;
+    byte result = arg;
+    if ((result & 0x01) != 0) {
+      setFlag(FLAG_C, true);
+    }
+    result >>= 1;
+    result |= carry;
+    if (!isA) {
+      setFlag(FLAG_Z, arg == 0);
+    }
+    return result;
+}
+
+
 byte Rlc(byte arg) {
     // XXX: may be correct per https://github.com/daveallie/rustyboy/blob/master/src/register/alu.rs
     bool oldC = (arg & 0x80) == 0x80;
@@ -2070,6 +2086,41 @@ void exec_ext_op(byte opcode){
     // RL A
     case 0x17:
       A = RL(A);
+      break;
+
+    // RR B
+    case 0x18:
+      B = Rr(B, false);
+      break;
+
+    // RR C
+    case 0x19:
+      C = Rr(C, false);
+      break;
+
+    // RR D
+    case 0x1a:
+      D = Rr(D, false);
+      break;
+
+    // RR E
+    case 0x1b:
+      E = Rr(E, false);
+      break;
+
+    // RR H
+    case 0x1c:
+      H = Rr(H, false);
+      break;
+
+    // RR L
+    case 0x1d:
+      L = Rr(L, false);
+      break;
+
+    // RR A
+    case 0x1f:
+      A = Rr(A, true);
       break;
 
     // SLA B

@@ -190,7 +190,7 @@ for op, info in ops['unprefixed'].items():
     case {op}:
       {operand1} = Add(cpu_read(HL()));
       break;""".format(op=op, **info))
-        elif info['mnemonic'] == 'ADD' and info['operand1'] == 'HL' and len(info.get('operand2')) == 2:
+        elif info['operand1'] == 'HL' and len(info.get('operand2')) == 2:
             # credit: https://github.com/daveallie/rustyboy/blob/master/src/register/alu.rs#L116
             gen.append("""
     // {mnemonic} {operand1} += {operand2}
@@ -597,6 +597,13 @@ for op, info in ops['cbprefixed'].items():
     case {op}:
       cpu_write(HL(), {func}(cpu_read(HL())));
       break;""".format(op=op, func=info['mnemonic'].lower().capitalize(), **info))
+    elif info['mnemonic'] == 'RR':
+        if len(info['operand1']) == 1:
+            genex.append("""
+    // {mnemonic} {operand1}
+    case {op}:
+      {operand1} = {func}({operand1}, {isA});
+      break;""".format(op=op, func=info['mnemonic'].lower().capitalize(), isA=('true' if info['operand1'] == 'A' else 'false'), **info))
 
 
 
