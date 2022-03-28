@@ -247,7 +247,7 @@ void cart_load(char *path) {
 
     printf("Loaded %s\n", cart_name);
 
-    if (cart_type !=0){
+    if (cart_type !=0&&cart_type!=1){
         printf("Invalid romtype %x: MBC not yet supported\n", cart_type);
         exit(1);
     }
