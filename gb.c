@@ -3318,8 +3318,16 @@ void sdl_main_impl(void){
 
 }
 
-int main(){
-  cart_load("tetris.gb");
+int main(int argc, char **argv){
+
+  char *rom = "tetris.gb";
+
+  if (argc == 2) {
+    rom = argv[1];
+  }
+
+  cart_load(rom);
+
   mem_init();
   cpu_init();
   gpu_init();
