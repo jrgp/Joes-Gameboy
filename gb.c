@@ -27,7 +27,6 @@ void mem_write(int pos, byte data);
 int gpu_cycles;
 byte VRAM[0xffff + 1];
 
-SDL_Surface* surface;
 uint32_t *pixels;
 
 typedef struct {
@@ -60,7 +59,7 @@ void gpu_parse_control(byte control){
     }
 }
 
-#define set_pixel(x,y,c) pixels[(y * surface->w) + x] = c;
+#define set_pixel(x,y,c) pixels[(y * VIEWPORT_WIDTH) + x] = c;
 
 void gpu_init(){
     memset(VRAM, 0, 0xffff + 1);
@@ -3257,28 +3256,39 @@ void sdl_init(){
         exit(1);
     }
 
-    surface = SDL_CreateRGBSurface(0, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, 32, 0, 0, 0, 0);
-    if (surface == NULL) {
-          printf("Surface could not be created! SDL Error: %s\n", SDL_GetError());
-          exit(1);
-    }
-    pixels = (uint32_t*)surface->pixels;
-}
-
-void sdl_display(){
-    texture = SDL_CreateTextureFromSurface(renderer, surface);
+    texture = SDL_CreateTexture(renderer,
+        SDL_PIXELFORMAT_RGBA32,
+        SDL_TEXTUREACCESS_STREAMING,
+        VIEWPORT_WIDTH, VIEWPORT_HEIGHT);
     if (texture == NULL) {
           printf("Texture could not be created! SDL Error: %s\n", SDL_GetError());
           exit(1);
     }
 
-    // Implement scrolling
+    pixels = malloc(sizeof(uint32_t) * VIEWPORT_WIDTH * VIEWPORT_HEIGHT);
+    if (pixels == NULL) {
+          printf("Could not malloc pixels");
+          exit(1);
+    }
+}
+
+void sdl_display(){
+    int result = SDL_UpdateTexture(texture, NULL, pixels, VIEWPORT_WIDTH*sizeof(uint32_t));
+
+    if (result != 0) {
+          printf("Texture could not be updated! SDL Error: %s\n", SDL_GetError());
+          exit(1);
+    }
+
     const SDL_Rect srcr = {.x = VRAM[SCX], .y = VRAM[SCY], .w = VIEWPORT_WIDTH, .h = VIEWPORT_HEIGHT};
 
-    SDL_RenderCopy(renderer, texture, &srcr, NULL);
+    result = SDL_RenderCopy(renderer, texture, &srcr, NULL);
+    if (result != 0) {
+          printf("SDL_RenderCopy failed. SDL Error: %s\n", SDL_GetError());
+          exit(1);
+    }
+
     SDL_RenderPresent(renderer);
-    SDL_DestroyTexture(texture);
-    texture = NULL;
 }
 
 
