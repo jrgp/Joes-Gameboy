@@ -639,7 +639,7 @@ byte Sub(byte arg) {
     setFlag(FLAG_Z,  (result&0x0ff) == 0);
     setFlag(FLAG_N, true);
     setFlag(FLAG_C, (result & 0xFF00)!=0);
-    // FIXME: flags + signing + etc
+    setFlag(FLAG_H,  (A & 0x0F) < (arg & 0x0F));
     return  result&0x0ff;
 }
 
@@ -647,7 +647,8 @@ byte Add(byte arg) {
     const byte result = A + arg;
     setFlag(FLAG_Z, result == 0);
     setFlag(FLAG_N, false);
-    setFlag(FLAG_H, ((arg & 0x0f) + 1) == 0x10);
+    setFlag(FLAG_H, (A & 0x0F) + (arg & 0x0F) > 0x0F);
+    setFlag(FLAG_C, 0xFF - A < arg);
     return result;
 }
 
@@ -660,6 +661,7 @@ byte Adc(byte arg) {
     setFlag(FLAG_N, false);
     setFlag(FLAG_C, (result > 0xff));
     setFlag(FLAG_H, (((A&0xf)+(arg&0xf))&0x10) == 0x10);
+    setFlag(FLAG_Z, (byte)result == 0);
     return (byte)result;
 }
 
@@ -706,17 +708,17 @@ byte RL(byte arg) {
 }
 
 byte Rr(byte arg, bool isA) {
-    // XXX: may be correct per https://github.com/drhelius/Gearboy/blob/master/src/Processor_inline.h#L586
-    byte carry = CheckFlag(FLAG_C) ? 0x80 : 0x00;
-    byte result = arg;
-    if ((result & 0x01) != 0) {
-      setFlag(FLAG_C, true);
+    bool lsb = (arg & 1) > 0;
+    byte result;
+    if (CheckFlag(FLAG_C)){
+        result = (arg >> 1) | 0x80;
+    } else {
+        result = (arg >> 1);
     }
-    result >>= 1;
-    result |= carry;
-    if (!isA) {
-      setFlag(FLAG_Z, arg == 0);
-    }
+    setFlag(FLAG_Z, result == 0);
+    setFlag(FLAG_C, lsb);
+    setFlag(FLAG_H, false);
+    setFlag(FLAG_N, false);
     return result;
 }
 
@@ -785,11 +787,9 @@ void Bit(byte target, int bit) {
 }
 
 void CP(byte to) {
-    const int result = (int)A - (int)to;
-    setFlag(FLAG_N, true);
-    setFlag(FLAG_C, result < 0);
-    setFlag(FLAG_Z, result == 0);
-    // FIXME: carry flag
+    byte tmp = A;
+    Sub(to);
+    A = tmp;
 }
 
 //
