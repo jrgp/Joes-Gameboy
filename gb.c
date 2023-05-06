@@ -1969,7 +1969,11 @@ void exec_op(byte opcode){
 
     // LDH (a8) <- A
     case 0xe0:
-      cpu_write(cpu_read_next() + 0xFF00, A);
+      {
+          const byte immediate = cpu_read_next();
+          const word addr = 0xFF00 | immediate;
+          cpu_write(addr, A);
+      }
       break;
 
     // POP HL
@@ -1980,7 +1984,10 @@ void exec_op(byte opcode){
 
     // LD (C) <- A
     case 0xe2:
-      cpu_write(C + 0xFF00, A);
+      {
+      const word addr = 0xFF00 | C;
+      cpu_write(addr, A);
+      }
       break;
 
     // PUSH HL
@@ -2025,7 +2032,11 @@ void exec_op(byte opcode){
 
     // LDH A <- (a8)
     case 0xf0:
-      A = cpu_read(cpu_read_next() + 0xFF00);
+      {
+          const byte immediate = cpu_read_next();
+          const word addr = 0xFF00 | immediate;
+          A = cpu_read(addr);
+      }
       break;
 
     // POP AF
@@ -2036,7 +2047,10 @@ void exec_op(byte opcode){
 
     // LD A <- (C)
     case 0xf2:
-      A = cpu_read(C + 0xFF00);
+          {
+          const word addr = 0xFF00 | C;
+          A = cpu_read(addr);
+      }
       break;
 
     // DI
