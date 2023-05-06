@@ -20,6 +20,7 @@ typedef uint16_t word;
 void request_interrupt(byte interrupt);
 byte mem_read(int pos);
 void mem_write(int pos, byte data);
+FILE *debug_logfile;
 
 //
 // GPU
@@ -186,8 +187,7 @@ void gpu_step(int _cycles){
         if (gpu_cycles >= 456) {
             gpu_cycles = 0;
 
-            VRAM[LY]++;
-            const byte ly = VRAM[LY];
+            const byte ly = ++VRAM[LY];
 
             if (ly == 144) {
 
@@ -196,6 +196,10 @@ void gpu_step(int _cycles){
             } else if (ly < 144) {
                 // draw scanline
                 gpu_drawline(ly);
+            }
+
+            if (debug_logfile != NULL) {
+                VRAM[LY] = 0x90;
             }
         }
     }
@@ -405,9 +409,10 @@ void mem_init(){
 byte F, A, C, B, E, D, L, H;
 
 int cycles;
-int PC;
+word PC;
 word SP;
 bool interrupts;
+
 
 void cpu_init(){
     F = 0;
@@ -421,6 +426,42 @@ void cpu_init(){
     cycles = 0;
     PC = 0;
     SP = 0;
+}
+
+void cpu_init_debug_file(){
+  debug_logfile = fopen("debug_out.txt", "w");
+  if (!debug_logfile) {
+    perror("fopen");
+    exit(1);
+  }
+}
+
+void cpu_close_debug_file(){
+  if (debug_logfile != NULL) {
+    fclose(debug_logfile);
+  }
+}
+
+void cpu_fake_init(){
+    F = 0xB0;
+    A = 0x01;
+    C = 0x13;
+    B = 0x00;
+    E = 0xD8;
+    D = 0x00;
+    L = 0x4D;
+    H = 0x01;
+    cycles = 0;
+    PC = 0x0100;
+    SP = 0xFFFE;
+}
+
+void cpu_debug_log() {
+  fprintf(
+      debug_logfile,
+      "A:%02X F:%02X B:%02X C:%02X D:%02X E:%02X H:%02X L:%02X SP:%04X PC:%04X PCMEM:%02X,%02X,%02X,%02X\n",
+      A, F, B, C, D, E, H, L, SP, PC,
+      mem_read(PC), mem_read(PC+1), mem_read(PC+2), mem_read(PC+3));
 }
 
 void push_stack(word data) {
@@ -548,6 +589,7 @@ void do_interrupts(){
             push_stack(PC);
 
             PC = INTERRUPT_OFFSETS[i];
+            break;
           }
         }
 
@@ -575,7 +617,8 @@ void clearFlags() {
 byte Inc(byte reg) {
     reg++;
     setFlag(FLAG_Z, reg == 0);
-    // FIXME: flags + signing + etc
+    setFlag(FLAG_N, false);
+    setFlag(FLAG_H, (reg & 0xf)==0);
     return reg;
 }
 
@@ -583,16 +626,17 @@ byte Dec(byte reg) {
     reg--;
     setFlag(FLAG_Z, reg == 0);
     setFlag(FLAG_N, true);
-    // FIXME: flags + signing + etc
+    setFlag(FLAG_H, (reg & 0xf)==0xf);
     return reg;
 }
 
 byte Sub(byte arg) {
-    const int result = A - arg;
-    setFlag(FLAG_Z, (byte) result == 0);
+    const word result = A - arg;
+    setFlag(FLAG_Z,  (result&0x0ff) == 0);
     setFlag(FLAG_N, true);
+    setFlag(FLAG_C, (result & 0xFF00)!=0);
     // FIXME: flags + signing + etc
-    return (byte) result;
+    return  result&0x0ff;
 }
 
 byte Add(byte arg) {
@@ -3219,6 +3263,9 @@ void exec_ext_op(byte opcode){
 bool debug = false;
 
 void exec_next(){
+    if (debug_logfile != NULL) {
+        cpu_debug_log();
+    }
     if(PC == 0x02dd) {
       //  debug = true;
     }
@@ -3305,9 +3352,9 @@ bool frame(){
                 break;
         //        return false;
             }
+            do_interrupts();
             int prevcycles = cycles;
             exec_next();
-            do_interrupts();
             gpu_step(cycles-prevcycles);
         }
     }
@@ -3391,16 +3438,20 @@ int main(int argc, char **argv){
   if (argc == 2) {
     rom = argv[1];
   }
+cpu_init_debug_file();
 
   cart_load(rom);
 
   mem_init();
-  cpu_init();
+  //cpu_init();
+  cpu_fake_init();
   gpu_init();
   sdl_init();
   joypad_init();
 
   sdl_main_impl();
+
+cpu_close_debug_file();
 
   return 0;
 }
