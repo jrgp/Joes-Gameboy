@@ -123,13 +123,19 @@ for op, info in ops['unprefixed'].items():
             gen.append("""
     // {mnemonic} {operand1} <- {operand2}
     case {op}:
-      {operand1} = cpu_read(C + 0xFF00);
+         {{
+                   const word addr = 0xFF00 | C;
+                   {operand1} = cpu_read(addr);
+         }}
       break;""".format(op=op, **info))
         elif len(info['operand2']) == 1 and info.get('operand1') == '(C)':
             gen.append("""
     // {mnemonic} {operand1} <- {operand2}
     case {op}:
-      cpu_write(C + 0xFF00, {operand2});
+          {{
+          const word addr = 0xFF00 | C;
+          cpu_write(addr, A);
+          }}
       break;""".format(op=op, **info))
         elif len(info['operand2']) == 1 and info.get('operand1') == '(a16)':
             gen.append("""
@@ -162,13 +168,21 @@ for op, info in ops['unprefixed'].items():
             gen.append("""
     // {mnemonic} {operand1} <- {operand2}
     case {op}:
-      cpu_write(cpu_read_next() + 0xFF00, {operand2});
+      {{
+          const byte immediate = cpu_read_next();
+          const word addr = 0xFF00 | immediate;
+          cpu_write(addr, {operand2});
+      }}
       break;""".format(op=op, **info))
         elif len(info['operand1']) == 1 and info.get('operand2') == '(a8)':
             gen.append("""
     // {mnemonic} {operand1} <- {operand2}
     case {op}:
-      {operand1} = cpu_read(cpu_read_next() + 0xFF00);
+       {{
+           const byte immediate = cpu_read_next();
+           const word addr = 0xFF00 | immediate;
+            {operand1} = cpu_read(addr);
+       }}
       break;""".format(op=op, **info))
 
     elif info['mnemonic'] in ['ADD', 'ADC']:
