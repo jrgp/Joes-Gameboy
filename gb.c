@@ -348,6 +348,10 @@ byte mem_read(int pos) {
             case BGP:
             case LCDC:
             case LY:
+                if (debug_logfile != NULL) {
+                    return 0x90;
+                }
+                return gpu_read(pos);
             case LYC:
             case SCY:
             case WX:
