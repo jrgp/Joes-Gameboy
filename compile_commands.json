@@ -1,0 +1,23 @@
+[
+  {
+    "arguments": [
+      "/usr/bin/gcc",
+      "-c",
+      "-I/opt/homebrew/include",
+      "-I/opt/homebrew/include/SDL2",
+      "-D_THREAD_SAFE",
+      "-Wall",
+      "-g",
+      "-pedantic",
+      "-Wshadow",
+      "-Wpointer-arith",
+      "-Wcast-qual",
+      "-o",
+      "gb",
+      "gb.c"
+    ],
+    "directory": "/Users/joe/dev/newcgb",
+    "file": "/Users/joe/dev/newcgb/gb.c",
+    "output": "/Users/joe/dev/newcgb/gb"
+  }
+]
