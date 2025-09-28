@@ -26,7 +26,12 @@ FILE *debug_logfile;
 // GPU
 //
 int gpu_cycles;
-byte VRAM[0xffff + 1];
+byte VRAM[0x2000];  // VRAM is 8KB, not 64KB
+byte LY_REG = 0;    // LY register (0xFF44)
+byte SCX_REG = 0;   // SCX register (0xFF43)
+byte SCY_REG = 0;   // SCY register (0xFF42)
+byte LCDC_REG = 0;  // LCDC register (0xFF40)
+byte BGP_REG = 0;   // BGP register (0xFF47)
 
 uint32_t *pixels;
 
@@ -62,27 +67,102 @@ void gpu_parse_control(byte control){
 
 #define set_pixel(x,y,c) pixels[(y * VIEWPORT_WIDTH) + x] = c;
 
-void gpu_init(){
-    memset(VRAM, 0, 0xffff + 1);
+void gpu_init(void){
+    memset(VRAM, 0, 0x2000);
     gpu_cycles = 0;
+    LY_REG = 0;
+    
+    // Initialize GPU control with default values
+    gpu_control.enabled = false;
+    gpu_control.bg = false;
+    gpu_control.window = false;
+    gpu_control.sprite = false;
+    gpu_control.BgWindowTileData = 0x8800;
+    gpu_control.BgTileDataSigned = true;
+    gpu_control.bgtilemap = 0x9800;
+    gpu_control.windowtilemap = 0x9800;
+    
+    // Set default LCDC register value (display enabled, background enabled)
+    mem_write(LCDC, 0x91);  // 10010001 - LCD enabled, BG enabled, BG tile data at 0x8000, BG tile map at 0x9800
+    
+    // Set default BGP register (white, light gray, dark gray, black)
+    mem_write(BGP, 0xFC);   // 11111100 - white, light gray, dark gray, black
+    
+    // printf("GPU initialized: LCDC=0x%02X, BGP=0x%02X\n", mem_read(LCDC), mem_read(BGP));
+    
+    // Initialize scroll registers
+    mem_write(SCX, 0);
+    mem_write(SCY, 0);
+    
+    // Initialize some basic tile data for testing
+    // Create a simple checkerboard pattern in tile 0
+    for (int i = 0; i < 8; i++) {
+        if (i % 2 == 0) {
+            mem_write(0x8000 + (i * 2), 0xAA);     // 10101010
+            mem_write(0x8000 + (i * 2) + 1, 0x55); // 01010101
+        } else {
+            mem_write(0x8000 + (i * 2), 0x55);     // 01010101
+            mem_write(0x8000 + (i * 2) + 1, 0xAA); // 10101010
+        }
+    }
+    
+    // Set tile map to use tile 0 everywhere
+    for (int i = 0; i < 32 * 32; i++) {
+        mem_write(0x9800 + i, 0);
+    }
 }
 
 byte gpu_read(int pos){
     //printf("reading from gpu %x\n", pos);
-    return VRAM[pos];
+    if (pos >= 0x8000 && pos <= 0x9FFF) {
+        return VRAM[pos - 0x8000];
+    }
+    if (pos == LY) {
+        return LY_REG;
+    }
+    if (pos == SCX) {
+        return SCX_REG;
+    }
+    if (pos == SCY) {
+        return SCY_REG;
+    }
+    if (pos == LCDC) {
+        return LCDC_REG;
+    }
+    if (pos == BGP) {
+        return BGP_REG;
+    }
+    // For other registers like LYC, etc., we need to handle them separately
+    return 0;
 }
 
 void gpu_write(int pos, byte data){
-    VRAM[pos] = data;
+    if (pos >= 0x8000 && pos <= 0x9FFF) {
+        VRAM[pos - 0x8000] = data;
+    }
     if (pos == LCDC) {
+        LCDC_REG = data;
         gpu_parse_control(data);
-    } else if (data > 0) {
+    }
+    if (pos == LY) {
+        LY_REG = data;
+    }
+    if (pos == SCX) {
+        SCX_REG = data;
+    }
+    if (pos == SCY) {
+        SCY_REG = data;
+    }
+    if (pos == BGP) {
+        BGP_REG = data;
+    }
+    if (data > 0) {
  //       printf("wrote %x to %x\n", data, pos);
     }
 }
 
 uint32_t gpu_pallete_color(byte number, int paletteIndex) {
-    const byte config = VRAM[paletteIndex];
+    const byte config = mem_read(paletteIndex);
     byte resultindex = 0;
 
     const byte b1 = number * 2;
@@ -104,10 +184,15 @@ uint32_t gpu_pallete_color(byte number, int paletteIndex) {
 void gpu_render_tile(byte ly, int xprefix, int tileIndex, int paletteIndex, bool flipx, bool flipy){
 
     // Start of tile data
-    const int start = gpu_control.BgWindowTileData + (16 * tileIndex);
+    int actualTileIndex = tileIndex;
+    if (gpu_control.BgTileDataSigned) {
+        // Convert signed tile index to unsigned
+        actualTileIndex = (tileIndex < 128) ? tileIndex : tileIndex - 256;
+    }
+    const int start = gpu_control.BgWindowTileData + (16 * actualTileIndex);
 
-    const byte high = VRAM[start + ((ly % 8)*2)];
-    const byte low = VRAM[start + ((ly % 8)*2)+1];
+    const byte high = mem_read(start + ((ly % 8)*2));
+    const byte low = mem_read(start + ((ly % 8)*2)+1);
     byte x = 7;
     for (byte i = 0; i < 8; i++) {
       byte wat = 0;
@@ -126,14 +211,27 @@ void gpu_render_tile(byte ly, int xprefix, int tileIndex, int paletteIndex, bool
 
 void gpu_draw_bg(byte ly){
     if (gpu_control.bg) {
+        // Debug output removed
         for (int tile = 0; tile < 32; tile++) {
+            // Calculate tile position with scrolling
+            int tile_x = tile + (SCX_REG / 8);
+            int tile_y = (ly / 8) + (SCY_REG / 8);
+            
+            // Wrap around for tile map
+            tile_x = tile_x % 32;
+            tile_y = tile_y % 32;
+            
             // Index of tile from sprite map
-            const int tileIndex = VRAM[gpu_control.bgtilemap + ((ly / 8)*32) + tile];
+            const int tileIndex = mem_read(gpu_control.bgtilemap + (tile_y * 32) + tile_x);
+            
+            // Debug output removed
+            
             gpu_render_tile(ly, (tile*8), tileIndex, BGP, false, false);
         }
 
     } else {
-        for (int i = 0; i<WIDTH; i++) {
+        // Debug output removed
+        for (int i = 0; i<VIEWPORT_WIDTH; i++) {
             set_pixel(i, ly, 0xffffff);
         }
     }
@@ -145,11 +243,11 @@ void gpu_draw_sprites(byte ly){
         // ones that overlap within the current LY value
         for (int i = 0; i < 40; i++) {
             const int start = 0xFE00 + (i * 4);
-            const byte y = VRAM[start + 1];
-            const byte x = VRAM[start];
+            const byte y = mem_read(start + 1);
+            const byte x = mem_read(start);
 
             // does not overlap with our scanline; skip.
-            if (y < ly || (y + 8) >= ly) {
+            if (y > ly || (y + 8) <= ly) {
                 if (y != 0 || x != 0){
                     printf("SKIPPING sprite at %d %d (LY: %d)\n", y, x, ly);
                 }
@@ -159,8 +257,8 @@ void gpu_draw_sprites(byte ly){
            // printf("not skpping sprite at %d %d (LY: %d)", y, x, ly);
             printf("NOT SKIPPING sprite at %d %d (LY: %d)\n", y, x, ly);
 
-            const byte tileIndex = VRAM[start + 2];
-            const byte flags = VRAM[start + 3];
+            const byte tileIndex = mem_read(start + 2);
+            const byte flags = mem_read(start + 3);
             const bool flipy = bit_check(flags, 6);
             const bool flipx = bit_check(flags, 5);
             int paletteIndex;
@@ -177,6 +275,9 @@ void gpu_draw_sprites(byte ly){
 }
 
 void gpu_drawline(byte ly){
+    // if (ly == 0) {
+    //     printf("Drawing scanline %d: LCDC=0x%02X, BG=%s\n", ly, mem_read(LCDC), gpu_control.bg ? "ON" : "OFF");
+    // }
     gpu_draw_bg(ly);
     gpu_draw_sprites(ly);
 }
@@ -184,23 +285,31 @@ void gpu_drawline(byte ly){
 void gpu_step(int _cycles){
     if (gpu_control.enabled) {
         gpu_cycles += _cycles;
+        // Debug output removed
         if (gpu_cycles >= 456) {
+            const int total_cycles = gpu_cycles;
             gpu_cycles = 0;
 
-            const byte ly = ++VRAM[LY];
+            const byte ly = ++LY_REG;
+            
+            // Debug output removed
 
             if (ly == 144) {
-
+                // VBLANK period starts
+                request_interrupt(INTERRUPT_VBLANK);
+                printf("VBLANK started\n");
             } else if (ly > 153) {
-                VRAM[LY] = 0;
+                LY_REG = 0;
+                printf("Frame complete, LY reset to 0\n");
             } else if (ly < 144) {
                 // draw scanline
                 gpu_drawline(ly);
             }
 
-            if (debug_logfile != NULL) {
-                VRAM[LY] = 0x90;
-            }
+            // Debug code that was forcing LY to 144 - commented out
+            // if (debug_logfile != NULL) {
+            //     LY_REG = 0x90;
+            // }
         }
     }
 }
@@ -269,7 +378,7 @@ typedef struct {
 
 JOYPADBUTTONS joypad_buttons;
 
-void joypad_init(){
+void joypad_init(void){
   joypad_buttons.START = false;
   joypad_buttons.SELECT = false;
   joypad_buttons.A = false;
@@ -280,7 +389,7 @@ void joypad_init(){
   joypad_buttons.RIGHT = false;
 }
 
-byte joypad_read(){
+byte joypad_read(void){
   // Want button keys
   byte result = 0;
   if (!bit_check(joypad, 5)){
@@ -348,9 +457,6 @@ byte mem_read(int pos) {
             case BGP:
             case LCDC:
             case LY:
-                if (debug_logfile != NULL) {
-                    return 0x90;
-                }
                 return gpu_read(pos);
             case LYC:
             case SCY:
@@ -394,7 +500,7 @@ void mem_write(int pos, byte data) {
     }
 }
 
-void mem_init(){
+void mem_init(void){
     memset(RAM, 0, 0xffff + 1);
     inBios = true;
     bailAfterBios = true;
@@ -418,7 +524,7 @@ word SP;
 bool interrupts;
 
 
-void cpu_init(){
+void cpu_init(void){
     F = 0;
     A = 0;
     C = 0;
@@ -432,7 +538,7 @@ void cpu_init(){
     SP = 0;
 }
 
-void cpu_init_debug_file(){
+void cpu_init_debug_file(void){
   debug_logfile = fopen("debug_out.txt", "w");
   if (!debug_logfile) {
     perror("fopen");
@@ -440,13 +546,13 @@ void cpu_init_debug_file(){
   }
 }
 
-void cpu_close_debug_file(){
+void cpu_close_debug_file(void){
   if (debug_logfile != NULL) {
     fclose(debug_logfile);
   }
 }
 
-void cpu_fake_init(){
+void cpu_fake_init(void){
     F = 0xB0;
     A = 0x01;
     C = 0x13;
@@ -460,7 +566,7 @@ void cpu_fake_init(){
     SP = 0xFFFE;
 }
 
-void cpu_debug_log() {
+void cpu_debug_log(void) {
   fprintf(
       debug_logfile,
       "A:%02X F:%02X B:%02X C:%02X D:%02X E:%02X H:%02X L:%02X SP:%04X PC:%04X PCMEM:%02X,%02X,%02X,%02X\n",
@@ -477,36 +583,36 @@ void push_stack(word data) {
     mem_write(SP + 1, f2);
 }
 
-word pop_stack() {
+word pop_stack(void) {
     const word f1 = mem_read(SP);
     const word f2 = mem_read(SP + 1);
     SP += 2;
     return (f2 << 8) | f1;
 }
 
-word peek_stack() {
+word peek_stack(void) {
     const word f1 = mem_read(SP);
     const word f2 = mem_read(SP + 1);
     return (f2 << 8) | f1;
 }
 
-word AF() {
+word AF(void) {
     return F | (A << 8);
 }
 
-word HL() {
+word HL(void) {
     return L | (H << 8);
 }
 
-word DE() {
+word DE(void) {
     return E | (D << 8);
 }
 
-word BC() {
+word BC(void) {
     return C | (B << 8);
 }
 
-void dump_regs() {
+void dump_regs(void) {
   printf("REGS: AF: %04x BC: %04x DE: %04x HL: %04x SP: %04x PC: %04x\n",
     AF(),
     BC(),
@@ -538,14 +644,14 @@ void setHL(word data) {
     L = (byte) data;
 }
 
-word HLDec() {
+word HLDec(void) {
     const word hl = HL();
     setHL(hl - 1);
     // System.out.println("Old HL: 0x"+Integer.toHexString(hl));
     return hl;
 }
 
-word HLInc() {
+word HLInc(void) {
     const word hl = HL();
     setHL(hl + 1);
     return hl;
@@ -561,19 +667,19 @@ void cpu_write(int loc, byte value) {
     mem_write(loc, value);
 }
 
-byte cpu_read_next() {
+byte cpu_read_next(void) {
   const byte data = cpu_read(PC);
   PC++;
   return data;
 }
 
-word cpu_read16() {
+word cpu_read16(void) {
   const byte lo = cpu_read_next();
   const byte hi = cpu_read_next();
   return lo | (hi << 8);
 }
 
-void do_interrupts(){
+void do_interrupts(void){
   if (interrupts) {
     byte enabled_bits = mem_read(INTERRUPT_ENABLE);
     if(enabled_bits > 0){
@@ -614,7 +720,7 @@ bool CheckFlag(byte flag) {
     return bit_check(F, flag);
 }
 
-void clearFlags() {
+void clearFlags(void) {
     F = 0;
 }
 
@@ -865,7 +971,7 @@ void exec_op(byte opcode){
             setHL(result);
             setFlag(FLAG_N, false);
             setFlag(FLAG_C, (0xFFFF-target) < source);
-            setFlag(FLAG_H, (target&0x07FF)+(source&0x07FF) > 0x07FF);
+            setFlag(FLAG_H, (target&0x0FFF)+(source&0x0FFF) > 0x0FFF);
         }
       break;
 
@@ -948,7 +1054,7 @@ void exec_op(byte opcode){
             setHL(result);
             setFlag(FLAG_N, false);
             setFlag(FLAG_C, (0xFFFF-target) < source);
-            setFlag(FLAG_H, (target&0x07FF)+(source&0x07FF) > 0x07FF);
+            setFlag(FLAG_H, (target&0x0FFF)+(source&0x0FFF) > 0x0FFF);
         }
       break;
 
@@ -1046,7 +1152,7 @@ void exec_op(byte opcode){
             setHL(result);
             setFlag(FLAG_N, false);
             setFlag(FLAG_C, (0xFFFF-target) < source);
-            setFlag(FLAG_H, (target&0x07FF)+(source&0x07FF) > 0x07FF);
+            setFlag(FLAG_H, (target&0x0FFF)+(source&0x0FFF) > 0x0FFF);
         }
       break;
 
@@ -1079,6 +1185,8 @@ void exec_op(byte opcode){
     // CPL
     case 0x2f:
       A = ~A;
+      setFlag(FLAG_N, true);
+      setFlag(FLAG_H, true);
       break;
 
     // JR NC
@@ -1147,7 +1255,7 @@ void exec_op(byte opcode){
             setHL(result);
             setFlag(FLAG_N, false);
             setFlag(FLAG_C, (0xFFFF-target) < source);
-            setFlag(FLAG_H, (target&0x07FF)+(source&0x07FF) > 0x07FF);
+            setFlag(FLAG_H, (target&0x0FFF)+(source&0x0FFF) > 0x0FFF);
         }
       break;
 
@@ -1557,7 +1665,7 @@ void exec_op(byte opcode){
 
     // ADC A += (HL)
     case 0x8e:
-      A = Add(cpu_read(HL()));
+      A = Adc(cpu_read(HL()));
       break;
 
     // ADC A += A
@@ -3280,7 +3388,7 @@ void exec_ext_op(byte opcode){
 
 bool debug = false;
 
-void exec_next(){
+void exec_next(void){
     if (debug_logfile != NULL) {
         cpu_debug_log();
     }
@@ -3305,13 +3413,15 @@ SDL_Window* window;
 SDL_Renderer* renderer;
 SDL_Texture* texture;
 
-void sdl_init(){
+void sdl_init(void){
+    printf("Initializing SDL...\n");
     window = SDL_CreateWindow("Joe's GB", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, VIEWPORT_WIDTH*2, VIEWPORT_HEIGHT*2, SDL_WINDOW_SHOWN);
 
     if (window == NULL) {
         printf("Window could not be created! SDL Error: %s\n", SDL_GetError());
         exit(1);
     }
+    printf("SDL window created successfully\n");
 
     SDL_SetWindowResizable(window, true);
 
@@ -3335,9 +3445,12 @@ void sdl_init(){
           printf("Could not malloc pixels");
           exit(1);
     }
+    
+    // Initialize pixels to black
+    memset(pixels, 0, sizeof(uint32_t) * VIEWPORT_WIDTH * VIEWPORT_HEIGHT);
 }
 
-void sdl_display(){
+void sdl_display(void){
     int result = SDL_UpdateTexture(texture, NULL, pixels, VIEWPORT_WIDTH*sizeof(uint32_t));
 
     if (result != 0) {
@@ -3345,7 +3458,7 @@ void sdl_display(){
           exit(1);
     }
 
-    const SDL_Rect srcr = {.x = VRAM[SCX], .y = VRAM[SCY], .w = VIEWPORT_WIDTH, .h = VIEWPORT_HEIGHT};
+    const SDL_Rect srcr = {.x = SCX_REG, .y = SCY_REG, .w = VIEWPORT_WIDTH, .h = VIEWPORT_HEIGHT};
 
     result = SDL_RenderCopy(renderer, texture, &srcr, NULL);
     if (result != 0) {
@@ -3357,8 +3470,14 @@ void sdl_display(){
 }
 
 
-bool frame(){
+bool frame(void){
     const uint32_t start_ticks = SDL_GetTicks();
+    static int frame_count = 0;
+    frame_count++;
+
+    if (frame_count <= 3) {
+        printf("Frame %d: Starting frame processing\n", frame_count);
+    }
 
     if (bailAfterBios && !inBios) {
 
@@ -3373,11 +3492,17 @@ bool frame(){
             do_interrupts();
             int prevcycles = cycles;
             exec_next();
-            gpu_step(cycles-prevcycles);
+            int cpu_cycles = cycles - prevcycles;
+            if (frame_count <= 3 && cpu_cycles > 0) {
+                printf("CPU executed %d cycles\n", cpu_cycles);
+            }
+            gpu_step(cpu_cycles);
         }
     }
 
-    request_interrupt(INTERRUPT_VBLANK);
+    if (frame_count <= 3) {
+        printf("Frame %d: About to display\n", frame_count);
+    }
 
     sdl_display();
 
@@ -3388,6 +3513,10 @@ bool frame(){
         SDL_Delay(nap_time);
     }
 
+    if (frame_count <= 3) {
+        printf("Frame %d: Completed\n", frame_count);
+    }
+
     return true;
 }
 
@@ -3396,6 +3525,7 @@ void sdl_main_impl(void){
   bool *joypad_key;
   bool joypad_last;
 
+  printf("SDL main loop starting\n");
   SDL_Event event;
   while(run) {
       while (SDL_PollEvent(&event)) {
