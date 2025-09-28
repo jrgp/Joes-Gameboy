@@ -71,7 +71,7 @@ void gpu_init(void){
     memset(VRAM, 0, 0x2000);
     gpu_cycles = 0;
     LY_REG = 0;
-    
+
     // Initialize GPU control with default values
     gpu_control.enabled = false;
     gpu_control.bg = false;
@@ -81,35 +81,20 @@ void gpu_init(void){
     gpu_control.BgTileDataSigned = true;
     gpu_control.bgtilemap = 0x9800;
     gpu_control.windowtilemap = 0x9800;
-    
+
     // Set default LCDC register value (display enabled, background enabled)
     mem_write(LCDC, 0x91);  // 10010001 - LCD enabled, BG enabled, BG tile data at 0x8000, BG tile map at 0x9800
-    
+
     // Set default BGP register (white, light gray, dark gray, black)
     mem_write(BGP, 0xFC);   // 11111100 - white, light gray, dark gray, black
-    
+
     // printf("GPU initialized: LCDC=0x%02X, BGP=0x%02X\n", mem_read(LCDC), mem_read(BGP));
-    
+
     // Initialize scroll registers
     mem_write(SCX, 0);
     mem_write(SCY, 0);
-    
-    // Initialize some basic tile data for testing
-    // Create a simple checkerboard pattern in tile 0
-    for (int i = 0; i < 8; i++) {
-        if (i % 2 == 0) {
-            mem_write(0x8000 + (i * 2), 0xAA);     // 10101010
-            mem_write(0x8000 + (i * 2) + 1, 0x55); // 01010101
-        } else {
-            mem_write(0x8000 + (i * 2), 0x55);     // 01010101
-            mem_write(0x8000 + (i * 2) + 1, 0xAA); // 10101010
-        }
-    }
-    
-    // Set tile map to use tile 0 everywhere
-    for (int i = 0; i < 32 * 32; i++) {
-        mem_write(0x9800 + i, 0);
-    }
+
+    // Test tile data initialization removed - let the ROM provide its own data
 }
 
 byte gpu_read(int pos){
@@ -145,7 +130,8 @@ void gpu_write(int pos, byte data){
         gpu_parse_control(data);
     }
     if (pos == LY) {
-        LY_REG = data;
+        // LY register is read-only in the Game Boy - ignore writes
+        // LY_REG = data;  // REMOVED: LY is read-only
     }
     if (pos == SCX) {
         SCX_REG = data;
@@ -193,18 +179,19 @@ void gpu_render_tile(byte ly, int xprefix, int tileIndex, int paletteIndex, bool
 
     const byte high = mem_read(start + ((ly % 8)*2));
     const byte low = mem_read(start + ((ly % 8)*2)+1);
-    byte x = 7;
     for (byte i = 0; i < 8; i++) {
       byte wat = 0;
-      if(bit_check(low, i)){
+      if(bit_check(low, (7-i))){
         wat |= (1 << 1);
       }
-      if(bit_check(high, i)){
+      if(bit_check(high, (7-i))){
         wat |= (1 << 0);
       }
 
-      set_pixel(xprefix+x, ly, gpu_pallete_color(wat, paletteIndex));
-      x--;
+      // Only render non-transparent pixels (color 0 is transparent for sprites)
+      if (wat != 0) {
+        set_pixel(xprefix+i, ly, gpu_pallete_color(wat, paletteIndex));
+      }
     }
 
 }
@@ -216,16 +203,16 @@ void gpu_draw_bg(byte ly){
             // Calculate tile position with scrolling
             int tile_x = tile + (SCX_REG / 8);
             int tile_y = (ly / 8) + (SCY_REG / 8);
-            
+
             // Wrap around for tile map
             tile_x = tile_x % 32;
             tile_y = tile_y % 32;
-            
+
             // Index of tile from sprite map
             const int tileIndex = mem_read(gpu_control.bgtilemap + (tile_y * 32) + tile_x);
-            
+
             // Debug output removed
-            
+
             gpu_render_tile(ly, (tile*8), tileIndex, BGP, false, false);
         }
 
@@ -235,27 +222,33 @@ void gpu_draw_bg(byte ly){
             set_pixel(i, ly, 0xffffff);
         }
     }
+    
+    // Test line removed
 }
 
 void gpu_draw_sprites(byte ly){
     if (gpu_control.sprite) {
         // Iterate through all 40 sprites, looking for
         // ones that overlap within the current LY value
-        for (int i = 0; i < 40; i++) {
+        // Render sprites in reverse order (higher indices first) for proper priority
+        for (int i = 39; i >= 0; i--) {
             const int start = 0xFE00 + (i * 4);
             const byte y = mem_read(start + 1);
             const byte x = mem_read(start);
 
+            // Game Boy sprites are positioned 16 pixels above their actual position
+            const int actual_y = y - 16;
+            
             // does not overlap with our scanline; skip.
-            if (y > ly || (y + 8) <= ly) {
+            if (actual_y > ly || (actual_y + 8) <= ly) {
                 if (y != 0 || x != 0){
-                    printf("SKIPPING sprite at %d %d (LY: %d)\n", y, x, ly);
+                    //printf("SKIPPING sprite at %d %d (LY: %d)\n", y, x, ly);
                 }
                 continue;
             }
 
            // printf("not skpping sprite at %d %d (LY: %d)", y, x, ly);
-            printf("NOT SKIPPING sprite at %d %d (LY: %d)\n", y, x, ly);
+            //printf("NOT SKIPPING sprite at %d %d (LY: %d)\n", y, x, ly);
 
             const byte tileIndex = mem_read(start + 2);
             const byte flags = mem_read(start + 3);
@@ -268,16 +261,24 @@ void gpu_draw_sprites(byte ly){
                 paletteIndex = OBP0;
             }
 
-            printf("drawing tile at %d %d\n", ly, x);
-            gpu_render_tile(ly, x, tileIndex, paletteIndex, flipx, flipy);
+            // Game Boy sprites are positioned 8 pixels to the left of their actual position
+            const int actual_x = x - 8;
+            
+            // Only render if sprite is within visible bounds
+            if (actual_x >= -8 && actual_x < VIEWPORT_WIDTH) {
+                //printf("drawing tile at %d %d\n", ly, actual_x);
+                gpu_render_tile(ly, actual_x, tileIndex, paletteIndex, flipx, flipy);
+            }
         }
     }
 }
 
 void gpu_drawline(byte ly){
-    // if (ly == 0) {
-    //     printf("Drawing scanline %d: LCDC=0x%02X, BG=%s\n", ly, mem_read(LCDC), gpu_control.bg ? "ON" : "OFF");
-    // }
+    // Diagnostic output for first few scanlines
+    if (ly < 5) {
+        printf("Drawing scanline %d: LCDC=0x%02X, BG=%s, Sprites=%s\n", 
+               ly, mem_read(LCDC), gpu_control.bg ? "ON" : "OFF", gpu_control.sprite ? "ON" : "OFF");
+    }
     gpu_draw_bg(ly);
     gpu_draw_sprites(ly);
 }
@@ -285,22 +286,37 @@ void gpu_drawline(byte ly){
 void gpu_step(int _cycles){
     if (gpu_control.enabled) {
         gpu_cycles += _cycles;
-        // Debug output removed
+        
+        // Diagnostic output for GPU cycle accumulation
+        static int gpu_step_count = 0;
+        gpu_step_count++;
+        if (gpu_step_count <= 50 || _cycles > 50) {
+            printf("GPU step %d: +%d cycles = %d total\n", gpu_step_count, _cycles, gpu_cycles);
+        }
+        
         if (gpu_cycles >= 456) {
-            const int total_cycles = gpu_cycles;
             gpu_cycles = 0;
 
+            const byte old_ly = LY_REG;
             const byte ly = ++LY_REG;
             
-            // Debug output removed
+            // Check for unexpected jumps
+            if (old_ly == 10 && ly == 140) {
+                printf("CRITICAL: LY jumped from %d to %d!\n", old_ly, ly);
+            }
+            
+            // Diagnostic output for LY advancement
+            if (ly <= 10 || ly >= 140) {
+                printf("GPU advancing to LY=%d\n", ly);
+            }
 
             if (ly == 144) {
                 // VBLANK period starts
                 request_interrupt(INTERRUPT_VBLANK);
-                printf("VBLANK started\n");
+                // VBLANK started
             } else if (ly > 153) {
                 LY_REG = 0;
-                printf("Frame complete, LY reset to 0\n");
+                // Frame complete, LY reset to 0
             } else if (ly < 144) {
                 // draw scanline
                 gpu_drawline(ly);
@@ -3414,14 +3430,12 @@ SDL_Renderer* renderer;
 SDL_Texture* texture;
 
 void sdl_init(void){
-    printf("Initializing SDL...\n");
     window = SDL_CreateWindow("Joe's GB", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, VIEWPORT_WIDTH*2, VIEWPORT_HEIGHT*2, SDL_WINDOW_SHOWN);
 
     if (window == NULL) {
         printf("Window could not be created! SDL Error: %s\n", SDL_GetError());
         exit(1);
     }
-    printf("SDL window created successfully\n");
 
     SDL_SetWindowResizable(window, true);
 
@@ -3445,12 +3459,14 @@ void sdl_init(void){
           printf("Could not malloc pixels");
           exit(1);
     }
-    
+
     // Initialize pixels to black
     memset(pixels, 0, sizeof(uint32_t) * VIEWPORT_WIDTH * VIEWPORT_HEIGHT);
 }
 
 void sdl_display(void){
+    // Diagnostic output removed
+    
     int result = SDL_UpdateTexture(texture, NULL, pixels, VIEWPORT_WIDTH*sizeof(uint32_t));
 
     if (result != 0) {
@@ -3458,7 +3474,7 @@ void sdl_display(void){
           exit(1);
     }
 
-    const SDL_Rect srcr = {.x = SCX_REG, .y = SCY_REG, .w = VIEWPORT_WIDTH, .h = VIEWPORT_HEIGHT};
+    const SDL_Rect srcr = {.x = 0, .y = 0, .w = VIEWPORT_WIDTH, .h = VIEWPORT_HEIGHT};
 
     result = SDL_RenderCopy(renderer, texture, &srcr, NULL);
     if (result != 0) {
@@ -3475,14 +3491,11 @@ bool frame(void){
     static int frame_count = 0;
     frame_count++;
 
-    if (frame_count <= 3) {
-        printf("Frame %d: Starting frame processing\n", frame_count);
-    }
-
     if (bailAfterBios && !inBios) {
 
     } else {
         cycles = 0;
+        int instruction_count = 0;
         while (cycles < 69905) {
             if (bailAfterBios && !inBios) {
                 printf("bailing after bios\n");
@@ -3493,28 +3506,33 @@ bool frame(void){
             int prevcycles = cycles;
             exec_next();
             int cpu_cycles = cycles - prevcycles;
-            if (frame_count <= 3 && cpu_cycles > 0) {
-                printf("CPU executed %d cycles\n", cpu_cycles);
+            
+            // Diagnostic: Check for large cycle jumps
+            if (cpu_cycles > 1000) {
+                printf("WARNING: Large CPU cycle jump: %d cycles!\n", cpu_cycles);
             }
+            
             gpu_step(cpu_cycles);
+            instruction_count++;
+            
+            // Safety check for infinite loops
+            if (instruction_count > 100000) {
+                printf("WARNING: Infinite loop detected at frame %d, PC=0x%04X\n", frame_count, PC);
+                break;
+            }
         }
-    }
-
-    if (frame_count <= 3) {
-        printf("Frame %d: About to display\n", frame_count);
+        
+        // Diagnostic output removed
     }
 
     sdl_display();
 
     const uint32_t diff = SDL_GetTicks() - start_ticks;
 
-    if (diff < 1000/FPS) {
-        const uint32_t nap_time = (1000 / FPS) - diff;
+    // More accurate frame timing - target 16.67ms per frame (60 FPS)
+    if (diff < 16) {
+        const uint32_t nap_time = 16 - diff;
         SDL_Delay(nap_time);
-    }
-
-    if (frame_count <= 3) {
-        printf("Frame %d: Completed\n", frame_count);
     }
 
     return true;
@@ -3525,7 +3543,7 @@ void sdl_main_impl(void){
   bool *joypad_key;
   bool joypad_last;
 
-  printf("SDL main loop starting\n");
+  // SDL main loop starting
   SDL_Event event;
   while(run) {
       while (SDL_PollEvent(&event)) {
