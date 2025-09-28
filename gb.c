@@ -274,11 +274,6 @@ void gpu_draw_sprites(byte ly){
 }
 
 void gpu_drawline(byte ly){
-    // Diagnostic output for first few scanlines
-    if (ly < 5) {
-        printf("Drawing scanline %d: LCDC=0x%02X, BG=%s, Sprites=%s\n", 
-               ly, mem_read(LCDC), gpu_control.bg ? "ON" : "OFF", gpu_control.sprite ? "ON" : "OFF");
-    }
     gpu_draw_bg(ly);
     gpu_draw_sprites(ly);
 }
@@ -287,28 +282,13 @@ void gpu_step(int _cycles){
     if (gpu_control.enabled) {
         gpu_cycles += _cycles;
         
-        // Diagnostic output for GPU cycle accumulation
-        static int gpu_step_count = 0;
-        gpu_step_count++;
-        if (gpu_step_count <= 50 || _cycles > 50) {
-            printf("GPU step %d: +%d cycles = %d total\n", gpu_step_count, _cycles, gpu_cycles);
-        }
+        
         
         if (gpu_cycles >= 456) {
             gpu_cycles = 0;
 
-            const byte old_ly = LY_REG;
             const byte ly = ++LY_REG;
             
-            // Check for unexpected jumps
-            if (old_ly == 10 && ly == 140) {
-                printf("CRITICAL: LY jumped from %d to %d!\n", old_ly, ly);
-            }
-            
-            // Diagnostic output for LY advancement
-            if (ly <= 10 || ly >= 140) {
-                printf("GPU advancing to LY=%d\n", ly);
-            }
 
             if (ly == 144) {
                 // VBLANK period starts
@@ -3430,6 +3410,11 @@ SDL_Renderer* renderer;
 SDL_Texture* texture;
 
 void sdl_init(void){
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+        printf("SDL could not initialize! SDL_Error: %s\n", SDL_GetError());
+        exit(1);
+    }
+    
     window = SDL_CreateWindow("Joe's GB", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, VIEWPORT_WIDTH*2, VIEWPORT_HEIGHT*2, SDL_WINDOW_SHOWN);
 
     if (window == NULL) {
@@ -3507,10 +3492,6 @@ bool frame(void){
             exec_next();
             int cpu_cycles = cycles - prevcycles;
             
-            // Diagnostic: Check for large cycle jumps
-            if (cpu_cycles > 1000) {
-                printf("WARNING: Large CPU cycle jump: %d cycles!\n", cpu_cycles);
-            }
             
             gpu_step(cpu_cycles);
             instruction_count++;
@@ -3545,11 +3526,12 @@ void sdl_main_impl(void){
 
   // SDL main loop starting
   SDL_Event event;
+  printf("SDL window created, starting main loop...\n");
   while(run) {
       while (SDL_PollEvent(&event)) {
           switch (event.type) {
               case SDL_QUIT:
-                  printf("got quit event\n");
+                  printf("got quit event - window closed\n");
                   run = false;
                   return;
               case SDL_KEYDOWN:
@@ -3592,6 +3574,11 @@ void sdl_main_impl(void){
           }
       }
 
+      static int frame_count = 0;
+      frame_count++;
+      if (frame_count <= 5) {
+          printf("Processing frame %d...\n", frame_count);
+      }
       run = frame();
   }
 
@@ -3604,7 +3591,7 @@ int main(int argc, char **argv){
   if (argc == 2) {
     rom = argv[1];
   }
-cpu_init_debug_file();
+// cpu_init_debug_file(); // Disabled to prevent interference
 
   cart_load(rom);
 
