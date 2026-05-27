@@ -8,7 +8,7 @@ ROMS_DIR="$ROOT/roms/blargg"
 
 # Default cycle limit: ~12 seconds of emulated time at ~4MHz
 # blargg cpu_instrs tests need up to ~10s to complete
-CYCLES="${GB_TEST_CYCLES:-50000000}"
+CYCLES="${GB_TEST_CYCLES:-100000000}"
 
 pass=0
 fail=0

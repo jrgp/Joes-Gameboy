@@ -437,6 +437,43 @@ void request_interrupt(byte interrupt){
     RAM[INTERRUPT_FLAGS] |= interrupt;
 }
 
+//
+// Timer
+//
+#define REG_DIV  0xFF04
+#define REG_TIMA 0xFF05
+#define REG_TMA  0xFF06
+#define REG_TAC  0xFF07
+
+int timer_div_cycles  = 0;
+int timer_tima_cycles = 0;
+
+// Clock dividers for TAC bits 1-0
+static const int timer_clocks[4] = { 1024, 16, 64, 256 };
+
+void timer_step(int cpu_cycles) {
+    // Divider: increments at CPU/256
+    timer_div_cycles += cpu_cycles;
+    while (timer_div_cycles >= 256) {
+        timer_div_cycles -= 256;
+        RAM[REG_DIV]++;
+    }
+
+    // TIMA: only counts when bit 2 of TAC is set
+    if (RAM[REG_TAC] & 0x04) {
+        int threshold = timer_clocks[RAM[REG_TAC] & 0x03];
+        timer_tima_cycles += cpu_cycles;
+        while (timer_tima_cycles >= threshold) {
+            timer_tima_cycles -= threshold;
+            RAM[REG_TIMA]++;
+            if (RAM[REG_TIMA] == 0) {
+                RAM[REG_TIMA] = RAM[REG_TMA];
+                request_interrupt(INTERRUPT_TIMER);
+            }
+        }
+    }
+}
+
 void mem_dma(byte data) {
 	const int start = (int)data * 100;
 	for (int i = 0; i <= 0x9f; i++) {
@@ -507,6 +544,16 @@ void mem_write(int pos, byte data) {
             }
             RAM[pos] = data;
             break;
+        case REG_DIV:
+            // Writing any value to DIV resets it to 0
+            RAM[REG_DIV] = 0;
+            timer_div_cycles = 0;
+            break;
+        case REG_TIMA:
+        case REG_TMA:
+        case REG_TAC:
+            RAM[pos] = data;
+            break;
         default:
             if (pos == 0xFF50 && inBios) {
                 inBios = false;
@@ -549,6 +596,7 @@ int cycles;
 word PC;
 word SP;
 bool interrupts;
+bool halted;
 
 
 void cpu_init(void){
@@ -710,10 +758,15 @@ word cpu_read16(void) {
 }
 
 void do_interrupts(void){
+  // Any pending interrupt wakes CPU from HALT regardless of IME
+  byte enabled_bits = mem_read(INTERRUPT_ENABLE);
+  byte flag_bits = mem_read(INTERRUPT_FLAGS);
+  if ((flag_bits & enabled_bits) > 0) {
+      halted = false;
+  }
+
   if (interrupts) {
-    byte enabled_bits = mem_read(INTERRUPT_ENABLE);
     if(enabled_bits > 0){
-      byte flag_bits = mem_read(INTERRUPT_FLAGS);
       byte enabled = flag_bits & enabled_bits;
 
       // If we have any, disable them as we run them
@@ -789,14 +842,21 @@ byte Add(byte arg) {
 }
 
 byte Adc(byte arg) {
-    // FIXME: this may be very wrong
-    if(CheckFlag(FLAG_C)){
-        arg++;
-    }
-    int result = A + arg;
+    int carry = CheckFlag(FLAG_C) ? 1 : 0;
+    int result = A + arg + carry;
     setFlag(FLAG_N, false);
-    setFlag(FLAG_C, (result > 0xff));
-    setFlag(FLAG_H, (((A&0xf)+(arg&0xf))&0x10) == 0x10);
+    setFlag(FLAG_C, result > 0xff);
+    setFlag(FLAG_H, (A & 0xf) + (arg & 0xf) + carry > 0xf);
+    setFlag(FLAG_Z, (byte)result == 0);
+    return (byte)result;
+}
+
+byte Sbc(byte arg) {
+    int carry = CheckFlag(FLAG_C) ? 1 : 0;
+    int result = A - arg - carry;
+    setFlag(FLAG_N, true);
+    setFlag(FLAG_C, result < 0);
+    setFlag(FLAG_H, (A & 0xf) - (arg & 0xf) - carry < 0);
     setFlag(FLAG_Z, (byte)result == 0);
     return (byte)result;
 }
@@ -882,10 +942,26 @@ byte Sla(byte arg) {
 }
 
 byte Srl(byte arg) {
-    // XXX: may be correct per https://github.com/daveallie/rustyboy/blob/master/src/register/alu.rs
     clearFlags();
     const byte v = arg >> 1;
     setFlag(FLAG_C, (arg & 0x1) == 0x1);
+    setFlag(FLAG_Z, v == 0);
+    return v;
+}
+
+byte Rrc(byte arg) {
+    bool lsb = (arg & 0x01) != 0;
+    arg = (arg >> 1) | (lsb ? 0x80 : 0);
+    clearFlags();
+    setFlag(FLAG_C, lsb);
+    setFlag(FLAG_Z, arg == 0);
+    return arg;
+}
+
+byte Sra(byte arg) {
+    clearFlags();
+    const byte v = (arg & 0x80) | (arg >> 1);
+    setFlag(FLAG_C, (arg & 0x01) != 0);
     setFlag(FLAG_Z, v == 0);
     return v;
 }
@@ -983,6 +1059,7 @@ void exec_op(byte opcode){
     // RLCA
     case 0x07:
       A = Rlc(A);
+      setFlag(FLAG_Z, false);
       break;
 
     // LD (a16) <- SP
@@ -1029,6 +1106,21 @@ void exec_op(byte opcode){
     // LD C <- d8
     case 0x0e:
       C = cpu_read_next();
+      break;
+
+    // RRCA
+    case 0x0f:
+      {
+        bool lsb = (A & 1) != 0;
+        A = (A >> 1) | (lsb ? 0x80 : 0);
+        clearFlags();
+        setFlag(FLAG_C, lsb);
+      }
+      break;
+
+    // STOP
+    case 0x10:
+      cpu_read_next(); // consume 0x00 operand
       break;
 
     // LD DE <- d16
@@ -1117,6 +1209,7 @@ void exec_op(byte opcode){
     // RRA
     case 0x1f:
       A = Rr(A, true);
+      setFlag(FLAG_Z, false);
       break;
 
     // JR NZ
@@ -1267,6 +1360,13 @@ void exec_op(byte opcode){
       cpu_write(HL(), cpu_read_next());
       break;
 
+    // SCF
+    case 0x37:
+      setFlag(FLAG_N, false);
+      setFlag(FLAG_H, false);
+      setFlag(FLAG_C, true);
+      break;
+
     // JR C
     case 0x38:
       offset = cpu_read_next();
@@ -1315,7 +1415,12 @@ void exec_op(byte opcode){
       A = cpu_read_next();
       break;
 
-    // LD B <- B
+    // CCF
+    case 0x3f:
+      setFlag(FLAG_N, false);
+      setFlag(FLAG_H, false);
+      setFlag(FLAG_C, !CheckFlag(FLAG_C));
+    // LD B <- B (nop)
     case 0x40:
       break;
 
@@ -1579,6 +1684,11 @@ void exec_op(byte opcode){
       cpu_write(HL(), L);
       break;
 
+    // HALT
+    case 0x76:
+      halted = true;
+      break;
+
     // LD (HL) <- A
     case 0x77:
       cpu_write(HL(), A);
@@ -1741,6 +1851,46 @@ void exec_op(byte opcode){
     // SUB A -= A
     case 0x97:
       A = Sub(A);
+      break;
+
+    // SBC A -= B
+    case 0x98:
+      A = Sbc(B);
+      break;
+
+    // SBC A -= C
+    case 0x99:
+      A = Sbc(C);
+      break;
+
+    // SBC A -= D
+    case 0x9a:
+      A = Sbc(D);
+      break;
+
+    // SBC A -= E
+    case 0x9b:
+      A = Sbc(E);
+      break;
+
+    // SBC A -= H
+    case 0x9c:
+      A = Sbc(H);
+      break;
+
+    // SBC A -= L
+    case 0x9d:
+      A = Sbc(L);
+      break;
+
+    // SBC A -= (HL)
+    case 0x9e:
+      A = Sbc(cpu_read(HL()));
+      break;
+
+    // SBC A -= A
+    case 0x9f:
+      A = Sbc(A);
       break;
 
     // AND A & B
@@ -2109,6 +2259,11 @@ void exec_op(byte opcode){
       PC = 0x18;
       break;
 
+    // SBC A, d8
+    case 0xde:
+      A = Sbc(cpu_read_next());
+      break;
+
     // LDH (a8) <- A
     case 0xe0:
       {
@@ -2130,6 +2285,20 @@ void exec_op(byte opcode){
           const word addr = 0xFF00 | C;
           cpu_write(addr, A);
           }
+      break;
+
+    // ADD SP, r8
+    case 0xe8:
+      {
+        int8_t val = (int8_t)cpu_read_next();
+        int result = SP + val;
+        setFlag(FLAG_Z, false);
+        setFlag(FLAG_N, false);
+        setFlag(FLAG_H, (SP & 0xf) + (val & 0xf) > 0xf);
+        setFlag(FLAG_C, (SP & 0xff) + (unsigned)(val & 0xff) > 0xff);
+        SP = (word)result;
+        cycles += 8;
+      }
       break;
 
     // PUSH HL
@@ -2218,6 +2387,26 @@ void exec_op(byte opcode){
       PC = 0x30;
       break;
 
+    // LD HL, SP+r8
+    case 0xf8:
+      {
+        int8_t val = (int8_t)cpu_read_next();
+        int result = SP + val;
+        setFlag(FLAG_Z, false);
+        setFlag(FLAG_N, false);
+        setFlag(FLAG_H, (SP & 0xf) + (val & 0xf) > 0xf);
+        setFlag(FLAG_C, (SP & 0xff) + (unsigned)(val & 0xff) > 0xff);
+        setHL((word)result);
+        cycles += 4;
+      }
+      break;
+
+    // LD SP, HL
+    case 0xf9:
+      SP = HL();
+      cycles += 4;
+      break;
+
     // LD A <- (a16)
     case 0xfa:
       A = cpu_read(cpu_read16());
@@ -2243,7 +2432,6 @@ void exec_op(byte opcode){
 // END GENERATED
         default:
             printf("Unimplemented opcode %x at %x\n", opcode, PC - 1);
-            exit(1);
             break;
     }
 }
@@ -2251,6 +2439,40 @@ void exec_op(byte opcode){
 void exec_ext_op(byte opcode){
     switch (opcode){
 // START EX GENERATED
+
+    // RLC B
+    case 0x00: B = Rlc(B); break;
+    // RLC C
+    case 0x01: C = Rlc(C); break;
+    // RLC D
+    case 0x02: D = Rlc(D); break;
+    // RLC E
+    case 0x03: E = Rlc(E); break;
+    // RLC H
+    case 0x04: H = Rlc(H); break;
+    // RLC L
+    case 0x05: L = Rlc(L); break;
+    // RLC (HL)
+    case 0x06: cpu_write(HL(), Rlc(cpu_read(HL()))); break;
+    // RLC A
+    case 0x07: A = Rlc(A); break;
+
+    // RRC B
+    case 0x08: B = Rrc(B); break;
+    // RRC C
+    case 0x09: C = Rrc(C); break;
+    // RRC D
+    case 0x0a: D = Rrc(D); break;
+    // RRC E
+    case 0x0b: E = Rrc(E); break;
+    // RRC H
+    case 0x0c: H = Rrc(H); break;
+    // RRC L
+    case 0x0d: L = Rrc(L); break;
+    // RRC (HL)
+    case 0x0e: cpu_write(HL(), Rrc(cpu_read(HL()))); break;
+    // RRC A
+    case 0x0f: A = Rrc(A); break;
 
     // RL B
     case 0x10:
@@ -2322,6 +2544,11 @@ void exec_ext_op(byte opcode){
       L = Rr(L, false);
       break;
 
+    // RR (HL)
+    case 0x1e:
+      cpu_write(HL(), Rr(cpu_read(HL()), false));
+      break;
+
     // RR A
     case 0x1f:
       A = Rr(A, true);
@@ -2366,6 +2593,23 @@ void exec_ext_op(byte opcode){
     case 0x27:
       A = Sla(A);
       break;
+
+    // SRA B
+    case 0x28: B = Sra(B); break;
+    // SRA C
+    case 0x29: C = Sra(C); break;
+    // SRA D
+    case 0x2a: D = Sra(D); break;
+    // SRA E
+    case 0x2b: E = Sra(E); break;
+    // SRA H
+    case 0x2c: H = Sra(H); break;
+    // SRA L
+    case 0x2d: L = Sra(L); break;
+    // SRA (HL)
+    case 0x2e: cpu_write(HL(), Sra(cpu_read(HL()))); break;
+    // SRA A
+    case 0x2f: A = Sra(A); break;
 
     // SWAP B
     case 0x30:
@@ -3419,6 +3663,10 @@ void exec_ext_op(byte opcode){
 bool debug = false;
 
 void exec_next(void){
+    if (halted) {
+        cycles += 4;
+        return;
+    }
     if (debug_logfile != NULL) {
         cpu_debug_log();
     }
@@ -3527,6 +3775,7 @@ bool frame_headless(void){
             int cpu_cycles = cycles - prevcycles;
 
             gpu_step(cpu_cycles);
+            timer_step(cpu_cycles);
             instruction_count++;
 
             // Safety check for infinite loops
@@ -3636,6 +3885,7 @@ void headless_main_impl(void) {
         exec_next();
         int cpu_cycles = cycles - prevcycles;
         gpu_step(cpu_cycles);
+        timer_step(cpu_cycles);
         total_cycles += cpu_cycles;
     }
 }
