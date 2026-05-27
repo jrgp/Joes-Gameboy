@@ -34,6 +34,11 @@ byte LCDC_REG = 0;  // LCDC register (0xFF40)
 byte BGP_REG = 0;   // BGP register (0xFF47)
 
 uint32_t *pixels;
+char serial_buf[256];
+int serial_buf_len = 0;
+byte serial_sb = 0;
+bool headless = false;
+long long max_cycles = 0;
 
 typedef struct {
     bool enabled, bg, window, sprite;
@@ -461,6 +466,10 @@ byte mem_read(int pos) {
                 return gpu_read(pos);
             case JOYPAD:
                 return joypad_read();
+            case 0xFF01:
+                return serial_sb;
+            case 0xFF02:
+                return RAM[pos];
             default:
                 return RAM[pos];
         }
@@ -484,6 +493,20 @@ void mem_write(int pos, byte data) {
         case DMA:
             mem_dma(data);
         break;
+        case 0xFF01:
+            serial_sb = data;
+            break;
+        case 0xFF02:
+            if (bit_check(data, 7)) {
+                if (serial_buf_len < (int)(sizeof(serial_buf) - 1)) {
+                    serial_buf[serial_buf_len++] = (char)serial_sb;
+                    serial_buf[serial_buf_len] = '\0';
+                }
+                fputc(serial_sb, stdout);
+                fflush(stdout);
+            }
+            RAM[pos] = data;
+            break;
         default:
             if (pos == 0xFF50 && inBios) {
                 inBios = false;
@@ -496,8 +519,16 @@ void mem_write(int pos, byte data) {
     }
 }
 
+char *serial_get_output(void) {
+    serial_buf[serial_buf_len] = '\0';
+    return serial_buf;
+}
+
 void mem_init(void){
     memset(RAM, 0, 0xffff + 1);
+    serial_buf_len = 0;
+    serial_buf[0] = '\0';
+    serial_sb = 0;
     inBios = true;
     bailAfterBios = true;
     bailAfterBios = false;
@@ -560,6 +591,9 @@ void cpu_fake_init(void){
     cycles = 0;
     PC = 0x0100;
     SP = 0xFFFE;
+    // We're skipping the BIOS, so mark it as done so ROM interrupt
+    // vectors at 0x40-0x60 are read from cart, not BIOS.
+    inBios = false;
 }
 
 void cpu_debug_log(void) {
@@ -3409,6 +3443,16 @@ SDL_Window* window;
 SDL_Renderer* renderer;
 SDL_Texture* texture;
 
+void pixels_init(void){
+    pixels = malloc(sizeof(uint32_t) * VIEWPORT_WIDTH * VIEWPORT_HEIGHT);
+    if (pixels == NULL) {
+          printf("Could not malloc pixels");
+          exit(1);
+    }
+
+    memset(pixels, 0, sizeof(uint32_t) * VIEWPORT_WIDTH * VIEWPORT_HEIGHT);
+}
+
 void sdl_init(void){
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
         printf("SDL could not initialize! SDL_Error: %s\n", SDL_GetError());
@@ -3438,15 +3482,6 @@ void sdl_init(void){
           printf("Texture could not be created! SDL Error: %s\n", SDL_GetError());
           exit(1);
     }
-
-    pixels = malloc(sizeof(uint32_t) * VIEWPORT_WIDTH * VIEWPORT_HEIGHT);
-    if (pixels == NULL) {
-          printf("Could not malloc pixels");
-          exit(1);
-    }
-
-    // Initialize pixels to black
-    memset(pixels, 0, sizeof(uint32_t) * VIEWPORT_WIDTH * VIEWPORT_HEIGHT);
 }
 
 void sdl_display(void){
@@ -3471,8 +3506,7 @@ void sdl_display(void){
 }
 
 
-bool frame(void){
-    const uint32_t start_ticks = SDL_GetTicks();
+bool frame_headless(void){
     static int frame_count = 0;
     frame_count++;
 
@@ -3491,21 +3525,27 @@ bool frame(void){
             int prevcycles = cycles;
             exec_next();
             int cpu_cycles = cycles - prevcycles;
-            
-            
+
             gpu_step(cpu_cycles);
             instruction_count++;
-            
+
             // Safety check for infinite loops
             if (instruction_count > 100000) {
                 printf("WARNING: Infinite loop detected at frame %d, PC=0x%04X\n", frame_count, PC);
                 break;
             }
         }
-        
+
         // Diagnostic output removed
     }
 
+    return true;
+}
+
+bool frame(void){
+    const uint32_t start_ticks = SDL_GetTicks();
+
+    frame_headless();
     sdl_display();
 
     const uint32_t diff = SDL_GetTicks() - start_ticks;
@@ -3584,12 +3624,41 @@ void sdl_main_impl(void){
 
 }
 
+void headless_main_impl(void) {
+    long long total_cycles = 0;
+    while (1) {
+        if (max_cycles > 0 && total_cycles >= max_cycles) {
+            printf("\n[headless] cycle limit %lld reached, stopping\n", max_cycles);
+            break;
+        }
+        do_interrupts();
+        int prevcycles = cycles;
+        exec_next();
+        int cpu_cycles = cycles - prevcycles;
+        gpu_step(cpu_cycles);
+        total_cycles += cpu_cycles;
+    }
+}
+
 int main(int argc, char **argv){
 
   char *rom = "tetris.gb";
 
-  if (argc == 2) {
-    rom = argv[1];
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--headless") == 0) {
+      headless = true;
+    } else if (strcmp(argv[i], "--cycles") == 0) {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "Missing value for --cycles\n");
+        return 1;
+      }
+      max_cycles = strtoll(argv[++i], NULL, 10);
+    } else if (strncmp(argv[i], "--", 2) == 0) {
+      fprintf(stderr, "Unknown option: %s\n", argv[i]);
+      return 1;
+    } else {
+      rom = argv[i];
+    }
   }
 // cpu_init_debug_file(); // Disabled to prevent interference
 
@@ -3599,10 +3668,17 @@ int main(int argc, char **argv){
   //cpu_init();
   cpu_fake_init();
   gpu_init();
-  sdl_init();
+  pixels_init();
+  if (!headless) {
+    sdl_init();
+  }
   joypad_init();
 
-  sdl_main_impl();
+  if (headless) {
+    headless_main_impl();
+  } else {
+    sdl_main_impl();
+  }
 
 cpu_close_debug_file();
 
