@@ -1,3 +1,7 @@
 *.gb
 gb
 a.out
+gb_asan
+gb_debug
+gb_g
+debug_out.txt
