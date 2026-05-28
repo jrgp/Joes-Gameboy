@@ -27,6 +27,8 @@ extern byte RAM[0xffff + 1];
 // GPU
 //
 int gpu_cycles;
+int exec_next_start_cycles; // cycles count at start of exec_next (after do_interrupts)
+int cycles; // CPU cycle counter (forward-declared here for gpu_write access)
 byte VRAM[0x2000];  // VRAM is 8KB, not 64KB
 byte LY_REG = 0;    // LY register (0xFF44)
 byte SCX_REG = 0;   // SCX register (0xFF43)
@@ -158,7 +160,6 @@ void gpu_write(int pos, byte data){
         gpu_parse_control(data);
         if (!was_enabled && now_enabled) {
             // LCD just turned on: start from beginning of frame.
-            // The OAM tests expect the first scanline's timing to begin at cycle 0.
             LY_REG = 0;
             gpu_cycles = 0;
         }
@@ -319,6 +320,8 @@ void gpu_drawline(byte ly){
 
 void gpu_step(int _cycles){
     if (gpu_control.enabled) {
+        byte prev_mode = gpu_get_mode();
+        int prev_ly = LY_REG;
         gpu_cycles += _cycles;
         
         if (gpu_cycles >= 456) {
@@ -329,12 +332,30 @@ void gpu_step(int _cycles){
             if (ly == 144) {
                 // VBLANK period starts
                 request_interrupt(INTERRUPT_VBLANK);
+                // STAT mode 1 interrupt (bit 4)
+                if (RAM[STAT] & 0x10) request_interrupt(INTERRUPT_STAT);
             } else if (ly > 153) {
                 LY_REG = 0;
             } else if (ly < 144) {
                 // draw scanline
                 gpu_drawline(ly);
             }
+
+            // STAT mode 2 interrupt: fires at start of each new OAM scan (LY 0-143)
+            if (LY_REG < 144 && (RAM[STAT] & 0x20)) {
+                request_interrupt(INTERRUPT_STAT);
+            }
+        }
+
+        // Check for LY=LYC coincidence interrupt (STAT bit 6)
+        if ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC] && LY_REG != prev_ly) {
+            request_interrupt(INTERRUPT_STAT);
+        }
+
+        // STAT mode 0 (H-blank) interrupt: fires when entering H-blank
+        byte new_mode = gpu_get_mode();
+        if ((RAM[STAT] & 0x08) && new_mode == 0 && prev_mode != 0 && LY_REG < 144) {
+            request_interrupt(INTERRUPT_STAT);
         }
     }
 }
@@ -351,6 +372,13 @@ static int oam_accessed_row_at(int t_offset) {
 
     int projected_cycles = gpu_cycles + t_offset;
     int projected_ly = LY_REG;
+
+    // Handle negative projected_cycles (wrap back to previous scanline)
+    while (projected_cycles < 0) {
+        projected_ly--;
+        if (projected_ly < 0) projected_ly = 153;
+        projected_cycles += 456;
+    }
 
     while (projected_cycles >= 456) {
         projected_cycles -= 456;
@@ -373,9 +401,9 @@ static void oam_write_word(byte *oam, int offset, word val) {
 
 // Write corruption: triggered by INC/DEC rr, PUSH, CALL, RST with reg in OAM range.
 // Formula: new_word0 = ((a ^ c) & (b ^ c)) ^ c; bytes[2..7] = copy from prev row.
-void oam_write_corrupt(word reg_val) {
+void oam_write_corrupt_at(word reg_val, int t_offset) {
     if (reg_val < 0xFE00 || reg_val > 0xFEFF) return;
-    int off_n = oam_accessed_row_at(0);
+    int off_n = oam_accessed_row_at(t_offset);
     if (off_n < 8) return; // -1 = not Mode 2, 0 = immune row
 
     byte *oam = &RAM[0xFE00];
@@ -389,24 +417,83 @@ void oam_write_corrupt(word reg_val) {
     for (int i = 2; i < 8; i++) oam[off_n + i] = oam[off_prev + i];
 }
 
+void oam_write_corrupt(word reg_val) {
+    oam_write_corrupt_at(reg_val, 0);
+}
+
 // Read corruption: triggered by POP, RET when stack read hits OAM range, or LD A,(HL±).
-// Formula: glitch = b | (a & c); writes glitch to BOTH row n word[0] AND prev row word[0].
-// bytes[0..7] of row n = copy from prev row.
-void oam_read_corrupt(word addr) {
+// Dispatches to the correct formula based on accessed row, matching SameBoy behavior.
+static void oam_read_corrupt_at(word addr, int t_offset) {
     if (addr < 0xFE00 || addr > 0xFEFF) return;
-    int off_n = oam_accessed_row_at(4);
-    if (off_n < 8) return;
+    int row = oam_accessed_row_at(t_offset);
+    if (row < 8 || row >= 0x98) return;
 
     byte *oam = &RAM[0xFE00];
-    int off_prev = off_n - 8;
 
-    word a = oam_read_word(oam, off_n);
-    word b = oam_read_word(oam, off_prev);
-    word c = oam_read_word(oam, off_prev + 4);
-    word glitch = b | (a & c);
-    oam_write_word(oam, off_n,   glitch);
-    oam_write_word(oam, off_prev, glitch);
-    for (int i = 0; i < 8; i++) oam[off_n + i] = oam[off_prev + i];
+    if ((row & 0x18) == 0x10) {
+        // Secondary case: rows 0x10, 0x30, 0x50, 0x70, 0x90
+        // Formula: (b & (a|c|d)) | (a&c&d), writes only to prev_word0
+        // Inner copy: oam[row-16..row-9] = oam[row-8..row-1]
+        word a = oam_read_word(oam, row - 16); // base[-8]
+        word b = oam_read_word(oam, row - 8);  // base[-4] = prev_word0
+        word c = oam_read_word(oam, row);      // base[0]  = curr_word0
+        word d = oam_read_word(oam, row - 4);  // base[-2] = prev_word2
+        word glitch = (b & (a | c | d)) | (a & c & d);
+        oam_write_word(oam, row - 8, glitch);
+        for (int i = 0; i < 8; i++) oam[row - 16 + i] = oam[row - 8 + i];
+    } else if ((row & 0x18) == 0x00) {
+        // Tertiary/Quaternary case: rows 0x20, 0x40, 0x60, 0x80...
+        if (row == 0x40) {
+            // Quaternary (DMG-B: emulate zero-output for non-deterministic cases)
+            // params: a=oam[0:1], b=oam[row], c=oam[row-4], d=oam[row-6],
+            //         e=oam[row-8], f=oam[row-14], g=oam[row-16], h=oam[row-32]
+            word b = oam_read_word(oam, row);      // base[0]
+            word c = oam_read_word(oam, row - 4);  // base[-2]
+            word d = oam_read_word(oam, row - 6);  // base[-3]
+            word e = oam_read_word(oam, row - 8);  // base[-4]
+            word f = oam_read_word(oam, row - 14); // base[-7]
+            word g = oam_read_word(oam, row - 16); // base[-8]
+            word h = oam_read_word(oam, row - 32); // base[-16]
+            word glitch = (e & (h | g | ((word)(~d) & f) | c | b)) | (c & g & h);
+            oam_write_word(oam, row - 8, glitch);
+            for (int i = 0; i < 8; i++) oam[row - 16 + i] = oam[row - 32 + i] = oam[row - 8 + i];
+        } else {
+            // Tertiary case: rows 0x20, 0x60, 0x80, etc.
+            // params: a=oam[row], b=oam[row-4], c=oam[row-8], d=oam[row-16], e=oam[row-32]
+            word a = oam_read_word(oam, row);      // base[0]
+            word b = oam_read_word(oam, row - 4);  // base[-2]
+            word c = oam_read_word(oam, row - 8);  // base[-4]
+            word d = oam_read_word(oam, row - 16); // base[-8]
+            word e = oam_read_word(oam, row - 32); // base[-16]
+            word glitch;
+            if (row == 0x20)
+                glitch = (c & (a | b | d | e)) | (a & b & d & e); // tertiary_read_2
+            else if (row == 0x60)
+                glitch = (c & (a | b | d | e)) | (b & d & e);     // tertiary_read_3
+            else
+                glitch = c | (a & b & d & e);                      // tertiary_read_1
+            oam_write_word(oam, row - 8, glitch);
+            for (int i = 0; i < 8; i++) oam[row - 16 + i] = oam[row - 32 + i] = oam[row - 8 + i];
+        }
+    } else {
+        // Standard case: rows with (row & 0x18) == 0x08 or 0x18
+        // Formula: b | (a & c), writes glitch to BOTH curr and prev word0
+        word a = oam_read_word(oam, row);     // base[0]  = curr_word0
+        word b = oam_read_word(oam, row - 8); // base[-4] = prev_word0
+        word c = oam_read_word(oam, row - 4); // base[-2] = prev_word2
+        word glitch = b | (a & c);
+        oam_write_word(oam, row,     glitch);
+        oam_write_word(oam, row - 8, glitch);
+    }
+
+    // Global copy always: oam[row..row+7] = oam[row-8..row-1]
+    for (int i = 0; i < 8; i++) oam[row + i] = oam[row - 8 + i];
+    if (row == 0x80) // special: row 0x80 also copies to row 0x00
+        for (int i = 0; i < 8; i++) oam[i] = oam[row + i];
+}
+
+void oam_read_corrupt(word addr) {
+    oam_read_corrupt_at(addr, 4); // standard: read happens at M2+ (1 M-cycle offset)
 }
 
 //
@@ -717,7 +804,7 @@ void mem_init(void){
 
 byte F, A, C, B, E, D, L, H;
 
-int cycles;
+// cycles declared at top of file (before gpu_write) for accessibility.
 // Tracks timer cycles pre-stepped mid-instruction via cpu_read/cpu_write.
 // Reset before each instruction; used to avoid double-counting in the main loops.
 int instr_timer_cycles;
@@ -1434,9 +1521,8 @@ void exec_op(byte opcode){
     case 0x2a:
       {
         word hl = HL();
-        oam_read_corrupt(hl);   // actual read may hit OAM
+        oam_read_corrupt_at(hl, 0);
         A = cpu_read(hl);
-        oam_write_corrupt(hl);  // IDU side-effect on HL
         setHL(hl + 1);
       }
       break;
@@ -1551,9 +1637,8 @@ void exec_op(byte opcode){
     case 0x3a:
       {
         word hl = HL();
-        oam_read_corrupt(hl);   // actual read may hit OAM
+        oam_read_corrupt_at(hl, 0);
         A = cpu_read(hl);
-        oam_write_corrupt(hl);  // IDU side-effect on HL
         setHL(hl - 1);
       }
       break;
@@ -2238,7 +2323,8 @@ void exec_op(byte opcode){
 
     // POP BC
     case 0xc1:
-      oam_read_corrupt(SP + 1); // second stack read may hit OAM
+      oam_read_corrupt_at(SP, 0);    // M2: POP first read (row 0x30, secondary case)
+      oam_read_corrupt_at(SP + 1, 4); // M3: POP second read (row 0x38, standard case)
       setBC(pop_stack());
       cycles += 8;
       break;
@@ -2270,7 +2356,9 @@ void exec_op(byte opcode){
 
     // PUSH BC
     case 0xc5:
-      oam_write_corrupt(SP); // IDU fires with pre-decrement SP
+      oam_write_corrupt_at(SP, 0);    // M2 IDU
+      oam_write_corrupt_at(SP-1, 4); // M3 write hi
+      oam_write_corrupt_at(SP-2, 8); // M4 write lo
       push_stack(BC());
       cycles += 12;
       break;
@@ -2352,7 +2440,8 @@ void exec_op(byte opcode){
 
     // POP DE
     case 0xd1:
-      oam_read_corrupt(SP + 1);
+      oam_read_corrupt_at(SP, 0);
+      oam_read_corrupt_at(SP + 1, 4);
       setDE(pop_stack());
       cycles += 8;
       break;
@@ -2378,7 +2467,9 @@ void exec_op(byte opcode){
 
     // PUSH DE
     case 0xd5:
-      oam_write_corrupt(SP);
+      oam_write_corrupt_at(SP, 0);    // M2 IDU
+      oam_write_corrupt_at(SP-1, 4); // M3 write hi
+      oam_write_corrupt_at(SP-2, 8); // M4 write lo
       push_stack(DE());
       cycles += 12;
       break;
@@ -2453,7 +2544,8 @@ void exec_op(byte opcode){
 
     // POP HL
     case 0xe1:
-      oam_read_corrupt(SP + 1);
+      oam_read_corrupt_at(SP, 0);
+      oam_read_corrupt_at(SP + 1, 4);
       setHL(pop_stack());
       cycles += 8;
       break;
@@ -2482,7 +2574,9 @@ void exec_op(byte opcode){
 
     // PUSH HL
     case 0xe5:
-      oam_write_corrupt(SP);
+      oam_write_corrupt_at(SP, 0);    // M2 IDU
+      oam_write_corrupt_at(SP-1, 4); // M3 write hi
+      oam_write_corrupt_at(SP-2, 8); // M4 write lo
       push_stack(HL());
       cycles += 12;
       break;
@@ -2532,7 +2626,8 @@ void exec_op(byte opcode){
 
     // POP AF
     case 0xf1:
-      oam_read_corrupt(SP + 1);
+      oam_read_corrupt_at(SP, 0);
+      oam_read_corrupt_at(SP + 1, 4);
       setAF(pop_stack());
       cycles += 8;
       break;
@@ -2553,7 +2648,9 @@ void exec_op(byte opcode){
 
     // PUSH AF
     case 0xf5:
-      oam_write_corrupt(SP);
+      oam_write_corrupt_at(SP, 0);    // M2 IDU
+      oam_write_corrupt_at(SP-1, 4); // M3 write hi
+      oam_write_corrupt_at(SP-2, 8); // M4 write lo
       push_stack(AF());
       cycles += 12;
       break;
@@ -3968,8 +4065,15 @@ bool frame_headless(void){
             instr_timer_cycles = 0;
             int prevcycles = cycles;
             do_interrupts();
+            int dispatch_cycles = cycles - prevcycles;
+            if (dispatch_cycles > 0) {
+                gpu_step(dispatch_cycles);
+                timer_step(dispatch_cycles - instr_timer_cycles);
+                instr_timer_cycles = 0;
+            }
+            exec_next_start_cycles = cycles;
             exec_next();
-            int cpu_cycles = cycles - prevcycles;
+            int cpu_cycles = cycles - prevcycles - dispatch_cycles;
 
             gpu_step(cpu_cycles);
             timer_step(cpu_cycles - instr_timer_cycles);
@@ -4096,8 +4200,15 @@ void headless_main_impl(void) {
         instr_timer_cycles = 0;
         int prevcycles = cycles;
         do_interrupts();
+        int dispatch_cycles = cycles - prevcycles;
+        if (dispatch_cycles > 0) {
+            gpu_step(dispatch_cycles);
+            timer_step(dispatch_cycles - instr_timer_cycles);
+            instr_timer_cycles = 0;
+        }
+        exec_next_start_cycles = cycles;
         exec_next();
-        int cpu_cycles = cycles - prevcycles;
+        int cpu_cycles = cycles - prevcycles - dispatch_cycles;
         gpu_step(cpu_cycles);
         timer_step(cpu_cycles - instr_timer_cycles);
         total_cycles += cpu_cycles;
