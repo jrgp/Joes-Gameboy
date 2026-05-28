@@ -40,6 +40,10 @@ byte serial_sb = 0;
 bool headless = false;
 long long max_cycles = 0;
 
+// Blargg A000-based result detection (used by halt_bug, interrupt_time, mem_timing-2, oam_bug)
+// Magic bytes at A001-A003 = {0xDE, 0xB0, 0x61}; result at A000 (0x80=running, 0=pass, other=fail)
+bool blargg_done = false;
+
 typedef struct {
     bool enabled, bg, window, sprite;
     int windowtilemap, BgWindowTileData;
@@ -322,6 +326,7 @@ void gpu_step(int _cycles){
 char cart_name[30];
 byte cart_type;
 byte *cart_data;
+byte ext_ram[0x2000]; // 8KB external RAM for MBC1+RAM (cart types 0x02, 0x03)
 byte cart_read(int pos){
   // TODO: banking obviously
   return cart_data[pos];
@@ -360,7 +365,7 @@ void cart_load(char *path) {
 
     printf("Loaded %s\n", cart_name);
 
-    if (cart_type !=0&&cart_type!=1){
+    if (cart_type > 3) {
         printf("Invalid romtype %x: MBC not yet supported\n", cart_type);
         exit(1);
     }
@@ -486,8 +491,10 @@ byte mem_read(int pos) {
         return bios[pos];
     } else if (pos <= 0x7FFF) {
         return cart_read(pos);
-    } else if ((pos >= 0xA000 && pos <= 0xBFFF) || (pos >= 0x8000 && pos <= 0x9FFF)) {
+    } else if (pos >= 0x8000 && pos <= 0x9FFF) {
         return gpu_read(pos);
+    } else if (pos >= 0xA000 && pos <= 0xBFFF) {
+        return ext_ram[pos - 0xA000];
     }
     // FIXME: lots missing here
     else {
@@ -503,6 +510,9 @@ byte mem_read(int pos) {
                 return gpu_read(pos);
             case JOYPAD:
                 return joypad_read();
+            case INTERRUPT_FLAGS:
+                // DMG: upper 3 bits of IF are always 1
+                return RAM[pos] | 0xE0;
             case 0xFF01:
                 return serial_sb;
             case 0xFF02:
@@ -558,8 +568,16 @@ void mem_write(int pos, byte data) {
             if (pos == 0xFF50 && inBios) {
                 inBios = false;
                 printf("bios disabled\n");
-            } else if ((pos >= 0xA000 && pos <= 0xBFFF) || (pos >= 0x8000 && pos <= 0x9FFF)) {
+            } else if (pos >= 0x8000 && pos <= 0x9FFF) {
                 gpu_write(pos, data);
+            } else if (pos >= 0xA000 && pos <= 0xBFFF) {
+                ext_ram[pos - 0xA000] = data;
+                // Detect blargg test completion: A000 written with non-0x80 value
+                // when magic bytes DE B0 61 are present at A001-A003
+                if (pos == 0xA000 && data != 0x80 &&
+                    ext_ram[1] == 0xDE && ext_ram[2] == 0xB0 && ext_ram[3] == 0x61) {
+                    blargg_done = true;
+                }
             } else {
                 RAM[pos] = data;
             }
@@ -573,9 +591,11 @@ char *serial_get_output(void) {
 
 void mem_init(void){
     memset(RAM, 0, 0xffff + 1);
+    memset(ext_ram, 0, sizeof(ext_ram));
     serial_buf_len = 0;
     serial_buf[0] = '\0';
     serial_sb = 0;
+    blargg_done = false;
     inBios = true;
     bailAfterBios = true;
     bailAfterBios = false;
@@ -593,10 +613,15 @@ void mem_init(void){
 byte F, A, C, B, E, D, L, H;
 
 int cycles;
+// Tracks timer cycles pre-stepped mid-instruction via cpu_read/cpu_write.
+// Reset before each instruction; used to avoid double-counting in the main loops.
+int instr_timer_cycles;
 word PC;
 word SP;
 bool interrupts;
+int ei_delay;
 bool halted;
+bool halt_bug_active; // HALT bug: next instruction's PC doesn't increment on opcode fetch
 
 
 void cpu_init(void){
@@ -609,8 +634,13 @@ void cpu_init(void){
     L = 0;
     H = 0;
     cycles = 0;
+    instr_timer_cycles = 0;
     PC = 0;
     SP = 0;
+    interrupts = false;
+    ei_delay = 0;
+    halted = false;
+    halt_bug_active = false;
 }
 
 void cpu_init_debug_file(void){
@@ -637,8 +667,13 @@ void cpu_fake_init(void){
     L = 0x4D;
     H = 0x01;
     cycles = 0;
+    instr_timer_cycles = 0;
     PC = 0x0100;
     SP = 0xFFFE;
+    interrupts = false;
+    ei_delay = 0;
+    halted = false;
+    halt_bug_active = false;
     // We're skipping the BIOS, so mark it as done so ROM interrupt
     // vectors at 0x40-0x60 are read from cart, not BIOS.
     inBios = false;
@@ -737,11 +772,15 @@ word HLInc(void) {
 
 byte cpu_read(int loc) {
     cycles += 4;
+    timer_step(4);            // step timer before memory access for sub-instruction timing
+    instr_timer_cycles += 4;
     return mem_read(loc);
 }
 
 void cpu_write(int loc, byte value) {
     cycles += 4;
+    timer_step(4);            // step timer before memory access for sub-instruction timing
+    instr_timer_cycles += 4;
     mem_write(loc, value);
 }
 
@@ -759,8 +798,9 @@ word cpu_read16(void) {
 
 void do_interrupts(void){
   // Any pending interrupt wakes CPU from HALT regardless of IME
-  byte enabled_bits = mem_read(INTERRUPT_ENABLE);
-  byte flag_bits = mem_read(INTERRUPT_FLAGS);
+  // Mask to bits 0-4 only; IF bits 5-7 are always 1 (hardware artifact)
+  byte enabled_bits = mem_read(INTERRUPT_ENABLE) & 0x1F;
+  byte flag_bits = mem_read(INTERRUPT_FLAGS) & 0x1F;
   if ((flag_bits & enabled_bits) > 0) {
       halted = false;
   }
@@ -1686,7 +1726,17 @@ void exec_op(byte opcode){
 
     // HALT
     case 0x76:
-      halted = true;
+      {
+        byte ie_reg = mem_read(INTERRUPT_ENABLE);
+        byte if_reg = mem_read(INTERRUPT_FLAGS);
+        if (!interrupts && (ie_reg & if_reg & 0x1F) != 0) {
+            // HALT bug: IME=0 and pending interrupt — CPU skips HALT but
+            // the next instruction's opcode byte is read without PC advancing.
+            halt_bug_active = true;
+        } else {
+            halted = true;
+        }
+      }
       break;
 
     // LD (HL) <- A
@@ -2367,6 +2417,7 @@ void exec_op(byte opcode){
     // DI
     case 0xf3:
       interrupts = false;
+      ei_delay = 0;
       break;
 
     // PUSH AF
@@ -2414,7 +2465,7 @@ void exec_op(byte opcode){
 
     // EI
     case 0xfb:
-      interrupts = true;
+      ei_delay = 2;
       break;
 
     // CP d8
@@ -3681,6 +3732,12 @@ void exec_next(void){
         printf("executing %x (%s) at $%x\n", op, opnames[op], PC-1);
     }
     exec_op(op);
+    if (ei_delay > 0) {
+        ei_delay--;
+        if (ei_delay == 0) {
+            interrupts = true;
+        }
+    }
 }
 
 //
