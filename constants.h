@@ -1,4 +1,5 @@
 #define LCDC 0xFF40
+#define STAT 0xFF41
 #define SCY 0xFF42
 #define SCX 0xFF43
 #define LY 0xFF44

@@ -21,6 +21,7 @@ void request_interrupt(byte interrupt);
 byte mem_read(int pos);
 void mem_write(int pos, byte data);
 FILE *debug_logfile;
+extern byte RAM[0xffff + 1];
 
 //
 // GPU
@@ -106,10 +107,22 @@ void gpu_init(void){
     // Test tile data initialization removed - let the ROM provide its own data
 }
 
+byte gpu_get_mode(void) {
+    if (!gpu_control.enabled) return 0;
+    if (LY_REG >= 144) return 1;   // VBlank
+    if (gpu_cycles < 80) return 2;  // OAM scan
+    if (gpu_cycles < 252) return 3; // LCD transfer
+    return 0;                        // HBlank
+}
+
 byte gpu_read(int pos){
     //printf("reading from gpu %x\n", pos);
     if (pos >= 0x8000 && pos <= 0x9FFF) {
         return VRAM[pos - 0x8000];
+    }
+    if (pos == STAT) {
+        byte lyc_flag = (LY_REG == RAM[LYC]) ? 0x04 : 0x00;
+        return 0x80 | (RAM[STAT] & 0x78) | lyc_flag | gpu_get_mode();
     }
     if (pos == LY) {
         return LY_REG;
@@ -134,9 +147,26 @@ void gpu_write(int pos, byte data){
     if (pos >= 0x8000 && pos <= 0x9FFF) {
         VRAM[pos - 0x8000] = data;
     }
+    if (pos == STAT) {
+        // Bits 3-6 are writable; bits 0-2 are read-only
+        RAM[STAT] = (RAM[STAT] & 0x87) | (data & 0x78);
+    }
     if (pos == LCDC) {
+        bool was_enabled = bit_check(LCDC_REG, 7);
+        bool now_enabled = bit_check(data, 7);
         LCDC_REG = data;
         gpu_parse_control(data);
+        if (!was_enabled && now_enabled) {
+            // LCD just turned on: start from beginning of frame.
+            // The OAM tests expect the first scanline's timing to begin at cycle 0.
+            LY_REG = 0;
+            gpu_cycles = 0;
+        }
+        if (was_enabled && !now_enabled) {
+            // LCD turned off: reset state
+            LY_REG = 0;
+            gpu_cycles = 0;
+        }
     }
     if (pos == LY) {
         // LY register is read-only in the Game Boy - ignore writes
@@ -291,32 +321,92 @@ void gpu_step(int _cycles){
     if (gpu_control.enabled) {
         gpu_cycles += _cycles;
         
-        
-        
         if (gpu_cycles >= 456) {
-            gpu_cycles = 0;
+            gpu_cycles -= 456; // preserve remainder for accurate sub-scanline timing
 
             const byte ly = ++LY_REG;
-            
 
             if (ly == 144) {
                 // VBLANK period starts
                 request_interrupt(INTERRUPT_VBLANK);
-                // VBLANK started
             } else if (ly > 153) {
                 LY_REG = 0;
-                // Frame complete, LY reset to 0
             } else if (ly < 144) {
                 // draw scanline
                 gpu_drawline(ly);
             }
-
-            // Debug code that was forcing LY to 144 - commented out
-            // if (debug_logfile != NULL) {
-            //     LY_REG = 0x90;
-            // }
         }
     }
+}
+
+// OAM corruption helpers. OAM = 20 rows x 8 bytes = 160 bytes at 0xFE00.
+// Objects 0-1 (row 0, bytes 0-7) are immune to corruption.
+//
+// The corruption happens during a specific M-cycle inside the current CPU instruction.
+// gpu_step() only runs after the whole instruction, so project gpu_cycles/LY forward by the
+// requested T-cycle offset before deciding which OAM row the PPU is scanning.
+
+static int oam_accessed_row_at(int t_offset) {
+    if (!gpu_control.enabled) return -1;
+
+    int projected_cycles = gpu_cycles + t_offset;
+    int projected_ly = LY_REG;
+
+    while (projected_cycles >= 456) {
+        projected_cycles -= 456;
+        projected_ly++;
+        if (projected_ly > 153) projected_ly = 0;
+    }
+
+    if (projected_ly >= 144) return -1;
+    if (projected_cycles >= 80) return -1;
+    return (projected_cycles / 4) * 8;
+}
+
+static word oam_read_word(byte *oam, int offset) {
+    return (word)oam[offset] | ((word)oam[offset + 1] << 8);
+}
+static void oam_write_word(byte *oam, int offset, word val) {
+    oam[offset]     = val & 0xFF;
+    oam[offset + 1] = (val >> 8) & 0xFF;
+}
+
+// Write corruption: triggered by INC/DEC rr, PUSH, CALL, RST with reg in OAM range.
+// Formula: new_word0 = ((a ^ c) & (b ^ c)) ^ c; bytes[2..7] = copy from prev row.
+void oam_write_corrupt(word reg_val) {
+    if (reg_val < 0xFE00 || reg_val > 0xFEFF) return;
+    int off_n = oam_accessed_row_at(0);
+    if (off_n < 8) return; // -1 = not Mode 2, 0 = immune row
+
+    byte *oam = &RAM[0xFE00];
+    int off_prev = off_n - 8;
+
+    word a = oam_read_word(oam, off_n);
+    word b = oam_read_word(oam, off_prev);
+    word c = oam_read_word(oam, off_prev + 4);
+    word result = ((a ^ c) & (b ^ c)) ^ c;
+    oam_write_word(oam, off_n, result);
+    for (int i = 2; i < 8; i++) oam[off_n + i] = oam[off_prev + i];
+}
+
+// Read corruption: triggered by POP, RET when stack read hits OAM range, or LD A,(HL±).
+// Formula: glitch = b | (a & c); writes glitch to BOTH row n word[0] AND prev row word[0].
+// bytes[0..7] of row n = copy from prev row.
+void oam_read_corrupt(word addr) {
+    if (addr < 0xFE00 || addr > 0xFEFF) return;
+    int off_n = oam_accessed_row_at(4);
+    if (off_n < 8) return;
+
+    byte *oam = &RAM[0xFE00];
+    int off_prev = off_n - 8;
+
+    word a = oam_read_word(oam, off_n);
+    word b = oam_read_word(oam, off_prev);
+    word c = oam_read_word(oam, off_prev + 4);
+    word glitch = b | (a & c);
+    oam_write_word(oam, off_n,   glitch);
+    oam_write_word(oam, off_prev, glitch);
+    for (int i = 0; i < 8; i++) oam[off_n + i] = oam[off_prev + i];
 }
 
 //
@@ -333,7 +423,16 @@ byte cart_read(int pos){
 }
 
 void cart_write(int pos, byte data){
-  printf("unhandled cart write to %x\n", pos);
+    // MBC1 RAM enable: writes to 0x0000-0x1FFF with value 0x0A enable,
+    // any other value disables. We always allow ext_ram access, so ignore.
+    if (pos <= 0x1FFF) {
+        return;
+    }
+    // MBC1 ROM bank number, RAM bank, mode: ignore (no banking support yet)
+    if (pos <= 0x7FFF) {
+        return;
+    }
+    // other cart writes: silently ignore
 }
 
 void cart_load(char *path) {
@@ -501,6 +600,7 @@ byte mem_read(int pos) {
         switch (pos) {
             case BGP:
             case LCDC:
+            case STAT:
             case LY:
                 return gpu_read(pos);
             case LYC:
@@ -524,9 +624,14 @@ byte mem_read(int pos) {
 }
 
 void mem_write(int pos, byte data) {
+    if (pos <= 0x7FFF) {
+        cart_write(pos, data);
+        return;
+    }
     switch (pos) {
         case BGP:
         case LCDC:
+        case STAT:
         case LY:
         case LYC:
         case SCY:
@@ -819,6 +924,9 @@ void do_interrupts(void){
             flag_bits = flag_bits & ~interrupt;
 
             //printf("Doing interrupt %s (%x)\n", INTERRUPT_NAMES[i], INTERRUPT_OFFSETS[i]);
+            // Interrupt dispatch takes 5 M-cycles (20 cycles):
+            // 2 idle + 2 stack push writes + 1 vector load
+            cycles += 20;
             push_stack(PC);
 
             PC = INTERRUPT_OFFSETS[i];
@@ -1077,7 +1185,7 @@ void exec_op(byte opcode){
 
     // INC BC
     case 0x03:
-      setBC(BC() + 1);
+      { word v = BC(); oam_write_corrupt(v); setBC(v + 1); }
       cycles += 4;
       break;
 
@@ -1119,6 +1227,7 @@ void exec_op(byte opcode){
             setFlag(FLAG_N, false);
             setFlag(FLAG_C, (0xFFFF-target) < source);
             setFlag(FLAG_H, (target&0x0FFF)+(source&0x0FFF) > 0x0FFF);
+            cycles += 4;
         }
       break;
 
@@ -1129,7 +1238,7 @@ void exec_op(byte opcode){
 
     // DEC BC
     case 0x0b:
-      setBC(BC() - 1);
+      { word v = BC(); oam_write_corrupt(v); setBC(v - 1); }
       cycles += 4;
       break;
 
@@ -1175,7 +1284,7 @@ void exec_op(byte opcode){
 
     // INC DE
     case 0x13:
-      setDE(DE() + 1);
+      { word v = DE(); oam_write_corrupt(v); setDE(v + 1); }
       cycles += 4;
       break;
 
@@ -1217,6 +1326,7 @@ void exec_op(byte opcode){
             setFlag(FLAG_N, false);
             setFlag(FLAG_C, (0xFFFF-target) < source);
             setFlag(FLAG_H, (target&0x0FFF)+(source&0x0FFF) > 0x0FFF);
+            cycles += 4;
         }
       break;
 
@@ -1227,7 +1337,7 @@ void exec_op(byte opcode){
 
     // DEC DE
     case 0x1b:
-      setDE(DE() - 1);
+      { word v = DE(); oam_write_corrupt(v); setDE(v - 1); }
       cycles += 4;
       break;
 
@@ -1273,7 +1383,7 @@ void exec_op(byte opcode){
 
     // INC HL
     case 0x23:
-      setHL(HL() + 1);
+      { word v = HL(); oam_write_corrupt(v); setHL(v + 1); }
       cycles += 4;
       break;
 
@@ -1316,17 +1426,24 @@ void exec_op(byte opcode){
             setFlag(FLAG_N, false);
             setFlag(FLAG_C, (0xFFFF-target) < source);
             setFlag(FLAG_H, (target&0x0FFF)+(source&0x0FFF) > 0x0FFF);
+            cycles += 4;
         }
       break;
 
     // LD A <- (HL+)
     case 0x2a:
-      A = cpu_read(HLInc());
+      {
+        word hl = HL();
+        oam_read_corrupt(hl);   // actual read may hit OAM
+        A = cpu_read(hl);
+        oam_write_corrupt(hl);  // IDU side-effect on HL
+        setHL(hl + 1);
+      }
       break;
 
     // DEC HL
     case 0x2b:
-      setHL(HL() - 1);
+      { word v = HL(); oam_write_corrupt(v); setHL(v - 1); }
       cycles += 4;
       break;
 
@@ -1373,7 +1490,7 @@ void exec_op(byte opcode){
 
     // INC SP
     case 0x33:
-      SP++;
+      oam_write_corrupt(SP); SP++;
       cycles += 4;
       break;
 
@@ -1426,17 +1543,24 @@ void exec_op(byte opcode){
             setFlag(FLAG_N, false);
             setFlag(FLAG_C, (0xFFFF-target) < source);
             setFlag(FLAG_H, (target&0x0FFF)+(source&0x0FFF) > 0x0FFF);
+            cycles += 4;
         }
       break;
 
     // LD A <- (HL-)
     case 0x3a:
-      A = cpu_read(HLDec());
+      {
+        word hl = HL();
+        oam_read_corrupt(hl);   // actual read may hit OAM
+        A = cpu_read(hl);
+        oam_write_corrupt(hl);  // IDU side-effect on HL
+        setHL(hl - 1);
+      }
       break;
 
     // DEC SP
     case 0x3b:
-      SP--;
+      oam_write_corrupt(SP); SP--;
       cycles += 4;
       break;
 
@@ -2114,6 +2238,7 @@ void exec_op(byte opcode){
 
     // POP BC
     case 0xc1:
+      oam_read_corrupt(SP + 1); // second stack read may hit OAM
       setBC(pop_stack());
       cycles += 8;
       break;
@@ -2145,6 +2270,7 @@ void exec_op(byte opcode){
 
     // PUSH BC
     case 0xc5:
+      oam_write_corrupt(SP); // IDU fires with pre-decrement SP
       push_stack(BC());
       cycles += 12;
       break;
@@ -2226,6 +2352,7 @@ void exec_op(byte opcode){
 
     // POP DE
     case 0xd1:
+      oam_read_corrupt(SP + 1);
       setDE(pop_stack());
       cycles += 8;
       break;
@@ -2251,6 +2378,7 @@ void exec_op(byte opcode){
 
     // PUSH DE
     case 0xd5:
+      oam_write_corrupt(SP);
       push_stack(DE());
       cycles += 12;
       break;
@@ -2325,6 +2453,7 @@ void exec_op(byte opcode){
 
     // POP HL
     case 0xe1:
+      oam_read_corrupt(SP + 1);
       setHL(pop_stack());
       cycles += 8;
       break;
@@ -2353,6 +2482,7 @@ void exec_op(byte opcode){
 
     // PUSH HL
     case 0xe5:
+      oam_write_corrupt(SP);
       push_stack(HL());
       cycles += 12;
       break;
@@ -2402,6 +2532,7 @@ void exec_op(byte opcode){
 
     // POP AF
     case 0xf1:
+      oam_read_corrupt(SP + 1);
       setAF(pop_stack());
       cycles += 8;
       break;
@@ -2422,6 +2553,7 @@ void exec_op(byte opcode){
 
     // PUSH AF
     case 0xf5:
+      oam_write_corrupt(SP);
       push_stack(AF());
       cycles += 12;
       break;
@@ -3727,11 +3859,18 @@ void exec_next(void){
     if (debug){
         dump_regs();
     }
-    byte op = cpu_read_next();
-    if(debug) {
-        printf("executing %x (%s) at $%x\n", op, opnames[op], PC-1);
+    // HALT bug: opcode is fetched without PC advancing (same byte read twice)
+    if (halt_bug_active) {
+        halt_bug_active = false;
+        byte op = cpu_read(PC); // read without incrementing PC
+        exec_op(op);
+    } else {
+        byte op = cpu_read_next();
+        if(debug) {
+            printf("executing %x (%s) at $%x\n", op, opnames[op], PC-1);
+        }
+        exec_op(op);
     }
-    exec_op(op);
     if (ei_delay > 0) {
         ei_delay--;
         if (ei_delay == 0) {
@@ -3826,13 +3965,14 @@ bool frame_headless(void){
                 break;
         //        return false;
             }
-            do_interrupts();
+            instr_timer_cycles = 0;
             int prevcycles = cycles;
+            do_interrupts();
             exec_next();
             int cpu_cycles = cycles - prevcycles;
 
             gpu_step(cpu_cycles);
-            timer_step(cpu_cycles);
+            timer_step(cpu_cycles - instr_timer_cycles);
             instruction_count++;
 
             // Safety check for infinite loops
@@ -3930,6 +4070,18 @@ void sdl_main_impl(void){
 
 }
 
+void headless_print_blargg_a000(void) {
+    // Print blargg A000-format test output to stdout.
+    // Format: A000=status, A001-A003=magic bytes DE B0 61, A004+=text
+    if (ext_ram[1] == 0xDE && ext_ram[2] == 0xB0 && ext_ram[3] == 0x61) {
+        for (int i = 4; i < 0x2000; i++) {
+            if (ext_ram[i] == 0) break;
+            fputc(ext_ram[i], stdout);
+        }
+        fflush(stdout);
+    }
+}
+
 void headless_main_impl(void) {
     long long total_cycles = 0;
     while (1) {
@@ -3937,13 +4089,22 @@ void headless_main_impl(void) {
             printf("\n[headless] cycle limit %lld reached, stopping\n", max_cycles);
             break;
         }
-        do_interrupts();
+        if (blargg_done) {
+            headless_print_blargg_a000();
+            break;
+        }
+        instr_timer_cycles = 0;
         int prevcycles = cycles;
+        do_interrupts();
         exec_next();
         int cpu_cycles = cycles - prevcycles;
         gpu_step(cpu_cycles);
-        timer_step(cpu_cycles);
+        timer_step(cpu_cycles - instr_timer_cycles);
         total_cycles += cpu_cycles;
+    }
+    // If cycle limit hit but A000 output present, still print it
+    if (!blargg_done) {
+        headless_print_blargg_a000();
     }
 }
 
