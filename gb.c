@@ -769,12 +769,15 @@ int timer_tima_cycles = 0;
 // TIMA ticks on falling edge of a specific bit depending on TAC mode.
 static uint16_t timer_internal = 0;
 static int timer_overflow_pending = 0;  // cycles until TMA reload (0=none)
+static bool timer_just_reloaded = false; // true during the M-cycle that TMA reloaded TIMA
 
 // Bit in timer_internal that drives TIMA for each TAC mode (bits 1-0)
 static const int timer_tac_bit[4] = { 9, 3, 5, 7 };
 
 // Advance timer by exactly 4 T-cycles; called in a loop from timer_step.
 static void timer_tick4(void) {
+    timer_just_reloaded = false;  // reset at start of each tick
+
     // Handle TMA reload delay
     if (timer_overflow_pending > 0) {
         timer_overflow_pending -= 4;
@@ -782,6 +785,7 @@ static void timer_tick4(void) {
             timer_overflow_pending = 0;
             RAM[REG_TIMA] = RAM[REG_TMA];
             request_interrupt(INTERRUPT_TIMER);
+            timer_just_reloaded = true;
         }
     }
 
@@ -1004,11 +1008,20 @@ void mem_write(int pos, byte data) {
         }
         case REG_TIMA:
             // Write during overflow delay cancels TMA reload
+            if (timer_just_reloaded) {
+                // Reload just fired this M-cycle via timer_step: cancel retroactively
+                RAM[INTERRUPT_FLAGS] &= ~INTERRUPT_TIMER;
+                timer_just_reloaded = false;
+            }
             timer_overflow_pending = 0;
             RAM[REG_TIMA] = data;
             break;
         case REG_TMA:
             RAM[REG_TMA] = data;
+            // Writing TMA during the reload window also updates TIMA immediately
+            if (timer_just_reloaded || timer_overflow_pending > 0) {
+                RAM[REG_TIMA] = data;
+            }
             break;
         case REG_TAC: {
             // Changing TAC can cause falling edge
@@ -1357,9 +1370,19 @@ void do_interrupts(void){
             // Interrupt dispatch takes 5 M-cycles (20 cycles):
             // 2 idle + 2 stack push writes + 1 vector load
             cycles += 20;
-            push_stack(PC);
-
-            PC = INTERRUPT_OFFSETS[i];
+            // Push PC in hardware order: hi byte first (M2), then IE check, then lo byte (M3)
+            mem_write(--SP, (PC >> 8) & 0xFF);
+            // IE is sampled between push_hi and push_lo; a write to $FFFF=IE via push_hi
+            // can cancel dispatch — the cancelled dispatch jumps to $0000 and IF is not consumed
+            byte post_hi_ie = mem_read(INTERRUPT_ENABLE) & 0x1F;
+            mem_write(--SP, PC & 0xFF);
+            if ((post_hi_ie & interrupt) == 0) {
+                // Dispatch cancelled: IF not consumed, restore it; jump to $0000
+                flag_bits |= interrupt;
+                PC = 0x0000;
+            } else {
+                PC = INTERRUPT_OFFSETS[i];
+            }
             break;
           }
         }
