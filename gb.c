@@ -101,6 +101,10 @@ static uint8_t bg_scanline[160];
 // Window internal line counter (increments each scanline window is visible)
 static int window_line = 0;
 
+// STAT interrupt line (rising-edge detection for blocking behaviour).
+// The hardware STAT interrupt fires only when this line transitions 0→1.
+static bool stat_irq_line = false;
+
 void gpu_init(void){
     memset(VRAM, 0, 0x2000);
     gpu_cycles = 0;
@@ -138,6 +142,25 @@ byte gpu_get_mode(void) {
     if (gpu_cycles < 80) return 2;  // OAM scan
     if (gpu_cycles < 252) return 3; // LCD transfer
     return 0;                        // HBlank
+}
+
+// Compute the STAT interrupt line and fire an interrupt on 0→1 transition.
+// Must be called after any GPU state change that might affect the conditions.
+static void stat_check_irq(void) {
+    if (!gpu_control.enabled) {
+        stat_irq_line = false;
+        return;
+    }
+    byte mode = gpu_get_mode();
+    bool line = false;
+    if ((RAM[STAT] & 0x08) && mode == 0 && LY_REG < 144) line = true; // Mode 0 HBlank
+    if ((RAM[STAT] & 0x10) && LY_REG >= 144)              line = true; // Mode 1 VBlank
+    if ((RAM[STAT] & 0x20) && mode == 2)                  line = true; // Mode 2 OAM
+    if ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC])         line = true; // LYC=LY
+    if (line && !stat_irq_line) {
+        request_interrupt(INTERRUPT_STAT);
+    }
+    stat_irq_line = line;
 }
 
 byte gpu_read(int pos){
@@ -183,6 +206,8 @@ void gpu_write(int pos, byte data){
     if (pos == STAT) {
         // Bits 3-6 are writable; bits 0-2 are read-only
         RAM[STAT] = (RAM[STAT] & 0x87) | (data & 0x78);
+        // Writing STAT may activate a new interrupt condition immediately (DMG behaviour)
+        stat_check_irq();
     }
     if (pos == LCDC) {
         bool was_enabled = bit_check(LCDC_REG, 7);
@@ -193,17 +218,22 @@ void gpu_write(int pos, byte data){
             // LCD just turned on: start from beginning of frame.
             LY_REG = 0;
             gpu_cycles = 0;
+            stat_irq_line = false;
         }
         if (was_enabled && !now_enabled) {
             // LCD turned off: reset state
             LY_REG = 0;
             gpu_cycles = 0;
             window_line = 0;
+            stat_irq_line = false;
         }
     }
     if (pos == LY) {
         // LY register is read-only in the Game Boy - ignore writes
         // LY_REG = data;  // REMOVED: LY is read-only
+    }
+    if (pos == LYC) {
+        RAM[LYC] = data;
     }
     if (pos == SCX) {
         SCX_REG = data;
@@ -367,45 +397,40 @@ void gpu_drawline(byte ly){
 }
 
 void gpu_step(int _cycles){
-    if (gpu_control.enabled) {
-        byte prev_mode = gpu_get_mode();
-        int prev_ly = LY_REG;
-        gpu_cycles += _cycles;
-        
-        if (gpu_cycles >= 456) {
-            gpu_cycles -= 456; // preserve remainder for accurate sub-scanline timing
+    if (!gpu_control.enabled) return;
 
-            const byte ly = ++LY_REG;
+    byte prev_mode = gpu_get_mode();
+    int prev_ly = LY_REG;
+    gpu_cycles += _cycles;
 
-            if (ly == 144) {
-                // VBLANK period starts
-                request_interrupt(INTERRUPT_VBLANK);
-                // STAT mode 1 interrupt (bit 4)
-                if (RAM[STAT] & 0x10) request_interrupt(INTERRUPT_STAT);
-            } else if (ly > 153) {
-                LY_REG = 0;
-                window_line = 0;  // reset window counter at start of new frame
-            } else if (ly < 144) {
-                // draw scanline
-                gpu_drawline(ly);
-            }
+    if (gpu_cycles >= 456) {
+        gpu_cycles -= 456; // preserve remainder for accurate sub-scanline timing
 
-            // STAT mode 2 interrupt: fires at start of each new OAM scan (LY 0-143)
-            if (LY_REG < 144 && (RAM[STAT] & 0x20)) {
-                request_interrupt(INTERRUPT_STAT);
-            }
+        const byte ly = ++LY_REG;
+
+        if (ly == 144) {
+            // VBlank period starts; VBlank interrupt is unconditional
+            request_interrupt(INTERRUPT_VBLANK);
+        } else if (ly > 153) {
+            LY_REG = 0;
+            window_line = 0;
+        } else if (ly < 144) {
+            gpu_drawline(ly);
         }
 
-        // Check for LY=LYC coincidence interrupt (STAT bit 6)
-        if ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC] && LY_REG != prev_ly) {
-            request_interrupt(INTERRUPT_STAT);
-        }
+        // Fire STAT for any newly-active condition after LY change
+        stat_check_irq();
+    }
 
-        // STAT mode 0 (H-blank) interrupt: fires when entering H-blank
-        byte new_mode = gpu_get_mode();
-        if ((RAM[STAT] & 0x08) && new_mode == 0 && prev_mode != 0 && LY_REG < 144) {
-            request_interrupt(INTERRUPT_STAT);
-        }
+    // Check for mode transitions (mode 3→0 HBlank, mode 0→2 new scanline)
+    byte new_mode = gpu_get_mode();
+    if (new_mode != prev_mode) {
+        stat_check_irq();
+    }
+
+    // LYC coincidence: check whenever LY changed
+    if (LY_REG != prev_ly) {
+        stat_check_irq();
     }
 }
 
@@ -1364,24 +1389,32 @@ void do_interrupts(void){
         for (int i = 0; i<5; i++) {
           byte interrupt = INTERRUPT_PRIORITY[i];
           if ((enabled & interrupt) != 0) {
-            flag_bits = flag_bits & ~interrupt;
-
             //printf("Doing interrupt %s (%x)\n", INTERRUPT_NAMES[i], INTERRUPT_OFFSETS[i]);
             // Interrupt dispatch takes 5 M-cycles (20 cycles):
             // 2 idle + 2 stack push writes + 1 vector load
             cycles += 20;
-            // Push PC in hardware order: hi byte first (M2), then IE check, then lo byte (M3)
+            // Push PC hi byte first; push_hi may write to $FFFF (IE), changing which
+            // interrupts remain enabled.  We must NOT consume the interrupt from IF
+            // until after we re-evaluate against the post-push IE.
             mem_write(--SP, (PC >> 8) & 0xFF);
-            // IE is sampled between push_hi and push_lo; a write to $FFFF=IE via push_hi
-            // can cancel dispatch — the cancelled dispatch jumps to $0000 and IF is not consumed
+            // Re-read IE after push_hi (it may have been overwritten)
             byte post_hi_ie = mem_read(INTERRUPT_ENABLE) & 0x1F;
+            // Re-evaluate all pending interrupts against the updated IE
+            byte post_hi_pending = flag_bits & post_hi_ie;
             mem_write(--SP, PC & 0xFF);
-            if ((post_hi_ie & interrupt) == 0) {
-                // Dispatch cancelled: IF not consumed, restore it; jump to $0000
-                flag_bits |= interrupt;
+            if (post_hi_pending == 0) {
+                // No interrupt remains enabled — dispatch cancelled; jump to $0000,
+                // IF is not consumed (nothing gets cleared)
                 PC = 0x0000;
             } else {
-                PC = INTERRUPT_OFFSETS[i];
+                // Find the highest-priority interrupt still pending and dispatch to it
+                for (int j = 0; j < 5; j++) {
+                    if ((post_hi_pending & INTERRUPT_PRIORITY[j]) != 0) {
+                        flag_bits &= ~INTERRUPT_PRIORITY[j];
+                        PC = INTERRUPT_OFFSETS[j];
+                        break;
+                    }
+                }
             }
             break;
           }
