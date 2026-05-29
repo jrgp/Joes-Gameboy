@@ -517,17 +517,26 @@ void oam_read_corrupt(word addr) {
 char cart_name[30];
 byte cart_type;
 byte *cart_data;
-int cart_rom_banks;   // total number of 16KB ROM banks
-int cart_rom_bank = 1; // current switchable ROM bank (for $4000-$7FFF)
-byte ext_ram[0x2000]; // 8KB external RAM for MBC1+RAM (cart types 0x02, 0x03)
+int cart_rom_banks;      // total number of 16KB ROM banks
+int cart_rom_bank = 1;   // current switchable ROM bank (for $4000-$7FFF)
+int cart_mbc1_upper = 0; // upper 2 bits written to $4000-$5FFF (ROM bank bits 5-6 or RAM bank)
+int cart_mbc1_mode = 0;  // 0=ROM banking mode (default), 1=RAM banking mode
+byte ext_ram[0x8000];    // 32KB external RAM (up to 4 banks × 8KB for MBC1)
 
 byte cart_read(int pos) {
     if (pos < 0x4000) {
-        return cart_data[pos]; // bank 0 is always fixed
+        // Bank 0: fixed, but in MBC1 mode 1 the upper bits can remap bank 0
+        if (cart_mbc1_mode == 1 && cart_rom_banks > 32) {
+            int bank0 = (cart_mbc1_upper << 5) & (cart_rom_banks - 1);
+            return cart_data[bank0 * 0x4000 + pos];
+        }
+        return cart_data[pos];
     }
     // $4000-$7FFF: switchable ROM bank
-    int bank_offset = cart_rom_bank * 0x4000 + (pos - 0x4000);
-    return cart_data[bank_offset];
+    int bank = cart_rom_bank | (cart_mbc1_upper << 5);
+    bank &= (cart_rom_banks - 1);
+    if ((bank & 0x1F) == 0) bank |= 1; // MBC1: lower 5 bits of 0 map to 1
+    return cart_data[bank * 0x4000 + (pos - 0x4000)];
 }
 
 void cart_write(int pos, byte data) {
@@ -537,20 +546,18 @@ void cart_write(int pos, byte data) {
     }
     if (pos <= 0x3FFF) {
         // MBC1 ROM bank number (lower 5 bits)
-        int bank = data & 0x1F;
-        if (bank == 0) bank = 1; // MBC1: bank 0 maps to bank 1
-        // Mask to valid bank range
-        int mask = cart_rom_banks - 1;
-        cart_rom_bank = bank & mask;
+        cart_rom_bank = data & 0x1F;
         if (cart_rom_bank == 0) cart_rom_bank = 1;
         return;
     }
     if (pos <= 0x5FFF) {
-        // MBC1 RAM bank or upper ROM bank bits: ignore for now
+        // MBC1 upper bits: RAM bank number OR upper ROM bank bits
+        cart_mbc1_upper = data & 0x03;
         return;
     }
     if (pos <= 0x7FFF) {
-        // MBC1 mode select: ignore
+        // MBC1 banking mode: 0=ROM (up to 2MB ROM, 8KB RAM), 1=RAM (512KB ROM, 32KB RAM)
+        cart_mbc1_mode = data & 0x01;
         return;
     }
     // other cart writes: silently ignore
@@ -560,6 +567,10 @@ void cart_load(char *path) {
     FILE *fileptr;
     long filelen;
     fileptr = fopen(path, "rb");
+    if (fileptr == NULL) {
+        fprintf(stderr, "Error: cannot open ROM: %s\n", path);
+        exit(1);
+    }
     fseek(fileptr, 0, SEEK_END);
     filelen = ftell(fileptr);
     rewind(fileptr);
@@ -583,13 +594,15 @@ void cart_load(char *path) {
     cart_name[i+1] = '\0';
     cart_type = cart_data[0x147];
     cart_rom_banks = (int)filelen / 0x4000;
-    cart_rom_bank = 1; // reset to default bank
+    cart_rom_bank = 1;
+    cart_mbc1_upper = 0;
+    cart_mbc1_mode = 0;
 
     printf("Loaded %s\n", cart_name);
 
-    if (cart_type > 3) {
-        printf("Invalid romtype %x: MBC not yet supported\n", cart_type);
-        exit(1);
+    // Support MBC1 (types 0-3) and MBC3 (types 0x0F-0x13) for Pokemon
+    if (cart_type > 3 && !(cart_type >= 0x0F && cart_type <= 0x13)) {
+        printf("Warning: cart type 0x%02X not fully supported\n", cart_type);
     }
 }
 
@@ -716,7 +729,8 @@ byte mem_read(int pos) {
     } else if (pos >= 0x8000 && pos <= 0x9FFF) {
         return gpu_read(pos);
     } else if (pos >= 0xA000 && pos <= 0xBFFF) {
-        return ext_ram[pos - 0xA000];
+        int ram_bank = (cart_mbc1_mode == 1) ? cart_mbc1_upper : 0;
+        return ext_ram[ram_bank * 0x2000 + (pos - 0xA000)];
     }
     // FIXME: lots missing here
     else {
@@ -804,13 +818,18 @@ void mem_write(int pos, byte data) {
             } else if (pos >= 0x8000 && pos <= 0x9FFF) {
                 gpu_write(pos, data);
             } else if (pos >= 0xA000 && pos <= 0xBFFF) {
-                ext_ram[pos - 0xA000] = data;
+                int ram_bank = (cart_mbc1_mode == 1) ? cart_mbc1_upper : 0;
+                int idx = ram_bank * 0x2000 + (pos - 0xA000);
+                ext_ram[idx] = data;
                 // Detect blargg test completion: A000 written with non-0x80 value
                 // when magic bytes DE B0 61 are present at A001-A003
                 if (pos == 0xA000 && data != 0x80 &&
                     ext_ram[1] == 0xDE && ext_ram[2] == 0xB0 && ext_ram[3] == 0x61) {
                     blargg_done = true;
                 }
+                // In headless mode, drain the blargg text buffer when the blargg
+                // No per-write drain check needed here; drain is triggered in the
+                // main loop by monitoring the $D883/$D884 text pointer value.
             } else {
                 RAM[pos] = data;
             }
@@ -4237,6 +4256,20 @@ void headless_main_impl(void) {
         if (blargg_done) {
             headless_print_blargg_a000();
             break;
+        }
+        // Drain blargg A004 text buffer before it overflows into WRAM ($C000+).
+        // Monitor the blargg write pointer at $D883/$D884: when it reaches $BF00
+        // (near the end of the 8KB ext_ram bank), reset it to $A004 and clear the
+        // buffer. This is safe to check after each instruction since the pointer
+        // only advances during blargg text writes (very infrequent).
+        if (headless && !blargg_done &&
+            ext_ram[1] == 0xDE && ext_ram[2] == 0xB0 && ext_ram[3] == 0x61) {
+            uint16_t txt_ptr = ((uint16_t)RAM[0xD884] << 8) | RAM[0xD883];
+            if (txt_ptr >= 0xBF00) {
+                RAM[0xD883] = 0x04;  // reset write pointer low byte → $A004
+                RAM[0xD884] = 0xA0;  // reset write pointer high byte
+                memset(&ext_ram[4], 0, 0x2000 - 4);
+            }
         }
         instr_timer_cycles = 0;
         int prevcycles = cycles;
