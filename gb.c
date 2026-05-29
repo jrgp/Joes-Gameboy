@@ -950,6 +950,8 @@ void mem_write(int pos, byte data) {
     if (pos >= 0xE000 && pos < 0xFE00) {
         pos -= 0x2000;
     }
+    // OAM bus is locked during DMA — CPU writes to OAM are blocked
+    if (dma_active && pos >= 0xFE00 && pos <= 0xFE9F) return;
     switch (pos) {
         case BGP:
         case LCDC:
@@ -1296,7 +1298,9 @@ byte cpu_read(int loc) {
     cycles += 4;
     timer_step(4);            // step timer before memory access for sub-instruction timing
     instr_timer_cycles += 4;
-    return mem_read(loc);
+    byte result = mem_read(loc);
+    dma_step(4);              // step DMA after access (mem_read checks dma_active before this)
+    return result;
 }
 
 void cpu_write(int loc, byte value) {
@@ -1304,6 +1308,15 @@ void cpu_write(int loc, byte value) {
     timer_step(4);            // step timer before memory access for sub-instruction timing
     instr_timer_cycles += 4;
     mem_write(loc, value);
+    dma_step(4);              // step DMA after access
+}
+
+// Internal M-cycle: advances time by 4T and steps timer/DMA (for non-memory-access cycles)
+static inline void cpu_internal(void) {
+    cycles += 4;
+    timer_step(4);
+    instr_timer_cycles += 4;
+    dma_step(4);
 }
 
 byte cpu_read_next(void) {
@@ -2680,10 +2693,10 @@ void exec_op(byte opcode){
 
     // RET NZ
     case 0xc0:
-      cycles += 4;
+      cpu_internal();       // M2: condition check
       if (!CheckFlag(FLAG_Z)) {
           { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = ((word)hi << 8) | lo; }
-          cycles += 4;
+          cpu_internal();   // M5: internal
       }
       break;
 
@@ -2698,7 +2711,7 @@ void exec_op(byte opcode){
     case 0xc2:
       pos = cpu_read16();
       if (!CheckFlag(FLAG_Z)) {
-          cycles += 4;
+          cpu_internal();   // M4: internal
           PC = pos;
       }
       break;
@@ -2706,14 +2719,14 @@ void exec_op(byte opcode){
     // JP a16
     case 0xc3:
       PC = cpu_read16();
-      cycles += 4;
+      cpu_internal();   // M4: internal
       break;
 
     // CALL NZ
     case 0xc4:
       pos = cpu_read16();
       if (!CheckFlag(FLAG_Z)) {
-          cycles += 4;
+          cpu_internal();   // M4: internal delay
           cpu_write(--SP, (PC >> 8) & 0xFF);
           cpu_write(--SP, PC & 0xFF);
           PC = pos;
@@ -2725,7 +2738,7 @@ void exec_op(byte opcode){
       oam_write_corrupt_at(SP, 0);    // M2 IDU
       oam_write_corrupt_at(SP-1, 4); // M3 write hi
       oam_write_corrupt_at(SP-2, 8); // M4 write lo
-      cycles += 4;              // M2 internal delay
+      cpu_internal();           // M2 internal delay
       cpu_write(--SP, B);       // M3: write B (hi)
       cpu_write(--SP, C);       // M4: write C (lo)
       break;
@@ -2737,7 +2750,7 @@ void exec_op(byte opcode){
 
     // RST 00H
     case 0xc7:
-      cycles += 4;
+      cpu_internal();   // M2: internal
       cpu_write(--SP, (PC >> 8) & 0xFF);
       cpu_write(--SP, PC & 0xFF);
       PC = 0x00;
@@ -2745,24 +2758,24 @@ void exec_op(byte opcode){
 
     // RET Z
     case 0xc8:
-      cycles += 4;
+      cpu_internal();       // M2: condition check
       if (CheckFlag(FLAG_Z)) {
           { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = ((word)hi << 8) | lo; }
-          cycles += 4;
+          cpu_internal();   // M5: internal
       }
       break;
 
     // RET
     case 0xc9:
       { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = ((word)hi << 8) | lo; }
-      cycles += 4;
+      cpu_internal();   // M4: internal
       break;
 
     // JP Z
     case 0xca:
       pos = cpu_read16();
       if (CheckFlag(FLAG_Z)) {
-          cycles += 4;
+          cpu_internal();   // M4: internal
           PC = pos;
       }
       break;
@@ -2771,7 +2784,7 @@ void exec_op(byte opcode){
     case 0xcc:
       pos = cpu_read16();
       if (CheckFlag(FLAG_Z)) {
-          cycles += 4;
+          cpu_internal();   // M4: internal delay
           cpu_write(--SP, (PC >> 8) & 0xFF);
           cpu_write(--SP, PC & 0xFF);
           PC = pos;
@@ -2781,7 +2794,7 @@ void exec_op(byte opcode){
     // CALL a16
     case 0xcd:
       pos = cpu_read16();
-      cycles += 4;
+      cpu_internal();   // M4: internal delay
       cpu_write(--SP, (PC >> 8) & 0xFF);
       cpu_write(--SP, PC & 0xFF);
       PC = pos;
@@ -2794,7 +2807,7 @@ void exec_op(byte opcode){
 
     // RST 08H
     case 0xcf:
-      cycles += 4;
+      cpu_internal();   // M2: internal
       cpu_write(--SP, (PC >> 8) & 0xFF);
       cpu_write(--SP, PC & 0xFF);
       PC = 0x08;
@@ -2802,10 +2815,10 @@ void exec_op(byte opcode){
 
     // RET NC
     case 0xd0:
-      cycles += 4;
+      cpu_internal();       // M2: condition check
       if (!CheckFlag(FLAG_C)) {
           { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = ((word)hi << 8) | lo; }
-          cycles += 4;
+          cpu_internal();   // M5: internal
       }
       break;
 
@@ -2820,7 +2833,7 @@ void exec_op(byte opcode){
     case 0xd2:
       pos = cpu_read16();
       if (!CheckFlag(FLAG_C)) {
-          cycles += 4;
+          cpu_internal();   // M4: internal
           PC = pos;
       }
       break;
@@ -2829,7 +2842,7 @@ void exec_op(byte opcode){
     case 0xd4:
       pos = cpu_read16();
       if (!CheckFlag(FLAG_C)) {
-          cycles += 4;
+          cpu_internal();   // M4: internal delay
           cpu_write(--SP, (PC >> 8) & 0xFF);
           cpu_write(--SP, PC & 0xFF);
           PC = pos;
@@ -2841,7 +2854,7 @@ void exec_op(byte opcode){
       oam_write_corrupt_at(SP, 0);    // M2 IDU
       oam_write_corrupt_at(SP-1, 4); // M3 write hi
       oam_write_corrupt_at(SP-2, 8); // M4 write lo
-      cycles += 4;              // M2 internal delay
+      cpu_internal();           // M2 internal delay
       cpu_write(--SP, D);       // M3: write D (hi)
       cpu_write(--SP, E);       // M4: write E (lo)
       break;
@@ -2853,7 +2866,7 @@ void exec_op(byte opcode){
 
     // RST 10H
     case 0xd7:
-      cycles += 4;
+      cpu_internal();   // M2: internal
       cpu_write(--SP, (PC >> 8) & 0xFF);
       cpu_write(--SP, PC & 0xFF);
       PC = 0x10;
@@ -2861,17 +2874,17 @@ void exec_op(byte opcode){
 
     // RET C
     case 0xd8:
-      cycles += 4;
+      cpu_internal();       // M2: condition check
       if (CheckFlag(FLAG_C)) {
           { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = ((word)hi << 8) | lo; }
-          cycles += 4;
+          cpu_internal();   // M5: internal
       }
       break;
 
     // RETI
     case 0xd9:
       { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = ((word)hi << 8) | lo; }
-      cycles += 4;
+      cpu_internal();   // M4: internal
       interrupts = true;
       break;
 
@@ -2879,7 +2892,7 @@ void exec_op(byte opcode){
     case 0xda:
       pos = cpu_read16();
       if (CheckFlag(FLAG_C)) {
-          cycles += 4;
+          cpu_internal();   // M4: internal
           PC = pos;
       }
       break;
@@ -2888,7 +2901,7 @@ void exec_op(byte opcode){
     case 0xdc:
       pos = cpu_read16();
       if (CheckFlag(FLAG_C)) {
-          cycles += 4;
+          cpu_internal();   // M4: internal delay
           cpu_write(--SP, (PC >> 8) & 0xFF);
           cpu_write(--SP, PC & 0xFF);
           PC = pos;
@@ -2897,7 +2910,7 @@ void exec_op(byte opcode){
 
     // RST 18H
     case 0xdf:
-      cycles += 4;
+      cpu_internal();   // M2: internal
       cpu_write(--SP, (PC >> 8) & 0xFF);
       cpu_write(--SP, PC & 0xFF);
       PC = 0x18;
@@ -2942,7 +2955,8 @@ void exec_op(byte opcode){
         setFlag(FLAG_H, (SP & 0xf) + (val & 0xf) > 0xf);
         setFlag(FLAG_C, (SP & 0xff) + (unsigned)(val & 0xff) > 0xff);
         SP = (word)result;
-        cycles += 8;
+        cpu_internal();   // M3: internal
+        cpu_internal();   // M4: internal
       }
       break;
 
@@ -2951,7 +2965,7 @@ void exec_op(byte opcode){
       oam_write_corrupt_at(SP, 0);    // M2 IDU
       oam_write_corrupt_at(SP-1, 4); // M3 write hi
       oam_write_corrupt_at(SP-2, 8); // M4 write lo
-      cycles += 4;              // M2 internal delay
+      cpu_internal();           // M2 internal delay
       cpu_write(--SP, H);       // M3: write H (hi)
       cpu_write(--SP, L);       // M4: write L (lo)
       break;
@@ -2963,7 +2977,7 @@ void exec_op(byte opcode){
 
     // RST 20H
     case 0xe7:
-      cycles += 4;
+      cpu_internal();   // M2: internal
       cpu_write(--SP, (PC >> 8) & 0xFF);
       cpu_write(--SP, PC & 0xFF);
       PC = 0x20;
@@ -2986,7 +3000,7 @@ void exec_op(byte opcode){
 
     // RST 28H
     case 0xef:
-      cycles += 4;
+      cpu_internal();   // M2: internal
       cpu_write(--SP, (PC >> 8) & 0xFF);
       cpu_write(--SP, PC & 0xFF);
       PC = 0x28;
@@ -3027,7 +3041,7 @@ void exec_op(byte opcode){
       oam_write_corrupt_at(SP, 0);    // M2 IDU
       oam_write_corrupt_at(SP-1, 4); // M3 write hi
       oam_write_corrupt_at(SP-2, 8); // M4 write lo
-      cycles += 4;              // M2 internal delay
+      cpu_internal();           // M2 internal delay
       cpu_write(--SP, A);       // M3: write A (hi)
       cpu_write(--SP, F);       // M4: write F (lo)
       break;
@@ -3039,7 +3053,7 @@ void exec_op(byte opcode){
 
     // RST 30H
     case 0xf7:
-      cycles += 4;
+      cpu_internal();   // M2: internal
       cpu_write(--SP, (PC >> 8) & 0xFF);
       cpu_write(--SP, PC & 0xFF);
       PC = 0x30;
@@ -3055,14 +3069,14 @@ void exec_op(byte opcode){
         setFlag(FLAG_H, (SP & 0xf) + (val & 0xf) > 0xf);
         setFlag(FLAG_C, (SP & 0xff) + (unsigned)(val & 0xff) > 0xff);
         setHL((word)result);
-        cycles += 4;
+        cpu_internal();   // M3: internal
       }
       break;
 
     // LD SP, HL
     case 0xf9:
       SP = HL();
-      cycles += 4;
+      cpu_internal();   // M2: internal
       break;
 
     // LD A <- (a16)
@@ -3082,7 +3096,7 @@ void exec_op(byte opcode){
 
     // RST 38H
     case 0xff:
-      cycles += 4;
+      cpu_internal();   // M2: internal
       cpu_write(--SP, (PC >> 8) & 0xFF);
       cpu_write(--SP, PC & 0xFF);
       PC = 0x38;
@@ -4448,6 +4462,7 @@ bool frame_headless(void){
             if (dispatch_cycles > 0) {
                 gpu_step(dispatch_cycles);
                 timer_step(dispatch_cycles - instr_timer_cycles);
+                dma_step(dispatch_cycles);
                 instr_timer_cycles = 0;
             }
             exec_next_start_cycles = cycles;
@@ -4456,7 +4471,7 @@ bool frame_headless(void){
 
             gpu_step(cpu_cycles);
             timer_step(cpu_cycles - instr_timer_cycles);
-            dma_step(cpu_cycles);
+            dma_step(cpu_cycles - instr_timer_cycles);
             instruction_count++;
 
             // Safety check for infinite loops
@@ -4598,6 +4613,7 @@ void headless_main_impl(void) {
         if (dispatch_cycles > 0) {
             gpu_step(dispatch_cycles);
             timer_step(dispatch_cycles - instr_timer_cycles);
+            dma_step(dispatch_cycles);
             instr_timer_cycles = 0;
         }
         exec_next_start_cycles = cycles;
@@ -4606,7 +4622,7 @@ void headless_main_impl(void) {
         gpu_step(cpu_cycles);
         timer_step(cpu_cycles - instr_timer_cycles);
         apu_step(cpu_cycles);
-        dma_step(cpu_cycles);
+        dma_step(cpu_cycles - instr_timer_cycles);
         total_cycles += cpu_cycles;
     }
     // If cycle limit hit but A000 output present, still print it
