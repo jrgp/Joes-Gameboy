@@ -47,6 +47,19 @@ long long max_cycles = 0;
 // Magic bytes at A001-A003 = {0xDE, 0xB0, 0x61}; result at A000 (0x80=running, 0=pass, other=fail)
 bool blargg_done = false;
 
+// CGB double-speed mode state (KEY1/$FF4D)
+bool double_speed = false;
+
+// Minimal APU: only length counters for channels 1 and 2 (needed for interrupt_time test)
+// Length counter fires at 256 Hz real-time = 16384 T-cycles at 1x, 32768 T-cycles at 2x.
+bool apu_ch1_active = false;
+bool apu_ch1_length_enable = false;
+int  apu_ch1_length = 0;   // remaining length ticks
+bool apu_ch2_active = false;
+bool apu_ch2_length_enable = false;
+int  apu_ch2_length = 0;   // remaining length ticks
+int  apu_length_cycles = 0;
+
 typedef struct {
     bool enabled, bg, window, sprite;
     int windowtilemap, BgWindowTileData;
@@ -516,6 +529,7 @@ void oam_read_corrupt(word addr) {
 
 char cart_name[30];
 byte cart_type;
+byte cart_cgb_flag;  // cart header byte $0143: $80=CGB enhanced, $C0=CGB only
 byte *cart_data;
 int cart_rom_banks;      // total number of 16KB ROM banks
 int cart_rom_bank = 1;   // current switchable ROM bank (for $4000-$7FFF)
@@ -593,6 +607,7 @@ void cart_load(char *path) {
     }
     cart_name[i+1] = '\0';
     cart_type = cart_data[0x147];
+    cart_cgb_flag = cart_data[0x143];
     cart_rom_banks = (int)filelen / 0x4000;
     cart_rom_bank = 1;
     cart_mbc1_upper = 0;
@@ -714,6 +729,23 @@ void timer_step(int cpu_cycles) {
     }
 }
 
+// Minimal APU step: fires the 256 Hz length counter clock.
+// Period is 16384 T-cycles at 1x speed, 32768 T-cycles at 2x speed.
+void apu_step(int cpu_cycles) {
+    apu_length_cycles += cpu_cycles;
+    // 256 Hz clock: period doubles in double-speed mode because APU runs at 1x real-time
+    int period = double_speed ? 32768 : 16384;
+    while (apu_length_cycles >= period) {
+        apu_length_cycles -= period;
+        if (apu_ch1_active && apu_ch1_length_enable) {
+            if (--apu_ch1_length <= 0) apu_ch1_active = false;
+        }
+        if (apu_ch2_active && apu_ch2_length_enable) {
+            if (--apu_ch2_length <= 0) apu_ch2_active = false;
+        }
+    }
+}
+
 void mem_dma(byte data) {
 	const int start = (int)data * 100;
 	for (int i = 0; i <= 0x9f; i++) {
@@ -747,6 +779,17 @@ byte mem_read(int pos) {
                 return gpu_read(pos);
             case JOYPAD:
                 return joypad_read();
+            case 0xFF4D:
+                // KEY1: CGB speed switch register
+                // bit 7 = current speed (0=normal, 1=double), read-only
+                // bit 0 = arm speed switch, read/write
+                // bits 1-6 = unused (read as 1 on CGB, 0xFF on DMG but we support for compat)
+                return (double_speed ? 0x80 : 0x00) | (RAM[0xFF4D] & 0x01) | 0x7E;
+            case 0xFF26: // NR52: sound master control; bit0=ch1, bit1=ch2 active
+                return (RAM[0xFF26] & 0x80) |
+                       (apu_ch1_active ? 0x01 : 0x00) |
+                       (apu_ch2_active ? 0x02 : 0x00) |
+                       0x70; // unused bits read as 1
             case INTERRUPT_FLAGS:
                 // DMG: upper 3 bits of IF are always 1
                 return RAM[pos] | 0xE0;
@@ -811,6 +854,51 @@ void mem_write(int pos, byte data) {
         case REG_TAC:
             RAM[pos] = data;
             break;
+        case 0xFF4D:
+            // KEY1: only bit 0 (arm speed switch) is writable
+            RAM[0xFF4D] = data & 0x01;
+            break;
+        // APU channel 1 registers
+        case 0xFF11: // NR11: length/duty
+            RAM[pos] = data;
+            apu_ch1_length = 64 - (data & 0x3F);
+            break;
+        case 0xFF12: // NR12: volume/envelope (DAC on if bits 7-3 != 0)
+            RAM[pos] = data;
+            break;
+        case 0xFF14: // NR14: freq hi + trigger + length enable
+            RAM[pos] = data;
+            apu_ch1_length_enable = (data >> 6) & 1;
+            if (data & 0x80) { // trigger bit
+                apu_ch1_active = true;
+                if (apu_ch1_length == 0) apu_ch1_length = 64;
+                apu_length_cycles = 0; // sync phase on trigger
+            }
+            break;
+        // APU channel 2 registers
+        case 0xFF16: // NR21: length/duty
+            RAM[pos] = data;
+            apu_ch2_length = 64 - (data & 0x3F);
+            break;
+        case 0xFF17: // NR22: volume/envelope
+            RAM[pos] = data;
+            break;
+        case 0xFF19: // NR24: freq hi + trigger + length enable
+            RAM[pos] = data;
+            apu_ch2_length_enable = (data >> 6) & 1;
+            if (data & 0x80) { // trigger bit
+                apu_ch2_active = true;
+                if (apu_ch2_length == 0) apu_ch2_length = 64;
+                apu_length_cycles = 0; // sync phase on trigger
+            }
+            break;
+        case 0xFF26: // NR52: sound master on/off
+            RAM[pos] = data & 0x80;
+            if (!(data & 0x80)) { // turning APU off clears channels
+                apu_ch1_active = false;
+                apu_ch2_active = false;
+            }
+            break;
         default:
             if (pos == 0xFF50 && inBios) {
                 inBios = false;
@@ -848,6 +936,15 @@ void mem_init(void){
     serial_buf[0] = '\0';
     serial_sb = 0;
     blargg_done = false;
+    double_speed = false;
+    RAM[0xFF4D] = 0;
+    apu_ch1_active = false;
+    apu_ch1_length_enable = false;
+    apu_ch1_length = 0;
+    apu_ch2_active = false;
+    apu_ch2_length_enable = false;
+    apu_ch2_length = 0;
+    apu_length_cycles = 0;
     inBios = true;
     bailAfterBios = true;
     bailAfterBios = false;
@@ -911,7 +1008,8 @@ void cpu_close_debug_file(void){
 
 void cpu_fake_init(void){
     F = 0xB0;
-    A = 0x01;
+    // CGB-only ROMs ($0143=$C0) expect A=$11 at boot; DMG/CGB-enhanced use $01
+    A = (cart_cgb_flag == 0xC0) ? 0x11 : 0x01;
     C = 0x13;
     B = 0x00;
     E = 0xD8;
@@ -1417,6 +1515,14 @@ void exec_op(byte opcode){
     // STOP
     case 0x10:
       cpu_read_next(); // consume 0x00 operand
+      // CGB speed switch: if KEY1 bit 0 is armed, toggle double-speed mode
+      fprintf(stderr, "[STOP] PC=%04X KEY1=%02X\n", PC, RAM[0xFF4D]);
+      if (RAM[0xFF4D] & 0x01) {
+          double_speed = !double_speed;
+          RAM[0xFF4D] = 0;  // clear arm bit; bit 7 updated via mem_read
+          cycles += 2050 * 4;  // 2050 M-cycle stall per Pan Docs
+          fprintf(stderr, "[SPEED] switched to double_speed=%d\n", double_speed);
+      }
       break;
 
     // LD DE <- d16
@@ -4285,6 +4391,7 @@ void headless_main_impl(void) {
         int cpu_cycles = cycles - prevcycles - dispatch_cycles;
         gpu_step(cpu_cycles);
         timer_step(cpu_cycles - instr_timer_cycles);
+        apu_step(cpu_cycles);
         total_cycles += cpu_cycles;
     }
     // If cycle limit hit but A000 output present, still print it
