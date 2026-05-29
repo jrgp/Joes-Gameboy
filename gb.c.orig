@@ -47,12 +47,6 @@ long long max_cycles = 0;
 // Magic bytes at A001-A003 = {0xDE, 0xB0, 0x61}; result at A000 (0x80=running, 0=pass, other=fail)
 bool blargg_done = false;
 
-// OAM DMA state: cycle-accurate 160 M-cycle transfer
-bool dma_active = false;
-int  dma_cycles_remaining = 0; // counts down from 160 (M-cycles) during active transfer
-int  dma_startup_remaining = 0;// 2 M-cycle startup delay before first byte is copied
-int  dma_source = 0;           // source start address
-
 // CGB double-speed mode state (KEY1/$FF4D)
 bool double_speed = false;
 
@@ -830,37 +824,11 @@ void apu_step(int cpu_cycles) {
     }
 }
 
-// dma_read_source: read one byte from a DMA source address, handling echo RAM mapping
-static byte dma_read_source(int addr) {
-    // Echo RAM ($E000-$FFFF) mirrors WRAM ($C000-$DFFF) for DMA bus reads
-    // DMG: addresses $E000-$FDFF → $C000-$DDFF, $FE00-$FEFF → $DE00-$DEFF, $FF00-$FFFF → $DF00-$DFFF
-    if (addr >= 0xE000) addr -= 0x2000;
-    return mem_read(addr);
-}
-
 void mem_dma(byte data) {
-    RAM[DMA] = data; // store for $FF46 readback
-    dma_source = (int)data * 0x100;
-    dma_cycles_remaining = 160; // 160 M-cycles = 640 T-cycles
-    dma_startup_remaining = 2;  // 2 M-cycle startup delay before first byte copied
-    dma_active = true;
-}
-
-// Called each instruction with the T-cycle count; steps the DMA transfer.
-void dma_step(int t_cycles) {
-    if (!dma_active) return;
-    int m_cycles = t_cycles / 4;
-    while (m_cycles-- > 0) {
-        if (dma_startup_remaining > 0) {
-            dma_startup_remaining--;
-            continue;
-        }
-        if (dma_cycles_remaining <= 0) break;
-        int idx = 160 - dma_cycles_remaining;
-        RAM[0xFE00 + idx] = dma_read_source(dma_source + idx);
-        dma_cycles_remaining--;
-    }
-    if (dma_startup_remaining <= 0 && dma_cycles_remaining <= 0) dma_active = false;
+	const int start = (int)data * 0x100;  // DMA source: data * 256 (e.g. $C0 → $C000)
+	for (int i = 0; i <= 0x9f; i++) {
+        RAM[0xFE00+i] = mem_read(start+i);
+	}
 }
 
 byte mem_read(int pos) {
@@ -873,13 +841,6 @@ byte mem_read(int pos) {
     } else if (pos >= 0xA000 && pos <= 0xBFFF) {
         int ram_bank = is_mbc3() ? cart_ram_bank : (cart_mbc1_mode == 1 ? cart_mbc1_upper : 0);
         return ext_ram[ram_bank * 0x2000 + (pos - 0xA000)];
-    } else if (pos >= 0xE000 && pos < 0xFE00) {
-        // Echo RAM: $E000-$FDFF mirrors WRAM $C000-$DDFF
-        return RAM[pos - 0x2000];
-    } else if (pos >= 0xFE00 && pos <= 0xFE9F) {
-        // OAM: returns 0xFF when DMA is active (bus conflict)
-        if (dma_active) return 0xFF;
-        return RAM[pos];
     }
     // FIXME: lots missing here
     else {
@@ -897,11 +858,11 @@ byte mem_read(int pos) {
             case JOYPAD:
                 return joypad_read() | 0xC0; // bits 7-6 always 1
             case 0xFF4D:
-                // KEY1: CGB speed switch register - only accessible on CGB hardware
-                // On DMG, this register doesn't exist and reads as $FF
-                if (cart_cgb_flag == 0xC0)
-                    return (double_speed ? 0x80 : 0x00) | (RAM[0xFF4D] & 0x01) | 0x7E;
-                return 0xFF;
+                // KEY1: CGB speed switch register
+                // bit 7 = current speed (0=normal, 1=double), read-only
+                // bit 0 = arm speed switch, read/write
+                // bits 1-6 = unused (read as 1 on CGB, 0xFF on DMG but we support for compat)
+                return (double_speed ? 0x80 : 0x00) | (RAM[0xFF4D] & 0x01) | 0x7E;
             case 0xFF26: // NR52: sound master control; bit0=ch1, bit1=ch2 active
                 return (RAM[0xFF26] & 0x80) |
                        (apu_ch1_active ? 0x01 : 0x00) |
@@ -945,10 +906,6 @@ void mem_write(int pos, byte data) {
     if (pos <= 0x7FFF) {
         cart_write(pos, data);
         return;
-    }
-    // Echo RAM: $E000-$FDFF mirrors WRAM $C000-$DDFF (write through)
-    if (pos >= 0xE000 && pos < 0xFE00) {
-        pos -= 0x2000;
     }
     switch (pos) {
         case BGP:
@@ -2007,7 +1964,6 @@ void exec_op(byte opcode){
       setFlag(FLAG_N, false);
       setFlag(FLAG_H, false);
       setFlag(FLAG_C, !CheckFlag(FLAG_C));
-      break;
     // LD B <- B (nop)
     case 0x40:
       // Mooneye-gb test signal: LD B,B used as breakpoint
@@ -2017,23 +1973,7 @@ void exec_op(byte opcode){
               printf("Passed\n");
               blargg_done = true;
           } else if (B == 0x42 && C == 0x42 && D == 0x42 && E == 0x42 && H == 0x42 && L == 0x42) {
-              // Decode the BG tilemap ($9800) as ASCII to show the failure message
-              // Tile map uses tile indices; font in VRAM at $8000, each tile = 16 bytes
-              // Character codes: tile 0 = space, others are ASCII-like
-              char vram_msg[200] = {0};
-              int vlen = 0;
-              for (int row = 0; row < 5; row++) {
-                  for (int col = 0; col < 32 && vlen < 198; col++) {
-                      byte tidx = VRAM[0x1800 + row*32 + col];
-                      char ch = (tidx >= 0x20 && tidx < 0x80) ? (char)tidx : (tidx == 0 ? ' ' : '?');
-                      vram_msg[vlen++] = ch;
-                  }
-                  if (vlen < 198) vram_msg[vlen++] = '\n';
-              }
-              vram_msg[vlen] = '\0';
-              // Trim trailing spaces
-              while (vlen > 0 && vram_msg[vlen-1] == ' ') vram_msg[--vlen] = '\0';
-              printf("Failed (mooneye): %s\n", vram_msg[0] ? vram_msg : "(no screen msg)");
+              printf("Failed (mooneye)\n");
               blargg_done = true;
           }
       }
@@ -2682,16 +2622,17 @@ void exec_op(byte opcode){
     case 0xc0:
       cycles += 4;
       if (!CheckFlag(FLAG_Z)) {
-          { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = ((word)hi << 8) | lo; }
-          cycles += 4;
+          cycles += 12;
+          PC = pop_stack();
       }
       break;
 
     // POP BC
     case 0xc1:
-      oam_read_corrupt_at(SP, 0);
-      oam_read_corrupt_at(SP + 1, 4);
-      { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); setBC(((word)hi << 8) | lo); }
+      oam_read_corrupt_at(SP, 0);    // M2: POP first read (row 0x30, secondary case)
+      oam_read_corrupt_at(SP + 1, 4); // M3: POP second read (row 0x38, standard case)
+      setBC(pop_stack());
+      cycles += 8;
       break;
 
     // JP NZ
@@ -2713,10 +2654,9 @@ void exec_op(byte opcode){
     case 0xc4:
       pos = cpu_read16();
       if (!CheckFlag(FLAG_Z)) {
-          cycles += 4;
-          cpu_write(--SP, (PC >> 8) & 0xFF);
-          cpu_write(--SP, PC & 0xFF);
+          push_stack(PC);
           PC = pos;
+          cycles += 12;
       }
       break;
 
@@ -2725,9 +2665,8 @@ void exec_op(byte opcode){
       oam_write_corrupt_at(SP, 0);    // M2 IDU
       oam_write_corrupt_at(SP-1, 4); // M3 write hi
       oam_write_corrupt_at(SP-2, 8); // M4 write lo
-      cycles += 4;              // M2 internal delay
-      cpu_write(--SP, B);       // M3: write B (hi)
-      cpu_write(--SP, C);       // M4: write C (lo)
+      push_stack(BC());
+      cycles += 12;
       break;
 
     // ADD A += d8
@@ -2737,9 +2676,8 @@ void exec_op(byte opcode){
 
     // RST 00H
     case 0xc7:
-      cycles += 4;
-      cpu_write(--SP, (PC >> 8) & 0xFF);
-      cpu_write(--SP, PC & 0xFF);
+      push_stack(PC);
+      cycles += 12;
       PC = 0x00;
       break;
 
@@ -2747,15 +2685,15 @@ void exec_op(byte opcode){
     case 0xc8:
       cycles += 4;
       if (CheckFlag(FLAG_Z)) {
-          { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = ((word)hi << 8) | lo; }
-          cycles += 4;
+          cycles += 12;
+          PC = pop_stack();
       }
       break;
 
     // RET
     case 0xc9:
-      { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = ((word)hi << 8) | lo; }
-      cycles += 4;
+      cycles += 12;
+      PC = pop_stack();
       break;
 
     // JP Z
@@ -2771,20 +2709,18 @@ void exec_op(byte opcode){
     case 0xcc:
       pos = cpu_read16();
       if (CheckFlag(FLAG_Z)) {
-          cycles += 4;
-          cpu_write(--SP, (PC >> 8) & 0xFF);
-          cpu_write(--SP, PC & 0xFF);
+          push_stack(PC);
           PC = pos;
+          cycles += 12;
       }
       break;
 
     // CALL a16
     case 0xcd:
       pos = cpu_read16();
-      cycles += 4;
-      cpu_write(--SP, (PC >> 8) & 0xFF);
-      cpu_write(--SP, PC & 0xFF);
+      push_stack(PC);
       PC = pos;
+      cycles += 12;
       break;
 
     // ADC A += d8
@@ -2794,9 +2730,8 @@ void exec_op(byte opcode){
 
     // RST 08H
     case 0xcf:
-      cycles += 4;
-      cpu_write(--SP, (PC >> 8) & 0xFF);
-      cpu_write(--SP, PC & 0xFF);
+      push_stack(PC);
+      cycles += 12;
       PC = 0x08;
       break;
 
@@ -2804,8 +2739,8 @@ void exec_op(byte opcode){
     case 0xd0:
       cycles += 4;
       if (!CheckFlag(FLAG_C)) {
-          { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = ((word)hi << 8) | lo; }
-          cycles += 4;
+          cycles += 12;
+          PC = pop_stack();
       }
       break;
 
@@ -2813,7 +2748,8 @@ void exec_op(byte opcode){
     case 0xd1:
       oam_read_corrupt_at(SP, 0);
       oam_read_corrupt_at(SP + 1, 4);
-      { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); setDE(((word)hi << 8) | lo); }
+      setDE(pop_stack());
+      cycles += 8;
       break;
 
     // JP NC
@@ -2829,10 +2765,9 @@ void exec_op(byte opcode){
     case 0xd4:
       pos = cpu_read16();
       if (!CheckFlag(FLAG_C)) {
-          cycles += 4;
-          cpu_write(--SP, (PC >> 8) & 0xFF);
-          cpu_write(--SP, PC & 0xFF);
+          push_stack(PC);
           PC = pos;
+          cycles += 12;
       }
       break;
 
@@ -2841,9 +2776,8 @@ void exec_op(byte opcode){
       oam_write_corrupt_at(SP, 0);    // M2 IDU
       oam_write_corrupt_at(SP-1, 4); // M3 write hi
       oam_write_corrupt_at(SP-2, 8); // M4 write lo
-      cycles += 4;              // M2 internal delay
-      cpu_write(--SP, D);       // M3: write D (hi)
-      cpu_write(--SP, E);       // M4: write E (lo)
+      push_stack(DE());
+      cycles += 12;
       break;
 
     // SUB A -= d8
@@ -2853,9 +2787,8 @@ void exec_op(byte opcode){
 
     // RST 10H
     case 0xd7:
-      cycles += 4;
-      cpu_write(--SP, (PC >> 8) & 0xFF);
-      cpu_write(--SP, PC & 0xFF);
+      push_stack(PC);
+      cycles += 12;
       PC = 0x10;
       break;
 
@@ -2863,15 +2796,15 @@ void exec_op(byte opcode){
     case 0xd8:
       cycles += 4;
       if (CheckFlag(FLAG_C)) {
-          { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = ((word)hi << 8) | lo; }
-          cycles += 4;
+          cycles += 12;
+          PC = pop_stack();
       }
       break;
 
     // RETI
     case 0xd9:
-      { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = ((word)hi << 8) | lo; }
-      cycles += 4;
+      cycles += 12;
+      PC = pop_stack();
       interrupts = true;
       break;
 
@@ -2888,18 +2821,16 @@ void exec_op(byte opcode){
     case 0xdc:
       pos = cpu_read16();
       if (CheckFlag(FLAG_C)) {
-          cycles += 4;
-          cpu_write(--SP, (PC >> 8) & 0xFF);
-          cpu_write(--SP, PC & 0xFF);
+          push_stack(PC);
           PC = pos;
+          cycles += 12;
       }
       break;
 
     // RST 18H
     case 0xdf:
-      cycles += 4;
-      cpu_write(--SP, (PC >> 8) & 0xFF);
-      cpu_write(--SP, PC & 0xFF);
+      push_stack(PC);
+      cycles += 12;
       PC = 0x18;
       break;
 
@@ -2921,7 +2852,8 @@ void exec_op(byte opcode){
     case 0xe1:
       oam_read_corrupt_at(SP, 0);
       oam_read_corrupt_at(SP + 1, 4);
-      { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); setHL(((word)hi << 8) | lo); }
+      setHL(pop_stack());
+      cycles += 8;
       break;
 
     // LD (C) <- A
@@ -2951,9 +2883,8 @@ void exec_op(byte opcode){
       oam_write_corrupt_at(SP, 0);    // M2 IDU
       oam_write_corrupt_at(SP-1, 4); // M3 write hi
       oam_write_corrupt_at(SP-2, 8); // M4 write lo
-      cycles += 4;              // M2 internal delay
-      cpu_write(--SP, H);       // M3: write H (hi)
-      cpu_write(--SP, L);       // M4: write L (lo)
+      push_stack(HL());
+      cycles += 12;
       break;
 
     // AND A & d8
@@ -2963,9 +2894,8 @@ void exec_op(byte opcode){
 
     // RST 20H
     case 0xe7:
-      cycles += 4;
-      cpu_write(--SP, (PC >> 8) & 0xFF);
-      cpu_write(--SP, PC & 0xFF);
+      push_stack(PC);
+      cycles += 12;
       PC = 0x20;
       break;
 
@@ -2986,9 +2916,8 @@ void exec_op(byte opcode){
 
     // RST 28H
     case 0xef:
-      cycles += 4;
-      cpu_write(--SP, (PC >> 8) & 0xFF);
-      cpu_write(--SP, PC & 0xFF);
+      push_stack(PC);
+      cycles += 12;
       PC = 0x28;
       break;
 
@@ -3005,7 +2934,8 @@ void exec_op(byte opcode){
     case 0xf1:
       oam_read_corrupt_at(SP, 0);
       oam_read_corrupt_at(SP + 1, 4);
-      { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); setAF(((word)hi << 8) | lo); }
+      setAF(pop_stack());
+      cycles += 8;
       break;
 
     // LD A <- (C)
@@ -3027,9 +2957,8 @@ void exec_op(byte opcode){
       oam_write_corrupt_at(SP, 0);    // M2 IDU
       oam_write_corrupt_at(SP-1, 4); // M3 write hi
       oam_write_corrupt_at(SP-2, 8); // M4 write lo
-      cycles += 4;              // M2 internal delay
-      cpu_write(--SP, A);       // M3: write A (hi)
-      cpu_write(--SP, F);       // M4: write F (lo)
+      push_stack(AF());
+      cycles += 12;
       break;
 
     // OR A | d8
@@ -3039,9 +2968,8 @@ void exec_op(byte opcode){
 
     // RST 30H
     case 0xf7:
-      cycles += 4;
-      cpu_write(--SP, (PC >> 8) & 0xFF);
-      cpu_write(--SP, PC & 0xFF);
+      push_stack(PC);
+      cycles += 12;
       PC = 0x30;
       break;
 
@@ -3072,7 +3000,7 @@ void exec_op(byte opcode){
 
     // EI
     case 0xfb:
-      if (ei_delay == 0) ei_delay = 2; // don't reset if already pending
+      ei_delay = 2;
       break;
 
     // CP d8
@@ -3082,9 +3010,8 @@ void exec_op(byte opcode){
 
     // RST 38H
     case 0xff:
-      cycles += 4;
-      cpu_write(--SP, (PC >> 8) & 0xFF);
-      cpu_write(--SP, PC & 0xFF);
+      push_stack(PC);
+      cycles += 12;
       PC = 0x38;
       break;
 
@@ -4456,7 +4383,6 @@ bool frame_headless(void){
 
             gpu_step(cpu_cycles);
             timer_step(cpu_cycles - instr_timer_cycles);
-            dma_step(cpu_cycles);
             instruction_count++;
 
             // Safety check for infinite loops
@@ -4606,7 +4532,6 @@ void headless_main_impl(void) {
         gpu_step(cpu_cycles);
         timer_step(cpu_cycles - instr_timer_cycles);
         apu_step(cpu_cycles);
-        dma_step(cpu_cycles);
         total_cycles += cpu_cycles;
     }
     // If cycle limit hit but A000 output present, still print it
