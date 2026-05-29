@@ -101,9 +101,19 @@ static uint8_t bg_scanline[160];
 // Window internal line counter (increments each scanline window is visible)
 static int window_line = 0;
 
+// Tracks timer cycles pre-stepped mid-instruction via cpu_read/cpu_write.
+// Reset before each instruction; used in projected-mode calculations (gpu_read,
+// mem_read) and to avoid double-counting timers in the main loop.
+int instr_timer_cycles;
+
 // STAT interrupt line (rising-edge detection for blocking behaviour).
 // The hardware STAT interrupt fires only when this line transitions 0→1.
 static bool stat_irq_line = false;
+
+// LYC=LY flag value frozen when LCD is disabled.
+// On DMG, turning off the LCD does NOT clear STAT bit 2 (LYC=LY flag);
+// it freezes at the value it had just before the LCD was turned off.
+static bool lcd_off_lyc_flag = false;
 
 void gpu_init(void){
     memset(VRAM, 0, 0x2000);
@@ -144,6 +154,20 @@ byte gpu_get_mode(void) {
     return 0;                        // HBlank
 }
 
+// Returns the GPU mode at a projected cycle offset within the current scanline.
+// Used for STAT reads and OAM/VRAM locking — accounts for the T-cycle within
+// the current instruction at which the memory access actually occurs.
+// projected_cycles = gpu_cycles + (instr_timer_cycles - 4)
+byte gpu_get_mode_projected(int projected_cycles) {
+    if (!gpu_control.enabled) return 0;
+    if (LY_REG >= 144) return 1;
+    if (projected_cycles < 0) projected_cycles = 0;
+    if (projected_cycles >= 456) projected_cycles = 455;
+    if (projected_cycles < 80) return 2;
+    if (projected_cycles < 252) return 3;
+    return 0;
+}
+
 // Compute the STAT interrupt line and fire an interrupt on 0→1 transition.
 // Must be called after any GPU state change that might affect the conditions.
 static void stat_check_irq(void) {
@@ -155,7 +179,9 @@ static void stat_check_irq(void) {
     bool line = false;
     if ((RAM[STAT] & 0x08) && mode == 0 && LY_REG < 144) line = true; // Mode 0 HBlank
     if ((RAM[STAT] & 0x10) && LY_REG >= 144)              line = true; // Mode 1 VBlank
-    if ((RAM[STAT] & 0x20) && mode == 2)                  line = true; // Mode 2 OAM
+    // Mode 2 OAM: normal mode 2, plus special LY=144 case (hardware fires mode-2 STAT
+    // at LY=144 simultaneously with VBlank interrupt).
+    if ((RAM[STAT] & 0x20) && (mode == 2 || (LY_REG == 144 && gpu_cycles < 80))) line = true;
     if ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC])         line = true; // LYC=LY
     if (line && !stat_irq_line) {
         request_interrupt(INTERRUPT_STAT);
@@ -166,11 +192,23 @@ static void stat_check_irq(void) {
 byte gpu_read(int pos){
     //printf("reading from gpu %x\n", pos);
     if (pos >= 0x8000 && pos <= 0x9FFF) {
+        // VRAM locked during mode 3 (LCD transfer)
+        int projected = gpu_cycles + instr_timer_cycles - 4;
+        if (gpu_get_mode_projected(projected) == 3) return 0xFF;
         return VRAM[pos - 0x8000];
     }
     if (pos == STAT) {
+        if (!gpu_control.enabled) {
+            // LCD off: mode=0, LYC=LY flag frozen at value when LCD was disabled
+            byte lyc_flag = lcd_off_lyc_flag ? 0x04 : 0x00;
+            return 0x80 | (RAM[STAT] & 0x78) | lyc_flag;
+        }
+        // Use projected mode: STAT samples the mode at end of M2 of the read instruction.
+        // projected = gpu_cycles + (instr_timer_cycles - 4) gives the T-cycle of the read.
+        int projected = gpu_cycles + instr_timer_cycles - 4;
+        byte mode = gpu_get_mode_projected(projected);
         byte lyc_flag = (LY_REG == RAM[LYC]) ? 0x04 : 0x00;
-        return 0x80 | (RAM[STAT] & 0x78) | lyc_flag | gpu_get_mode();
+        return 0x80 | (RAM[STAT] & 0x78) | lyc_flag | mode;
     }
     if (pos == LY) {
         // On DMG hardware, LY is a live hardware counter. Reading LY during an
@@ -218,10 +256,15 @@ void gpu_write(int pos, byte data){
             // LCD just turned on: start from beginning of frame.
             LY_REG = 0;
             gpu_cycles = 0;
-            stat_irq_line = false;
+            // Restore stat_irq_line from the frozen pre-disable state so
+            // rising-edge detection works correctly on re-enable:
+            // if LYC=LY was true before disable and is still true now, no new interrupt.
+            stat_irq_line = lcd_off_lyc_flag;
+            stat_check_irq();
         }
         if (was_enabled && !now_enabled) {
-            // LCD turned off: reset state
+            // LCD turned off: freeze LYC=LY flag before resetting LY
+            lcd_off_lyc_flag = (LY_REG == RAM[LYC]);
             LY_REG = 0;
             gpu_cycles = 0;
             window_line = 0;
@@ -906,8 +949,13 @@ byte mem_read(int pos) {
         // Echo RAM: $E000-$FDFF mirrors WRAM $C000-$DDFF
         return RAM[pos - 0x2000];
     } else if (pos >= 0xFE00 && pos <= 0xFE9F) {
-        // OAM: returns 0xFF when DMA is active (bus conflict)
+        // OAM: returns 0xFF when DMA is active or during GPU modes 2/3
         if (dma_active) return 0xFF;
+        {
+            int projected = gpu_cycles + instr_timer_cycles - 4;
+            byte mode = gpu_get_mode_projected(projected);
+            if (mode == 2 || mode == 3) return 0xFF;
+        }
         return RAM[pos];
     }
     // FIXME: lots missing here
@@ -1173,10 +1221,6 @@ void mem_init(void){
 
 byte F, A, C, B, E, D, L, H;
 
-// cycles declared at top of file (before gpu_write) for accessibility.
-// Tracks timer cycles pre-stepped mid-instruction via cpu_read/cpu_write.
-// Reset before each instruction; used to avoid double-counting in the main loops.
-int instr_timer_cycles;
 word PC;
 word SP;
 bool interrupts;
