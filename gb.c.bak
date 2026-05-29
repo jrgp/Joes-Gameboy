@@ -121,6 +121,10 @@ static bool lcd_off_lyc_flag = false;
 // gpu_cycles advances past the ~80T OAM-scan point.
 static bool lcd_startup_mode0 = false;
 
+// The first scanline after LCD enable is 460T long (vs 456T for all others).
+// This flag is set on LCD enable and cleared when LY transitions 0→1.
+static bool lcd_first_scanline = false;
+
 void gpu_init(void){
     memset(VRAM, 0, 0x2000);
     gpu_cycles = 0;
@@ -157,12 +161,13 @@ byte gpu_get_mode(void) {
     if (LY_REG >= 144) return 1;   // VBlank
     if (lcd_startup_mode0) return 0; // Startup: mode 0 visible before mode 2 begins
     if (gpu_cycles < 80) return 2;  // OAM scan
-    if (gpu_cycles < 252) return 3; // LCD transfer
+    // On the first scanline (460T), mode 3 extends to T=256; regular scanlines to T=252
+    if (gpu_cycles < (lcd_first_scanline ? 256 : 252)) return 3; // LCD transfer
     return 0;                        // HBlank
 }
 
-// Returns the GPU mode at a projected cycle offset within the current scanline.
-// Used for STAT reads and OAM/VRAM locking — accounts for the T-cycle within
+// Returns the hardware GPU mode at a projected cycle offset within the current scanline.
+// Used for OAM/VRAM access locking — accounts for the T-cycle within
 // the current instruction at which the memory access actually occurs.
 // projected_cycles = gpu_cycles + (instr_timer_cycles - 4)
 byte gpu_get_mode_projected(int projected_cycles) {
@@ -170,54 +175,48 @@ byte gpu_get_mode_projected(int projected_cycles) {
     if (LY_REG >= 144) return 1;
     if (lcd_startup_mode0) return 0; // Startup: mode 0 visible before mode 2 begins
     if (projected_cycles < 0) projected_cycles = 0;
-    if (projected_cycles >= 456) projected_cycles = 455;
-    if (projected_cycles < 80) return 2;
-    if (projected_cycles < 252) return 3;
-    return 0;
+    if (lcd_first_scanline) {
+        // First scanline is 460T: hardware mode 3 extends to T=256
+        if (projected_cycles >= 460) projected_cycles = 459;
+        if (projected_cycles < 256) return 3;
+        return 0;
+    } else {
+        // Regular scanlines (456T): hardware mode 3 ends at T=252
+        if (projected_cycles >= 456) projected_cycles = 455;
+        if (projected_cycles < 80) return 2;
+        if (projected_cycles < 252) return 3;
+        return 0;
+    }
 }
 
-// Mode calculation for OAM/VRAM read locking and interrupt comparisons.
-// Uses the hardware-internal mode boundaries (80/252) which differ from the
-// STAT-read-visible boundaries (84/260) by 4-8T propagation delay.
-static byte gpu_get_mode_for_lock(int projected_cycles) {
+// Returns the GPU mode as seen by the STAT register at a projected cycle.
+// On DMG hardware, the STAT bits 0-1 lag the hardware mode transitions by ~4T
+// on regular scanlines:
+//   - mode 2→3 visible at T=84 (hardware T=80)
+//   - mode 3→0 visible at T=256 (hardware T=252)
+// The first scanline uses startup mode (handled by lcd_startup_mode0), then
+// mode 3 until T=259, and mode 0 (HBlank) from T=260.
+// At T>=460 (the first-scanline wrap boundary) STAT shows mode 0 without
+// clamping, and LY has already transitioned via the lookahead.
+byte gpu_get_stat_mode_projected(int projected_cycles) {
     if (!gpu_control.enabled) return 0;
     if (LY_REG >= 144) return 1;
-    if (lcd_startup_mode0) return 0;
+    if (lcd_startup_mode0) return 0; // Startup: mode 0 visible before mode 2 begins
     if (projected_cycles < 0) projected_cycles = 0;
-    if (projected_cycles >= 456) projected_cycles = 455;
-    if (projected_cycles < 80) return 2;
-    if (projected_cycles < 252) return 3;
-    return 0;
-}
-
-// Returns true if VRAM writes are allowed at the projected T-cycle offset.
-// VRAM is locked only during mode 3 (pixel pipeline), starting 8T after mode 3 begins
-// and extending 8T into mode 0 — the same T=88..259 window as the OAM mode-3 lock.
-// Unlike OAM, VRAM is always accessible during mode 2.
-static bool vram_write_accessible(int proj) {
-    if (!gpu_control.enabled) return true;
-    if (LY_REG >= 144)       return true;  // VBlank: always accessible
-    if (proj < 0) proj = 0;
-    if (proj >= 456) proj -= 456;
-    if (proj >= 88 && proj <= 259) return false; // mode-3 pixel pipeline lock
-    return true;
-}
-// Derived from hardware-measured access windows for lcdon_write_timing-GS.
-// Lock windows per scanline:
-//   T=8..83   — mode-2 OAM-scan bus held by PPU
-//   T=88..259 — mode-3 pixel pipeline + first 8T of mode-0 OAM bus hold
-// Accessible windows: T<8, T=84..87 (1 M-cycle gap between locks), T>=260.
-// On the LCD startup line lcd_startup_mode0 is true until T=82, so the
-// whole mode-2 window is replaced by mode-0 (no lock).
-static bool oam_write_accessible(int proj) {
-    if (!gpu_control.enabled) return true;
-    if (LY_REG >= 144)       return true;  // VBlank: always accessible
-    if (lcd_startup_mode0)   return true;  // startup pseudo-mode 0: no lock
-    if (proj < 0) proj = 0;
-    if (proj >= 456) proj -= 456;           // wrap into next scanline
-    if (proj >= 8  && proj <= 83)  return false; // mode-2 bus lock
-    if (proj >= 88 && proj <= 259) return false; // mode-3 / early mode-0 lock
-    return true;
+    if (lcd_first_scanline) {
+        // First scanline: mode 3 T=84..259, mode 0 (HBlank) T=260+.
+        // At T>=460 (wrap boundary), show mode 0; don't clamp to 459.
+        if (projected_cycles >= 460) return 0;
+        if (projected_cycles < 260) return 3;
+        return 0;
+    } else {
+        // Regular scanlines: all transitions lag hardware by 4T.
+        // Mode 2: T=0..83, mode 3: T=84..255, mode 0: T=256..455
+        if (projected_cycles >= 456) projected_cycles = 455;
+        if (projected_cycles < 84) return 2;
+        if (projected_cycles < 256) return 3;
+        return 0;
+    }
 }
 
 // Compute the STAT interrupt line and fire an interrupt on 0→1 transition.
@@ -246,7 +245,7 @@ byte gpu_read(int pos){
     if (pos >= 0x8000 && pos <= 0x9FFF) {
         // VRAM locked during mode 3 (LCD transfer)
         int projected = gpu_cycles + instr_timer_cycles - 4;
-        if (gpu_get_mode_for_lock(projected) == 3) return 0xFF;
+        if (gpu_get_mode_projected(projected) == 3) return 0xFF;
         return VRAM[pos - 0x8000];
     }
     if (pos == STAT) {
@@ -255,18 +254,33 @@ byte gpu_read(int pos){
             byte lyc_flag = lcd_off_lyc_flag ? 0x04 : 0x00;
             return 0x80 | (RAM[STAT] & 0x78) | lyc_flag;
         }
-        // Use projected mode: STAT samples the mode at end of M2 of the read instruction.
-        // projected = gpu_cycles + (instr_timer_cycles - 4) gives the T-cycle of the read.
+        // Use STAT-specific projected mode: STAT bits 0-1 lag hardware by 4T on
+        // regular scanlines. projected = gpu_cycles + (instr_timer_cycles - 4).
         int projected = gpu_cycles + instr_timer_cycles - 4;
-        byte mode = gpu_get_mode_projected(projected);
-        byte lyc_flag = (LY_REG == RAM[LYC]) ? 0x04 : 0x00;
+        int ly_wrap = lcd_first_scanline ? 460 : 456;
+        byte mode, lyc_flag;
+        if (projected >= ly_wrap) {
+            // At the scanline counter reset boundary, hardware momentarily clears
+            // the LYC comparison circuit, so STAT shows mode=0 and lyc_flag=0.
+            mode = 0;
+            lyc_flag = 0;
+        } else {
+            mode = gpu_get_stat_mode_projected(projected);
+            lyc_flag = (LY_REG == RAM[LYC]) ? 0x04 : 0x00;
+        }
         return 0x80 | (RAM[STAT] & 0x78) | lyc_flag | mode;
     }
     if (pos == LY) {
-        // LY_REG is already updated by gpu_step at the end of each instruction.
-        // The +4 lookahead was incorrect: hardware shows the new LY only after
-        // the instruction that causes gpu_cycles to wrap past 456 completes,
-        // which is exactly when gpu_step fires and increments LY_REG.
+        // On DMG hardware, LY is a live hardware counter. Reading LY during an
+        // instruction reflects the state ~4T (one M-cycle) into the instruction.
+        // Our gpu_step only runs after full instructions, so compensate here.
+        // The first scanline after LCD enable is 460T (not 456T).
+        int ly_wrap = lcd_first_scanline ? 460 : 456;
+        if (gpu_control.enabled && gpu_cycles + 4 >= ly_wrap) {
+            byte next_ly = LY_REG + 1;
+            if (next_ly > 153) next_ly = 0;
+            return next_ly;
+        }
         return LY_REG;
     }
     if (pos == SCX) {
@@ -307,6 +321,8 @@ void gpu_write(int pos, byte data){
             // On DMG hardware, LCD startup begins in mode 0, not mode 2.
             // The comparison clock restarts immediately, so LYC=LY is re-evaluated.
             lcd_startup_mode0 = true;
+            // The first scanline after LCD enable is 460T (not 456T).
+            lcd_first_scanline = true;
             // Restore stat_irq_line from the frozen pre-disable state so
             // rising-edge detection works correctly on re-enable:
             // if LYC=LY was true before disable and is still true now, no new interrupt.
@@ -320,6 +336,7 @@ void gpu_write(int pos, byte data){
             gpu_cycles = 0;
             window_line = 0;
             stat_irq_line = false;
+            lcd_first_scanline = false;
         }
     }
     if (pos == LY) {
@@ -497,15 +514,17 @@ void gpu_step(int _cycles){
     int prev_ly = LY_REG;
     gpu_cycles += _cycles;
 
-    // Clear startup mode-0 override once gpu_cycles advances into OAM scan range.
-    // Threshold >=84 matches the hardware mode-2 start time; also ensures the
-    // startup line transitions directly to mode 3 (no spurious mode-2 visible).
+    // Clear startup mode-0 override once gpu_cycles advances into OAM scan range
+    // (T=84, not T=80, because STAT shows mode 0 until T=84 on the first scanline)
     if (lcd_startup_mode0 && gpu_cycles >= 84) {
         lcd_startup_mode0 = false;
     }
 
-    if (gpu_cycles >= 456) {
-        gpu_cycles -= 456; // preserve remainder for accurate sub-scanline timing
+    // The first scanline after LCD enable is 460T; all subsequent scanlines are 456T.
+    int wrap_threshold = lcd_first_scanline ? 460 : 456;
+    if (gpu_cycles >= wrap_threshold) {
+        gpu_cycles -= wrap_threshold; // preserve remainder for accurate sub-scanline timing
+        lcd_first_scanline = false;   // first scanline has ended
 
         const byte ly = ++LY_REG;
 
@@ -1020,7 +1039,7 @@ byte mem_read(int pos) {
         if (dma_active && dma_oam_locked) return 0xFF;
         {
             int projected = gpu_cycles + instr_timer_cycles - 4;
-            byte mode = gpu_get_mode_for_lock(projected);
+            byte mode = gpu_get_mode_projected(projected);
             if (mode == 2 || mode == 3) return 0xFF;
         }
         return RAM[pos];
@@ -1096,10 +1115,28 @@ void mem_write(int pos, byte data) {
     }
     // OAM bus is locked during DMA — CPU writes to OAM are blocked
     if (dma_active && pos >= 0xFE00 && pos <= 0xFE9F) return;
-    // OAM bus is locked by the PPU during mode 2 and most of mode 3.
-    if (pos >= 0xFE00 && pos <= 0xFE9F) {
+    // OAM write blocking by GPU mode (mode 2 and mode 3)
+    // From hardware measurement (lcdon_write_timing-GS):
+    //   First scanline (460T): blocked T=84..255 (mode 3 write lock) + T=460 (mode 2 start)
+    //   Regular scanlines (456T): blocked T<76 (mode 2) OR T=80..251 (mode 3) OR T>=456 (mode 2 start)
+    //   Gap at T=76..79 and T=252..455 is accessible on regular scanlines.
+    if (gpu_control.enabled && LY_REG < 144 && pos >= 0xFE00 && pos <= 0xFE9F) {
         int proj = gpu_cycles + instr_timer_cycles - 4;
-        if (!oam_write_accessible(proj)) return;
+        bool blocked = lcd_first_scanline ?
+            ((proj >= 84 && proj < 256) || proj >= 460) :
+            (proj < 76 || (proj >= 80 && proj < 252) || proj >= 456);
+        if (blocked) return;
+    }
+    // VRAM write blocking during mode 3 (GPU is reading VRAM for rendering).
+    // From hardware measurement (lcdon_write_timing-GS):
+    //   First scanline (460T): blocked T=84..255 (mode 3; startup accessible T<84, HBlank T>=256)
+    //   Regular scanlines (456T): blocked T=80..251 (mode 3; mode 2 and HBlank accessible)
+    if (pos >= 0x8000 && pos <= 0x9FFF && gpu_control.enabled && LY_REG < 144) {
+        int proj = gpu_cycles + instr_timer_cycles - 4;
+        bool blocked = lcd_first_scanline ?
+            (proj >= 84 && proj < 256) :
+            (proj >= 80 && proj < 252);
+        if (blocked) return;
     }
     switch (pos) {
         case BGP:
@@ -1181,15 +1218,8 @@ void mem_write(int pos, byte data) {
                 int new_bit = timer_tac_bit[data & 0x03];
                 bool new_selected = (timer_internal >> new_bit) & 1;
                 if (!still_enabled || !new_selected) {
-                    if (++RAM[REG_TIMA] == 0) {
-                        // TAC-write-triggered overflow: set IF immediately so the
-                        // interrupt is visible before the NEXT instruction's do_interrupts.
-                        // In hardware, the overflow fires during the opcode fetch of the
-                        // next instruction; since our do_interrupts runs before exec_next,
-                        // we must set IF now to get the same observable behavior.
-                        timer_overflow_pending = 4;  // TMA reload still happens after 4T
-                        request_interrupt(INTERRUPT_TIMER);
-                    }
+                    if (++RAM[REG_TIMA] == 0)
+                        timer_overflow_pending = 4;
                 }
             }
             break;
@@ -1244,9 +1274,7 @@ void mem_write(int pos, byte data) {
                 inBios = false;
                 printf("bios disabled\n");
             } else if (pos >= 0x8000 && pos <= 0x9FFF) {
-                int proj = gpu_cycles + instr_timer_cycles - 4;
-                if (vram_write_accessible(proj))
-                    gpu_write(pos, data);
+                gpu_write(pos, data);
             } else if (pos >= 0xA000 && pos <= 0xBFFF) {
                 int ram_bank = is_mbc3() ? cart_ram_bank : (cart_mbc1_mode == 1 ? cart_mbc1_upper : 0);
                 int idx = ram_bank * 0x2000 + (pos - 0xA000);
