@@ -115,6 +115,11 @@ static bool stat_irq_line = false;
 // it freezes at the value it had just before the LCD was turned off.
 static bool lcd_off_lyc_flag = false;
 
+// After LCD is enabled, hardware starts in mode 0 (not mode 2) for a brief
+// startup period before mode 2 begins. This flag overrides mode to 0 until
+// gpu_cycles advances past the ~80T OAM-scan point.
+static bool lcd_startup_mode0 = false;
+
 void gpu_init(void){
     memset(VRAM, 0, 0x2000);
     gpu_cycles = 0;
@@ -149,6 +154,7 @@ void gpu_init(void){
 byte gpu_get_mode(void) {
     if (!gpu_control.enabled) return 0;
     if (LY_REG >= 144) return 1;   // VBlank
+    if (lcd_startup_mode0) return 0; // Startup: mode 0 visible before mode 2 begins
     if (gpu_cycles < 80) return 2;  // OAM scan
     if (gpu_cycles < 252) return 3; // LCD transfer
     return 0;                        // HBlank
@@ -161,6 +167,7 @@ byte gpu_get_mode(void) {
 byte gpu_get_mode_projected(int projected_cycles) {
     if (!gpu_control.enabled) return 0;
     if (LY_REG >= 144) return 1;
+    if (lcd_startup_mode0) return 0; // Startup: mode 0 visible before mode 2 begins
     if (projected_cycles < 0) projected_cycles = 0;
     if (projected_cycles >= 456) projected_cycles = 455;
     if (projected_cycles < 80) return 2;
@@ -256,6 +263,9 @@ void gpu_write(int pos, byte data){
             // LCD just turned on: start from beginning of frame.
             LY_REG = 0;
             gpu_cycles = 0;
+            // On DMG hardware, LCD startup begins in mode 0, not mode 2.
+            // The comparison clock restarts immediately, so LYC=LY is re-evaluated.
+            lcd_startup_mode0 = true;
             // Restore stat_irq_line from the frozen pre-disable state so
             // rising-edge detection works correctly on re-enable:
             // if LYC=LY was true before disable and is still true now, no new interrupt.
@@ -445,6 +455,11 @@ void gpu_step(int _cycles){
     byte prev_mode = gpu_get_mode();
     int prev_ly = LY_REG;
     gpu_cycles += _cycles;
+
+    // Clear startup mode-0 override once gpu_cycles advances into OAM scan range
+    if (lcd_startup_mode0 && gpu_cycles >= 80) {
+        lcd_startup_mode0 = false;
+    }
 
     if (gpu_cycles >= 456) {
         gpu_cycles -= 456; // preserve remainder for accurate sub-scanline timing
