@@ -129,7 +129,10 @@ static int mode3_extra = 0;
 // Recompute mode3_extra for the current LY_REG.
 // Must be called right after LY_REG is updated so OAM is scanned for the correct line.
 static void compute_mode3_extra(void) {
-    int extra = SCX_REG & 7;
+    // SCX fine-scroll penalty is quantized: the background fetcher stalls in
+    // 4T groups: 0 for SCX&7=0, 4T for SCX&7=1-4, 8T for SCX&7=5-7.
+    int scx_fine = SCX_REG & 7;
+    int extra = (scx_fine == 0) ? 0 : (scx_fine <= 4 ? 4 : 8);
     if (gpu_control.sprite) {
         int height = gpu_control.sprite_tall ? 16 : 8;
         int n = 0;
@@ -137,7 +140,8 @@ static void compute_mode3_extra(void) {
             int oam = 0xFE00 + i * 4;
             int oy  = RAM[oam]     - 16;
             int ox  = RAM[oam + 1];
-            if ((int)LY_REG >= oy && (int)LY_REG < oy + height && ox > 0)
+            // Sprites with OAM X=0 are off-screen but still stall the PPU fetcher
+            if ((int)LY_REG >= oy && (int)LY_REG < oy + height)
                 n++;
         }
         extra += n * 6;
@@ -287,10 +291,16 @@ byte gpu_read(int pos){
         return 0x80 | (RAM[STAT] & 0x78) | lyc_flag | mode;
     }
     if (pos == LY) {
-        // LY_REG is already updated by gpu_step at the end of each instruction.
-        // The +4 lookahead was incorrect: hardware shows the new LY only after
-        // the instruction that causes gpu_cycles to wrap past 456 completes,
-        // which is exactly when gpu_step fires and increments LY_REG.
+        // Project LY forward: if the current M-cycle would advance gpu_cycles past
+        // the scanline boundary (T=456), return the NEXT LY value. This matches
+        // real hardware where LY shows the new value starting at T=456 from line start,
+        // even when the cpu_read memory access and instruction completion happen
+        // simultaneously with the boundary crossing.
+        if (gpu_cycles + instr_timer_cycles >= 456) {
+            byte next_ly = LY_REG + 1;
+            if (next_ly > 153) next_ly = 0;
+            return next_ly;
+        }
         return LY_REG;
     }
     if (pos == SCX) {
@@ -305,8 +315,8 @@ byte gpu_read(int pos){
     if (pos == BGP) {
         return BGP_REG;
     }
-    // For other registers like LYC, etc., we need to handle them separately
-    return 0;
+    // For other registers (LYC, WX, WY, etc.) stored directly in RAM
+    return RAM[pos];
 }
 
 void gpu_write(int pos, byte data){
@@ -1061,6 +1071,7 @@ byte mem_read(int pos) {
             case LY:
                 return gpu_read(pos);
             case LYC:
+            case SCX:
             case SCY:
             case WX:
             case WY:
@@ -1153,6 +1164,7 @@ void mem_write(int pos, byte data) {
         case STAT:
         case LY:
         case LYC:
+        case SCX:
         case SCY:
         case WX:
         case WY:
@@ -1415,7 +1427,7 @@ void cpu_fake_init(void){
     // DMG-ABC post-boot-ROM hardware state (skipping actual boot ROM execution).
     // Timer: boot ROM leaves internal counter at 0xABCC — DIV reads $AD after the
     // ~336 T-cycles of boot_hwio preamble code, matching real hardware behaviour.
-    timer_internal = 0xABCC;
+    timer_internal = 0xABC8;
     RAM[REG_DIV] = (uint8_t)(timer_internal >> 8);
 
     // IF: at post-boot, VBlank (bit 0) is pending — the LCD ran during the boot ROM
