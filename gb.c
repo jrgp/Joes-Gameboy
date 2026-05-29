@@ -61,7 +61,7 @@ int  apu_ch2_length = 0;   // remaining length ticks
 int  apu_length_cycles = 0;
 
 typedef struct {
-    bool enabled, bg, window, sprite;
+    bool enabled, bg, window, sprite, sprite_tall;
     int windowtilemap, BgWindowTileData;
     bool BgTileDataSigned;
     int bgtilemap;
@@ -70,27 +70,30 @@ typedef struct {
 GPUCONTROL gpu_control;
 
 void gpu_parse_control(byte control){
-    gpu_control.enabled = bit_check(control, 7);
-    gpu_control.window = bit_check(control, 5);
-    gpu_control.sprite = bit_check(control, 1);
-    gpu_control.bg = bit_check(control, 0);
+    gpu_control.enabled    = bit_check(control, 7);
+    gpu_control.window     = bit_check(control, 5);
+    gpu_control.sprite     = bit_check(control, 1);
+    gpu_control.sprite_tall= bit_check(control, 2);
+    gpu_control.bg         = bit_check(control, 0);
 
     if (bit_check(control, 4)) {
-        gpu_control.BgWindowTileData = 0x8000;
+        gpu_control.BgWindowTileData = 0x8000;  // unsigned, blocks 0+1
         gpu_control.BgTileDataSigned = false;
     } else {
-        gpu_control.BgWindowTileData = 0x8800;
+        gpu_control.BgWindowTileData = 0x9000;  // signed, blocks 2+1 (tile 0 at 0x9000)
         gpu_control.BgTileDataSigned = true;
     }
 
-    if(bit_check(control, 3)){
-      gpu_control.bgtilemap = 0x9C00;
-    } else {
-      gpu_control.bgtilemap = 0x9800;
-    }
+    gpu_control.bgtilemap    = bit_check(control, 3) ? 0x9C00 : 0x9800;
+    gpu_control.windowtilemap= bit_check(control, 6) ? 0x9C00 : 0x9800;
 }
 
 #define set_pixel(x,y,c) pixels[(y * VIEWPORT_WIDTH) + x] = c;
+
+// Per-scanline BG color index (0-3) — used by sprites for BG priority
+static uint8_t bg_scanline[160];
+// Window internal line counter (increments each scanline window is visible)
+static int window_line = 0;
 
 void gpu_init(void){
     memset(VRAM, 0, 0x2000);
@@ -102,7 +105,8 @@ void gpu_init(void){
     gpu_control.bg = false;
     gpu_control.window = false;
     gpu_control.sprite = false;
-    gpu_control.BgWindowTileData = 0x8800;
+    gpu_control.sprite_tall = false;
+    gpu_control.BgWindowTileData = 0x9000;
     gpu_control.BgTileDataSigned = true;
     gpu_control.bgtilemap = 0x9800;
     gpu_control.windowtilemap = 0x9800;
@@ -188,6 +192,7 @@ void gpu_write(int pos, byte data){
             // LCD turned off: reset state
             LY_REG = 0;
             gpu_cycles = 0;
+            window_line = 0;
         }
     }
     if (pos == LY) {
@@ -210,132 +215,148 @@ void gpu_write(int pos, byte data){
 
 uint32_t gpu_pallete_color(byte number, int paletteIndex) {
     const byte config = mem_read(paletteIndex);
-    byte resultindex = 0;
-
-    const byte b1 = number * 2;
-    const byte b2 = (number * 2) + 1;
-
-    if(bit_check(config, b1)){
-        resultindex = bit_set(resultindex, 1);
-    }
-
-    if(bit_check(config, b2)){
-        resultindex = bit_set(resultindex, 0);
-    }
-
-    const uint32_t color = pallette[resultindex];
-
-    return color;
+    // Each color number occupies 2 bits: bits [n*2+1 : n*2]
+    // Bit n*2 is LSB of shade, bit n*2+1 is MSB
+    const byte resultindex = (config >> (number * 2)) & 0x03;
+    return pallette[resultindex];
 }
 
-void gpu_render_tile(byte ly, int xprefix, int tileIndex, int paletteIndex, bool flipx, bool flipy){
-
-    // Start of tile data
-    int actualTileIndex = tileIndex;
-    if (gpu_control.BgTileDataSigned) {
-        // Convert signed tile index to unsigned
-        actualTileIndex = (tileIndex < 128) ? tileIndex : tileIndex - 256;
-    }
-    const int start = gpu_control.BgWindowTileData + (16 * actualTileIndex);
-
-    const byte high = mem_read(start + ((ly % 8)*2));
-    const byte low = mem_read(start + ((ly % 8)*2)+1);
-    for (byte i = 0; i < 8; i++) {
-      byte wat = 0;
-      if(bit_check(low, (7-i))){
-        wat |= (1 << 1);
-      }
-      if(bit_check(high, (7-i))){
-        wat |= (1 << 0);
-      }
-
-      // Only render non-transparent pixels (color 0 is transparent for sprites)
-      if (wat != 0) {
-        set_pixel(xprefix+i, ly, gpu_pallete_color(wat, paletteIndex));
-      }
+// Render one row of a tile.
+// tile_row: row within the tile (0-7).
+// transparent0: if true (sprites), skip color index 0.
+// for_sprite: if true, use 0x8000 base (unsigned); otherwise use BG/window tile data.
+// Records BG color index into bg_scanline[] when !transparent0.
+void gpu_render_tile(byte ly, int xprefix, int tile_row, byte tileIndex,
+                     int paletteIndex, bool flipx, bool flipy,
+                     bool transparent0, bool for_sprite) {
+    int data_base;
+    int actual;
+    if (for_sprite) {
+        data_base = 0x8000;
+        actual = tileIndex;  // sprites always unsigned
+    } else {
+        data_base = gpu_control.BgWindowTileData;
+        if (gpu_control.BgTileDataSigned) {
+            actual = (int)(int8_t)tileIndex;  // sign-extend
+        } else {
+            actual = tileIndex;
+        }
     }
 
+    int row = flipy ? (7 - tile_row) : tile_row;
+    const int addr = data_base + actual * 16;
+    const byte hi = mem_read(addr + row * 2);
+    const byte lo = mem_read(addr + row * 2 + 1);
+
+    for (int i = 0; i < 8; i++) {
+        int x = xprefix + (flipx ? (7 - i) : i);
+        if (x < 0 || x >= VIEWPORT_WIDTH) continue;
+        byte color = 0;
+        if (bit_check(lo, 7 - i)) color |= 2;
+        if (bit_check(hi, 7 - i)) color |= 1;
+        if (transparent0 && color == 0) continue;
+        set_pixel(x, ly, gpu_pallete_color(color, paletteIndex));
+        if (!transparent0) bg_scanline[x] = color;
+    }
 }
 
 void gpu_draw_bg(byte ly){
     if (gpu_control.bg) {
-        // Debug output removed
-        for (int tile = 0; tile < 32; tile++) {
-            // Calculate tile position with scrolling
-            int tile_x = tile + (SCX_REG / 8);
-            int tile_y = (ly / 8) + (SCY_REG / 8);
-
-            // Wrap around for tile map
-            tile_x = tile_x % 32;
-            tile_y = tile_y % 32;
-
-            // Index of tile from sprite map
-            const int tileIndex = mem_read(gpu_control.bgtilemap + (tile_y * 32) + tile_x);
-
-            // Debug output removed
-
-            gpu_render_tile(ly, (tile*8), tileIndex, BGP, false, false);
+        int fine_x = SCX_REG & 7;
+        int fine_y = (ly + SCY_REG) & 7;
+        // Render 21 tiles to cover 160 pixels + fine X offset
+        for (int tile = 0; tile <= 20; tile++) {
+            int map_x = ((SCX_REG / 8) + tile) & 31;
+            int map_y = ((ly + SCY_REG) / 8) & 31;
+            int tileIndex = mem_read(gpu_control.bgtilemap + (map_y * 32) + map_x);
+            gpu_render_tile(ly, tile * 8 - fine_x, fine_y, tileIndex,
+                            BGP, false, false, false, false);
         }
-
     } else {
-        // Debug output removed
-        for (int i = 0; i<VIEWPORT_WIDTH; i++) {
-            set_pixel(i, ly, 0xffffff);
+        for (int i = 0; i < VIEWPORT_WIDTH; i++) {
+            set_pixel(i, ly, pallette[0]);
+            bg_scanline[i] = 0;
         }
     }
-    
-    // Test line removed
+}
+
+void gpu_draw_window(byte ly){
+    if (!gpu_control.window) return;
+    int wy = RAM[WY];
+    int wx = (int)RAM[WX] - 7;  // WX=7 means window starts at x=0
+    if (ly < wy) return;
+    int fine_y = window_line & 7;
+    for (int tile = 0; tile <= 20; tile++) {
+        int xpos = wx + tile * 8;
+        if (xpos >= VIEWPORT_WIDTH) break;
+        int map_x = tile & 31;
+        int map_y = (window_line / 8) & 31;
+        int tileIndex = mem_read(gpu_control.windowtilemap + (map_y * 32) + map_x);
+        gpu_render_tile(ly, xpos, fine_y, tileIndex,
+                        BGP, false, false, false, false);
+    }
+    window_line++;
 }
 
 void gpu_draw_sprites(byte ly){
-    if (gpu_control.sprite) {
-        // Iterate through all 40 sprites, looking for
-        // ones that overlap within the current LY value
-        // Render sprites in reverse order (higher indices first) for proper priority
-        for (int i = 39; i >= 0; i--) {
-            const int start = 0xFE00 + (i * 4);
-            const byte y = mem_read(start + 1);
-            const byte x = mem_read(start);
+    if (!gpu_control.sprite) return;
+    int sprite_height = gpu_control.sprite_tall ? 16 : 8;
+    // Render in reverse OAM order so sprite 0 has highest priority (drawn last = on top)
+    for (int i = 39; i >= 0; i--) {
+        const int oam = 0xFE00 + (i * 4);
+        const int oam_y = RAM[oam];        // byte 0 = Y pos (actual_y + 16)
+        const int oam_x = RAM[oam + 1];    // byte 1 = X pos (actual_x + 8)
+        const int actual_y = oam_y - 16;
+        const int actual_x = oam_x - 8;
 
-            // Game Boy sprites are positioned 16 pixels above their actual position
-            const int actual_y = y - 16;
-            
-            // does not overlap with our scanline; skip.
-            if (actual_y > ly || (actual_y + 8) <= ly) {
-                if (y != 0 || x != 0){
-                    //printf("SKIPPING sprite at %d %d (LY: %d)\n", y, x, ly);
-                }
-                continue;
+        if (actual_y > (int)ly || (actual_y + sprite_height) <= (int)ly) continue;
+        if (actual_x <= -8 || actual_x >= VIEWPORT_WIDTH) continue;
+
+        byte tileIndex = RAM[oam + 2];
+        const byte flags = RAM[oam + 3];
+        const bool flipy    = bit_check(flags, 6);
+        const bool flipx    = bit_check(flags, 5);
+        const bool bg_prio  = bit_check(flags, 7);
+        const int paletteIndex = bit_check(flags, 4) ? OBP1 : OBP0;
+
+        int tile_row = (int)ly - actual_y;
+        if (gpu_control.sprite_tall) {
+            tileIndex &= 0xFE;  // 8x16: tile index bit 0 ignored
+            if ((!flipy && tile_row >= 8) || (flipy && tile_row < 8)) {
+                tileIndex++;
             }
+            tile_row &= 7;
+        }
+        if (flipy) tile_row = 7 - tile_row;  // flipy handled here, not in render_tile
 
-           // printf("not skpping sprite at %d %d (LY: %d)", y, x, ly);
-            //printf("NOT SKIPPING sprite at %d %d (LY: %d)\n", y, x, ly);
-
-            const byte tileIndex = mem_read(start + 2);
-            const byte flags = mem_read(start + 3);
-            const bool flipy = bit_check(flags, 6);
-            const bool flipx = bit_check(flags, 5);
-            int paletteIndex;
-            if (bit_check(flags, 4)) {
-                paletteIndex = OBP1;
-            } else {
-                paletteIndex = OBP0;
+        // For bg_prio sprites: only draw over BG color 0
+        if (bg_prio) {
+            // Render pixel-by-pixel with priority check
+            int row = tile_row;
+            const int addr = 0x8000 + tileIndex * 16;
+            const byte hi = mem_read(addr + row * 2);
+            const byte lo = mem_read(addr + row * 2 + 1);
+            for (int pi = 0; pi < 8; pi++) {
+                int x = actual_x + (flipx ? (7 - pi) : pi);
+                if (x < 0 || x >= VIEWPORT_WIDTH) continue;
+                if (bg_scanline[x] != 0) continue;  // BG wins
+                byte color = 0;
+                if (bit_check(lo, 7 - pi)) color |= 2;
+                if (bit_check(hi, 7 - pi)) color |= 1;
+                if (color == 0) continue;
+                set_pixel(x, ly, gpu_pallete_color(color, paletteIndex));
             }
-
-            // Game Boy sprites are positioned 8 pixels to the left of their actual position
-            const int actual_x = x - 8;
-            
-            // Only render if sprite is within visible bounds
-            if (actual_x >= -8 && actual_x < VIEWPORT_WIDTH) {
-                //printf("drawing tile at %d %d\n", ly, actual_x);
-                gpu_render_tile(ly, actual_x, tileIndex, paletteIndex, flipx, flipy);
-            }
+        } else {
+            // Normal sprite: transparent0=true, flipy already applied to tile_row
+            gpu_render_tile(ly, actual_x, tile_row, tileIndex,
+                            paletteIndex, flipx, false, true, true);
         }
     }
 }
 
 void gpu_drawline(byte ly){
     gpu_draw_bg(ly);
+    gpu_draw_window(ly);
     gpu_draw_sprites(ly);
 }
 
@@ -357,6 +378,7 @@ void gpu_step(int _cycles){
                 if (RAM[STAT] & 0x10) request_interrupt(INTERRUPT_STAT);
             } else if (ly > 153) {
                 LY_REG = 0;
+                window_line = 0;  // reset window counter at start of new frame
             } else if (ly < 144) {
                 // draw scanline
                 gpu_drawline(ly);
@@ -736,29 +758,52 @@ void request_interrupt(byte interrupt){
 int timer_div_cycles  = 0;
 int timer_tima_cycles = 0;
 
-// Clock dividers for TAC bits 1-0
+// Proper timer implementation using internal 16-bit counter.
+// DIV register = upper 8 bits (timer_internal >> 8).
+// TIMA ticks on falling edge of a specific bit depending on TAC mode.
+static uint16_t timer_internal = 0;
+static int timer_overflow_pending = 0;  // cycles until TMA reload (0=none)
+
+// Bit in timer_internal that drives TIMA for each TAC mode (bits 1-0)
+static const int timer_tac_bit[4] = { 9, 3, 5, 7 };
+
+// Advance timer by exactly 4 T-cycles; called in a loop from timer_step.
+static void timer_tick4(void) {
+    // Handle TMA reload delay
+    if (timer_overflow_pending > 0) {
+        timer_overflow_pending -= 4;
+        if (timer_overflow_pending <= 0) {
+            timer_overflow_pending = 0;
+            RAM[REG_TIMA] = RAM[REG_TMA];
+            request_interrupt(INTERRUPT_TIMER);
+        }
+    }
+
+    uint16_t old_internal = timer_internal;
+    timer_internal += 4;
+    // DIV register is upper 8 bits of internal counter
+    RAM[REG_DIV] = (uint8_t)(timer_internal >> 8);
+
+    // TIMA tick on falling edge of selected bit AND timer enabled
+    if (RAM[REG_TAC] & 0x04) {
+        int bit = timer_tac_bit[RAM[REG_TAC] & 0x03];
+        bool old_bit = (old_internal >> bit) & 1;
+        bool new_bit = (timer_internal >> bit) & 1;
+        if (old_bit && !new_bit) {
+            if (++RAM[REG_TIMA] == 0) {
+                // TIMA overflow: 4-cycle delay before TMA reload
+                timer_overflow_pending = 4;
+            }
+        }
+    }
+}
+
+// Clock dividers for TAC bits 1-0 (kept for reference/compatibility)
 static const int timer_clocks[4] = { 1024, 16, 64, 256 };
 
 void timer_step(int cpu_cycles) {
-    // Divider: increments at CPU/256
-    timer_div_cycles += cpu_cycles;
-    while (timer_div_cycles >= 256) {
-        timer_div_cycles -= 256;
-        RAM[REG_DIV]++;
-    }
-
-    // TIMA: only counts when bit 2 of TAC is set
-    if (RAM[REG_TAC] & 0x04) {
-        int threshold = timer_clocks[RAM[REG_TAC] & 0x03];
-        timer_tima_cycles += cpu_cycles;
-        while (timer_tima_cycles >= threshold) {
-            timer_tima_cycles -= threshold;
-            RAM[REG_TIMA]++;
-            if (RAM[REG_TIMA] == 0) {
-                RAM[REG_TIMA] = RAM[REG_TMA];
-                request_interrupt(INTERRUPT_TIMER);
-            }
-        }
+    for (int i = 0; i < cpu_cycles; i += 4) {
+        timer_tick4();
     }
 }
 
@@ -780,9 +825,9 @@ void apu_step(int cpu_cycles) {
 }
 
 void mem_dma(byte data) {
-	const int start = (int)data * 100;
+	const int start = (int)data * 0x100;  // DMA source: data * 256 (e.g. $C0 → $C000)
 	for (int i = 0; i <= 0x9f; i++) {
-    mem_write(0xFE00+i, mem_read(start+i));
+        RAM[0xFE00+i] = mem_read(start+i);
 	}
 }
 
@@ -877,16 +922,46 @@ void mem_write(int pos, byte data) {
                 RAM[pos] = data;
             }
             break;
-        case REG_DIV:
-            // Writing any value to DIV resets it to 0
-            RAM[REG_DIV] = 0;
+        case REG_DIV: {
+            // Writing DIV resets internal counter; may cause TIMA falling edge
+            int bit = timer_tac_bit[RAM[REG_TAC] & 0x03];
+            bool was_set = (timer_internal >> bit) & 1;
+            timer_internal = 0;
             timer_div_cycles = 0;
+            RAM[REG_DIV] = 0;
+            // Falling edge: if timer enabled and selected bit was 1
+            if ((RAM[REG_TAC] & 0x04) && was_set) {
+                if (++RAM[REG_TIMA] == 0)
+                    timer_overflow_pending = 4;
+            }
             break;
+        }
         case REG_TIMA:
-        case REG_TMA:
-        case REG_TAC:
-            RAM[pos] = data;
+            // Write during overflow delay cancels TMA reload
+            timer_overflow_pending = 0;
+            RAM[REG_TIMA] = data;
             break;
+        case REG_TMA:
+            RAM[REG_TMA] = data;
+            break;
+        case REG_TAC: {
+            // Changing TAC can cause falling edge
+            int old_bit = timer_tac_bit[RAM[REG_TAC] & 0x03];
+            bool timer_was_enabled = (RAM[REG_TAC] & 0x04) != 0;
+            bool old_selected = (timer_internal >> old_bit) & 1;
+            RAM[REG_TAC] = data;
+            // If timer was on and old selected bit was 1, and now effectively 0 (disabled or bit changed)
+            if (timer_was_enabled && old_selected) {
+                bool still_enabled = (data & 0x04) != 0;
+                int new_bit = timer_tac_bit[data & 0x03];
+                bool new_selected = (timer_internal >> new_bit) & 1;
+                if (!still_enabled || !new_selected) {
+                    if (++RAM[REG_TIMA] == 0)
+                        timer_overflow_pending = 4;
+                }
+            }
+            break;
+        }
         case 0xFF4D:
             // KEY1: only bit 0 (arm speed switch) is writable
             RAM[0xFF4D] = data & 0x01;
@@ -1870,6 +1945,17 @@ void exec_op(byte opcode){
       setFlag(FLAG_C, !CheckFlag(FLAG_C));
     // LD B <- B (nop)
     case 0x40:
+      // Mooneye-gb test signal: LD B,B used as breakpoint
+      // Pass: B=3,C=5,D=8,E=13,H=21,L=34 (Fibonacci); Fail: all regs = 0x42
+      if (headless) {
+          if (B == 3 && C == 5 && D == 8 && E == 13 && H == 21 && L == 34) {
+              printf("Passed\n");
+              blargg_done = true;
+          } else if (B == 0x42 && C == 0x42 && D == 0x42 && E == 0x42 && H == 0x42 && L == 0x42) {
+              printf("Failed (mooneye)\n");
+              blargg_done = true;
+          }
+      }
       break;
 
     // LD B <- C
