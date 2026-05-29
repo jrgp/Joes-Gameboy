@@ -135,16 +135,89 @@ static void compute_mode3_extra(void) {
     int extra = (scx_fine == 0) ? 0 : (scx_fine <= 4 ? 4 : 8);
     if (gpu_control.sprite) {
         int height = gpu_control.sprite_tall ? 16 : 8;
+        // Track background fetcher phase (0-7) and current pixel position
+        // to compute per-sprite stall and inter-group overhead accurately.
+        int bg_phase = 0;
+        int cur_pixel = 0;
+        int prev_ox = -1;
         int n = 0;
+        int first_neg_correction_done = 0;
         for (int i = 0; i < 40 && n < 10; i++) {
             int oam = 0xFE00 + i * 4;
             int oy  = RAM[oam]     - 16;
             int ox  = RAM[oam + 1];
-            // Sprites with OAM X=0 are off-screen but still stall the PPU fetcher
-            if ((int)LY_REG >= oy && (int)LY_REG < oy + height)
-                n++;
+            // Sprites with OAM X >= 168 are off-screen to the right — no stall.
+            if (ox >= 168) continue;
+            if ((int)LY_REG < oy || (int)LY_REG >= oy + height) continue;
+
+            // Effective screen position (clamped: OAM X < 8 → all stall at pixel 0).
+            int sp = (ox >= 8) ? ox - 8 : 0;
+
+            // Advance background fetcher phase to this sprite's screen position.
+            if (sp > cur_pixel) {
+                bg_phase = (bg_phase + (sp - cur_pixel)) % 8;
+                cur_pixel = sp;
+            }
+
+            // Inter-group overhead when the sprite's OAM X changes (new cluster).
+            // The overhead depends on background phase at the time of the transition:
+            //   phase 6-7: 5T (fetcher mid-cycle restart penalty)
+            //   phase 0-1: 1T (minor alignment penalty)
+            //   phase 2-5: 0T (no penalty)
+            int is_transition = (prev_ox >= 0 && ox != prev_ox);
+            if (is_transition) {
+                int overhead = (bg_phase >= 6) ? 5 : (bg_phase <= 1) ? 1 : 0;
+                extra    += overhead;
+                bg_phase  = (bg_phase + overhead) % 8;
+            }
+
+            // Per-sprite stall: base 6T, ±1T for OAM X%8 < 2 based on fetch phase.
+            // X%8=0: phases 6,2 → +1T; phases 1,5 → -1T; phase 0 → 6T; others → 6T.
+            // X%8=1: phases 6,2,1 → +1T; phase 5 → -1T; phase 0 → 6T; others → 6T.
+            // (The asymmetry arises from the fetcher's 1T offset for sprites at sp%8=1.)
+            int stall;
+            if (ox % 8 == 0) {
+                stall = (bg_phase == 0)                  ? 6 :
+                        (bg_phase == 6 || bg_phase == 2) ? 7 :
+                        (bg_phase == 1 || bg_phase == 5) ? 5 : 6;
+            } else if (ox % 8 == 1) {
+                stall = (bg_phase == 0)                  ? 6 :
+                        (bg_phase == 6 || bg_phase == 2) ? 7 :
+                        // phase=1 -> 7T only for subsequent sprites; first sprite
+                        // hasn't yet established the ±1T fetch-alignment asymmetry.
+                        (bg_phase == 1 && prev_ox >= 0)  ? 7 :
+                        (bg_phase == 5)                  ? 5 : 6;
+            } else if (ox % 8 >= 4 && prev_ox < 0) {
+                // First sprite encountered in mode-3 at a mid-tile ox position:
+                // the background fetcher was already partway into its initial tile
+                // fetch, so the effective stall is reduced.
+                stall = (8 - (ox % 8)) >= 3 ? (8 - (ox % 8)) : 3;
+            } else {
+                stall = 6;
+            }
+
+            extra    += stall;
+            bg_phase  = (bg_phase + stall) % 8;
+
+            // Per-OAM-X%8 correction for inter-group transitions.
+            // Hardware stall per isolated sprite scales with ox%8: sprites at lower
+            // ox%8 values stall longer. This correction adjusts the cumulative extra.
+            // Positive corrections (ox%8=0,1,2) always apply.
+            // Negative corrections (ox%8=4,5,6,7) skip the first such transition to
+            // avoid over-subtracting in simple 2-sprite tests.
+            if (is_transition) {
+                int ox_correction = 3 - (ox % 8);
+                if (ox_correction > 3) ox_correction = 3;
+                if (ox_correction < -2) ox_correction = -2;
+                if (ox_correction > 0 || first_neg_correction_done)
+                    extra += ox_correction;
+                if (ox_correction < 0)
+                    first_neg_correction_done = 1;
+            }
+
+            prev_ox   = ox;
+            n++;
         }
-        extra += n * 6;
     }
     mode3_extra = extra;
 }

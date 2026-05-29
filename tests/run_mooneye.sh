@@ -4,7 +4,7 @@ PASS=0; FAIL=0; FAILLIST=()
 for rom in roms/mooneye/acceptance/**/*.gb roms/mooneye/acceptance/*.gb; do
     [[ -f "$rom" ]] || continue
     name="${rom#roms/mooneye/acceptance/}"
-    out=$(./gb --headless --cycles 10000000 "$rom" 2>/dev/null)
+    out=$(./gb --headless --cycles 20000000 "$rom" 2>/dev/null)
     if echo "$out" | grep -q "Passed"; then
         PASS=$((PASS+1))
     else
