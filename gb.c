@@ -49,6 +49,7 @@ bool blargg_done = false;
 
 // OAM DMA state: cycle-accurate 160 M-cycle transfer
 bool dma_active = false;
+bool dma_oam_locked = false;    // OAM locked only after 2-M-cycle startup grace period
 int  dma_cycles_remaining = 0; // counts down from 160 (M-cycles) during active transfer
 int  dma_startup_remaining = 0;// 2 M-cycle startup delay before first byte is copied
 int  dma_source = 0;           // source start address
@@ -930,6 +931,11 @@ void mem_dma(byte data) {
     dma_source = (int)data * 0x100;
     dma_cycles_remaining = 160; // 160 M-cycles = 640 T-cycles
     dma_startup_remaining = 2;  // 2 M-cycle startup delay before first byte copied
+    // For a fresh DMA start OAM is accessible for 2 M-cycles (grace period).
+    // For a restarted DMA (previous one still running, OAM already locked), keep locked.
+    if (!(dma_active && dma_oam_locked)) {
+        dma_oam_locked = false;
+    }
     dma_active = true;
 }
 
@@ -940,6 +946,7 @@ void dma_step(int t_cycles) {
     while (m_cycles-- > 0) {
         if (dma_startup_remaining > 0) {
             dma_startup_remaining--;
+            if (dma_startup_remaining == 0) dma_oam_locked = true;
             continue;
         }
         if (dma_cycles_remaining <= 0) break;
@@ -947,7 +954,10 @@ void dma_step(int t_cycles) {
         RAM[0xFE00 + idx] = dma_read_source(dma_source + idx);
         dma_cycles_remaining--;
     }
-    if (dma_startup_remaining <= 0 && dma_cycles_remaining <= 0) dma_active = false;
+    if (dma_startup_remaining <= 0 && dma_cycles_remaining <= 0) {
+        dma_active = false;
+        dma_oam_locked = false;
+    }
 }
 
 byte mem_read(int pos) {
@@ -964,8 +974,8 @@ byte mem_read(int pos) {
         // Echo RAM: $E000-$FDFF mirrors WRAM $C000-$DDFF
         return RAM[pos - 0x2000];
     } else if (pos >= 0xFE00 && pos <= 0xFE9F) {
-        // OAM: returns 0xFF when DMA is active or during GPU modes 2/3
-        if (dma_active) return 0xFF;
+        // OAM: returns 0xFF when DMA is active (after startup grace) or during GPU modes 2/3
+        if (dma_active && dma_oam_locked) return 0xFF;
         {
             int projected = gpu_cycles + instr_timer_cycles - 4;
             byte mode = gpu_get_mode_projected(projected);
@@ -1095,12 +1105,13 @@ void mem_write(int pos, byte data) {
             break;
         }
         case REG_TIMA:
-            // Write during overflow delay cancels TMA reload
+            // Write during overflow delay cancels TMA reload.
+            // But if TMA already reloaded this M-cycle, the write is ignored entirely
+            // (hardware ignores TIMA writes during the reload M-cycle itself).
             if (timer_just_reloaded) {
-                // Reload just fired this M-cycle via timer_step: cancel retroactively
-                RAM[INTERRUPT_FLAGS] &= ~INTERRUPT_TIMER;
-                timer_just_reloaded = false;
+                break; // reload wins; write ignored, interrupt preserved
             }
+            // Write during the 4-M-cycle overflow delay cancels the pending reload
             timer_overflow_pending = 0;
             RAM[REG_TIMA] = data;
             break;
