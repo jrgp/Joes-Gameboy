@@ -127,6 +127,14 @@ byte gpu_read(int pos){
         return 0x80 | (RAM[STAT] & 0x78) | lyc_flag | gpu_get_mode();
     }
     if (pos == LY) {
+        // On DMG hardware, LY is a live hardware counter. Reading LY during an
+        // instruction reflects the state ~4T (one M-cycle) into the instruction.
+        // Our gpu_step only runs after full instructions, so compensate here.
+        if (gpu_control.enabled && gpu_cycles + 4 >= 456) {
+            byte next_ly = LY_REG + 1;
+            if (next_ly > 153) next_ly = 0;
+            return next_ly;
+        }
         return LY_REG;
     }
     if (pos == SCX) {
@@ -401,9 +409,15 @@ static void oam_write_word(byte *oam, int offset, word val) {
 
 // Write corruption: triggered by INC/DEC rr, PUSH, CALL, RST with reg in OAM range.
 // Formula: new_word0 = ((a ^ c) & (b ^ c)) ^ c; bytes[2..7] = copy from prev row.
+static int oam_corrupt_debug = 0; // set to 1 to enable debug logging
 void oam_write_corrupt_at(word reg_val, int t_offset) {
     if (reg_val < 0xFE00 || reg_val > 0xFEFF) return;
     int off_n = oam_accessed_row_at(t_offset);
+    if (oam_corrupt_debug) {
+        extern word PC;
+        fprintf(stderr, "[OAM_CORRUPT] PC=%04X reg=%04X t_offset=%d gpu_cycles=%d LY=%d off_n=%d\n",
+                PC, reg_val, t_offset, gpu_cycles, LY_REG, off_n);
+    }
     if (off_n < 8) return; // -1 = not Mode 2, 0 = immune row
 
     byte *oam = &RAM[0xFE00];
@@ -503,20 +517,40 @@ void oam_read_corrupt(word addr) {
 char cart_name[30];
 byte cart_type;
 byte *cart_data;
+int cart_rom_banks;   // total number of 16KB ROM banks
+int cart_rom_bank = 1; // current switchable ROM bank (for $4000-$7FFF)
 byte ext_ram[0x2000]; // 8KB external RAM for MBC1+RAM (cart types 0x02, 0x03)
-byte cart_read(int pos){
-  // TODO: banking obviously
-  return cart_data[pos];
+
+byte cart_read(int pos) {
+    if (pos < 0x4000) {
+        return cart_data[pos]; // bank 0 is always fixed
+    }
+    // $4000-$7FFF: switchable ROM bank
+    int bank_offset = cart_rom_bank * 0x4000 + (pos - 0x4000);
+    return cart_data[bank_offset];
 }
 
-void cart_write(int pos, byte data){
-    // MBC1 RAM enable: writes to 0x0000-0x1FFF with value 0x0A enable,
-    // any other value disables. We always allow ext_ram access, so ignore.
+void cart_write(int pos, byte data) {
     if (pos <= 0x1FFF) {
+        // MBC1 RAM enable: ignored (we always allow ext_ram access)
         return;
     }
-    // MBC1 ROM bank number, RAM bank, mode: ignore (no banking support yet)
+    if (pos <= 0x3FFF) {
+        // MBC1 ROM bank number (lower 5 bits)
+        int bank = data & 0x1F;
+        if (bank == 0) bank = 1; // MBC1: bank 0 maps to bank 1
+        // Mask to valid bank range
+        int mask = cart_rom_banks - 1;
+        cart_rom_bank = bank & mask;
+        if (cart_rom_bank == 0) cart_rom_bank = 1;
+        return;
+    }
+    if (pos <= 0x5FFF) {
+        // MBC1 RAM bank or upper ROM bank bits: ignore for now
+        return;
+    }
     if (pos <= 0x7FFF) {
+        // MBC1 mode select: ignore
         return;
     }
     // other cart writes: silently ignore
@@ -548,6 +582,8 @@ void cart_load(char *path) {
     }
     cart_name[i+1] = '\0';
     cart_type = cart_data[0x147];
+    cart_rom_banks = (int)filelen / 0x4000;
+    cart_rom_bank = 1; // reset to default bank
 
     printf("Loaded %s\n", cart_name);
 
@@ -743,8 +779,13 @@ void mem_write(int pos, byte data) {
                 }
                 fputc(serial_sb, stdout);
                 fflush(stdout);
+                // Clear bit 7 immediately (transfer complete) so ROM doesn't busy-wait
+                RAM[pos] = data & ~0x80;
+                // Trigger serial interrupt (INT 3 = $08)
+                RAM[INTERRUPT_FLAGS] |= 0x08;
+            } else {
+                RAM[pos] = data;
             }
-            RAM[pos] = data;
             break;
         case REG_DIV:
             // Writing any value to DIV resets it to 0
