@@ -121,6 +121,30 @@ static bool lcd_off_lyc_flag = false;
 // gpu_cycles advances past the ~80T OAM-scan point.
 static bool lcd_startup_mode0 = false;
 
+// Per-scanline mode-3 extension (T-cycles beyond 172).
+// Accounts for fine-scroll penalty (SCX & 7) and sprite-fetch stall (6T per sprite, max 10).
+// Recomputed at the start of each new scanline; used by all mode-boundary queries.
+static int mode3_extra = 0;
+
+// Recompute mode3_extra for the current LY_REG.
+// Must be called right after LY_REG is updated so OAM is scanned for the correct line.
+static void compute_mode3_extra(void) {
+    int extra = SCX_REG & 7;
+    if (gpu_control.sprite) {
+        int height = gpu_control.sprite_tall ? 16 : 8;
+        int n = 0;
+        for (int i = 0; i < 40 && n < 10; i++) {
+            int oam = 0xFE00 + i * 4;
+            int oy  = RAM[oam]     - 16;
+            int ox  = RAM[oam + 1];
+            if ((int)LY_REG >= oy && (int)LY_REG < oy + height && ox > 0)
+                n++;
+        }
+        extra += n * 6;
+    }
+    mode3_extra = extra;
+}
+
 void gpu_init(void){
     memset(VRAM, 0, 0x2000);
     gpu_cycles = 0;
@@ -157,7 +181,7 @@ byte gpu_get_mode(void) {
     if (LY_REG >= 144) return 1;   // VBlank
     if (lcd_startup_mode0) return 0; // Startup: mode 0 visible before mode 2 begins
     if (gpu_cycles < 80) return 2;  // OAM scan
-    if (gpu_cycles < 252) return 3; // LCD transfer
+    if (gpu_cycles < 252 + mode3_extra) return 3; // LCD transfer (extended by SCX/sprite penalty)
     return 0;                        // HBlank
 }
 
@@ -172,7 +196,7 @@ byte gpu_get_mode_projected(int projected_cycles) {
     if (projected_cycles < 0) projected_cycles = 0;
     if (projected_cycles >= 456) projected_cycles = 455;
     if (projected_cycles < 80) return 2;
-    if (projected_cycles < 252) return 3;
+    if (projected_cycles < 252 + mode3_extra) return 3;
     return 0;
 }
 
@@ -186,7 +210,7 @@ static byte gpu_get_mode_for_lock(int projected_cycles) {
     if (projected_cycles < 0) projected_cycles = 0;
     if (projected_cycles >= 456) projected_cycles = 455;
     if (projected_cycles < 80) return 2;
-    if (projected_cycles < 252) return 3;
+    if (projected_cycles < 252 + mode3_extra) return 3;
     return 0;
 }
 
@@ -199,7 +223,7 @@ static bool vram_write_accessible(int proj) {
     if (LY_REG >= 144)       return true;  // VBlank: always accessible
     if (proj < 0) proj = 0;
     if (proj >= 456) proj -= 456;
-    if (proj >= 88 && proj <= 259) return false; // mode-3 pixel pipeline lock
+    if (proj >= 88 && proj <= 259 + mode3_extra) return false; // mode-3 pixel pipeline lock
     return true;
 }
 // Derived from hardware-measured access windows for lcdon_write_timing-GS.
@@ -216,7 +240,7 @@ static bool oam_write_accessible(int proj) {
     if (proj < 0) proj = 0;
     if (proj >= 456) proj -= 456;           // wrap into next scanline
     if (proj >= 8  && proj <= 83)  return false; // mode-2 bus lock
-    if (proj >= 88 && proj <= 259) return false; // mode-3 / early mode-0 lock
+    if (proj >= 88 && proj <= 259 + mode3_extra) return false; // mode-3 / early mode-0 lock
     return true;
 }
 
@@ -518,6 +542,9 @@ void gpu_step(int _cycles){
         } else if (ly < 144) {
             gpu_drawline(ly);
         }
+
+        // Recompute mode-3 extension for the new scanline (SCX fine-scroll + sprite penalty).
+        compute_mode3_extra();
 
         // Fire STAT for any newly-active condition after LY change
         stat_check_irq();
@@ -1062,20 +1089,39 @@ byte mem_read(int pos) {
                 return RAM[REG_TAC] | 0xF8;
             case 0xFF10: // NR10: bit 7 always 1
                 return RAM[pos] | 0x80;
+            case 0xFF11: // NR11: duty (bits 7:6) readable; length (bits 5:0) write-only → read as 1
+                return (RAM[pos] & 0xC0) | 0x3F;
+            case 0xFF13: // NR13: frequency lo — write-only
+                return 0xFF;
+            case 0xFF14: // NR14: length_enable (bit 6) readable; rest read as 1
+                return (RAM[pos] & 0x40) | 0xBF;
+            case 0xFF16: // NR21: same structure as NR11
+                return (RAM[pos] & 0xC0) | 0x3F;
+            case 0xFF18: // NR23: frequency lo — write-only
+                return 0xFF;
+            case 0xFF19: // NR24: same structure as NR14
+                return (RAM[pos] & 0x40) | 0xBF;
+            case 0xFF1B: // NR31: length — write-only
+                return 0xFF;
             case 0xFF1A: // NR30: bits 6-0 always 1
                 return RAM[pos] | 0x7F;
             case 0xFF1C: // NR32: bits 7 and 4-0 always 1
                 return RAM[pos] | 0x9F;
-            case 0xFF20: // NR41: bits 7-6 always 1
-                return RAM[pos] | 0xC0;
-            case 0xFF23: // NR44: bits 5-0 always 1
-                return RAM[pos] | 0x3F;
+            case 0xFF1D: // NR33: frequency lo — write-only
+                return 0xFF;
+            case 0xFF1E: // NR34: same structure as NR14/NR24
+                return (RAM[pos] & 0x40) | 0xBF;
+            case 0xFF20: // NR41: length counter (bits 5:0) write-only; bits 7:6 unused → all read as 1
+                return 0xFF;
+            case 0xFF23: // NR44: length_enable (bit 6) + bit 7 always 1; bits 5:0 always 1
+                return (RAM[pos] & 0x40) | 0xBF;
             // Unmapped I/O: always return 0xFF
             case 0xFF03:
             case 0xFF08: case 0xFF09: case 0xFF0A: case 0xFF0B:
             case 0xFF0C: case 0xFF0D: case 0xFF0E:
             case 0xFF15: case 0xFF1F:
             case 0xFF27: case 0xFF28: case 0xFF29:
+            case 0xFF2A: case 0xFF2B: case 0xFF2C: case 0xFF2D: case 0xFF2E: case 0xFF2F:
                 return 0xFF;
             default:
                 // Unmapped $FF4C-$FF7F on DMG: always return 0xFF
@@ -1365,6 +1411,21 @@ void cpu_fake_init(void){
     // We're skipping the BIOS, so mark it as done so ROM interrupt
     // vectors at 0x40-0x60 are read from cart, not BIOS.
     inBios = false;
+
+    // DMG-ABC post-boot-ROM hardware state (skipping actual boot ROM execution).
+    // Timer: boot ROM leaves internal counter at 0xABCC — DIV reads $AD after the
+    // ~336 T-cycles of boot_hwio preamble code, matching real hardware behaviour.
+    timer_internal = 0xABCC;
+    RAM[REG_DIV] = (uint8_t)(timer_internal >> 8);
+
+    // IF: at post-boot, VBlank (bit 0) is pending — the LCD ran during the boot ROM
+    RAM[INTERRUPT_FLAGS] = 0x01;  // bits 7-5 always read as 1 via mem_read mask + 0xE0
+    RAM[0xFF11] = 0x80;   // NR11: wave duty=2 (50%) in bits 7:6
+    RAM[0xFF12] = 0xF3;   // NR12: volume=15, decreasing, shift=3
+    RAM[0xFF24] = 0x77;   // NR50: SO2/SO1 volume both at max (7)
+    RAM[0xFF25] = 0xF3;   // NR51: ch1+ch2 to SO1, ch1+ch2 to SO2
+    RAM[0xFF26] = 0x80;   // NR52: master sound on (bit 7); ch status via apu_ch1_active
+    apu_ch1_active = true; // channel 1 still running after boot chime
 }
 
 void cpu_debug_log(void) {
