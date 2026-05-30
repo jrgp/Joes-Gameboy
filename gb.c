@@ -1593,7 +1593,14 @@ byte mem_read(int pos) {
             if (projected < 0) projected = 0;
             bool locked;
             if (ly153_vblank_active) {
-                locked = false;  // VBlank continuation: OAM accessible
+                if (projected >= 456) {
+                    // Reads spilling out of the LY=153/0 VBlank continuation land in the
+                    // first real LY=0 scanline, where the normal OAM lock resumes.
+                    projected -= 456;
+                    locked = (projected >= 4 && projected < 260 + mode3_extra);
+                } else {
+                    locked = false;  // VBlank continuation: OAM accessible
+                }
             } else if (lcd_startup_line) {
                 if (projected >= 456) {
                     // Overflowing into LY=1: first real mode-2 scan, no dead zone.
