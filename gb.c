@@ -484,7 +484,10 @@ static void stat_check_irq(void) {
             bool oam_firing = (mode_irq == 2);
             bool vblank_firing = ((RAM[STAT] & 0x10) && mode_irq == 1 && LY_REG == 144);
             bool lyc_firing = ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC] && !lyc_delayed && gpu_cycles < 88);
-            if (oam_firing && if_cleared_proj_gc == 4) suppressed = true;
+            // Suppress OAM fire only if LYC is NOT independently firing at gc=8.
+            // When IF is cleared at proj=4, it suppresses the OAM at gc=4. But if LYC fires
+            // at gc=8 and OAM condition is still true (mode=2), don't suppress the LYC fire.
+            if (oam_firing && !lyc_firing && if_cleared_proj_gc == 4) suppressed = true;
             if ((vblank_firing || lyc_firing) && if_cleared_proj_gc == 8) suppressed = true;
         }
         if (!suppressed) {
@@ -586,14 +589,27 @@ void gpu_write(int pos, byte data){
     if (pos == STAT) {
         // DMG STAT write glitch: writing to STAT during mode 0 (HBlank) or mode 1 (VBlank)
         // causes a momentary 1-cycle pulse on the STAT IRQ line, firing an interrupt
-        // regardless of which enable bits are set. On the LCD startup line, the initial
-        // ~36 T-cycles behave like mode 0 for this glitch before normal OAM timing takes over.
+        // regardless of which enable bits are set.
+        //
+        // The glitch fires if the instruction's execution window intersects the HBlank/VBlank
+        // region: specifically if M1 (gc) or M3 (proj_tc) falls in HBlank [260..455], or we're
+        // in VBlank (LY=144..153). This handles:
+        //   - Write starts in HBlank but proj wraps past scanline boundary (gc>=260 fires)
+        //   - Write starts in mode 3 but M3 lands in HBlank (proj_tc in [260..455] fires)
+        //   - Dead zone gc=0..3 at start of scanline does NOT trigger the glitch
+        // On the LCD startup line, the initial ~36 T-cycles behave like mode 0.
         if (gpu_control.enabled) {
-            int proj_tc = gpu_cycles + instr_timer_cycles - 4;
-            byte mode_v;
-            if (lcd_startup_mode0) mode_v = (proj_tc < 36) ? 0 : 2;
-            else mode_v = gpu_get_mode_projected(proj_tc);
-            if (mode_v == 0 || mode_v == 1) {
+            bool glitch;
+            if (lcd_startup_mode0) {
+                glitch = (gpu_cycles < 36);
+            } else {
+                int proj_tc = gpu_cycles + instr_timer_cycles - 4;
+                bool hblank_at_m1 = (gpu_cycles >= 260 && LY_REG < 144);
+                bool hblank_at_m3 = (proj_tc >= 260 && proj_tc < 456 && LY_REG < 144);
+                bool in_vblank    = (LY_REG >= 144 && LY_REG <= 153);
+                glitch = hblank_at_m1 || hblank_at_m3 || in_vblank;
+            }
+            if (glitch) {
                 request_interrupt(INTERRUPT_STAT);
             }
         }
@@ -1546,31 +1562,28 @@ byte mem_read(int pos) {
             case INTERRUPT_FLAGS: {
                 // DMG: upper 3 bits of IF are always 1
                 byte result = RAM[pos] | 0xE0;
-                if (gpu_control.enabled && LY_REG < 144 && !lcd_startup_mode0 && !stat_irq_line) {
+                if (gpu_control.enabled && !lcd_startup_mode0 && !stat_irq_line) {
                     int proj = gpu_cycles + instr_timer_cycles - 4;
-                    // HBlank STAT projection: mode_irq 3→0 transition at gc=260
-                    if ((RAM[STAT] & 0x08) &&
-                            gpu_get_mode_for_irq(gpu_cycles) == 3 &&
-                            gpu_get_mode_for_irq(proj) == 0) {
-                        result |= 0x02;
-                    }
-                    // OAM STAT projection: mode_irq 0→2 transition at gc=4 (4T propagation)
-                    if ((RAM[STAT] & 0x20) &&
-                            gpu_get_mode_for_irq(gpu_cycles) == 0 &&
-                            gpu_get_mode_for_irq(proj) == 2) {
-                        result |= 0x02;
-                    }
-                    // LYC STAT projection: lyc_delayed clears at gc=8 (8T propagation)
-                    // When we're in the dead zone (gc=0..7) and proj crosses gc=8, LYC fires.
-                    if ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC] && lyc_delayed) {
-                        // Within current scanline: gc < 8 and proj >= 8
-                        if (gpu_cycles < 8 && proj >= 8) {
+                    if (LY_REG < 144) {
+                        // HBlank STAT projection: mode_irq 3→0 transition at gc=260
+                        if ((RAM[STAT] & 0x08) &&
+                                gpu_get_mode_for_irq(gpu_cycles) == 3 &&
+                                gpu_get_mode_for_irq(proj) == 0) {
                             result |= 0x02;
                         }
-                        // Cross-scanline: proj wraps into gc=4+ of next scanline
-                        // (instruction starts near end of previous scanline, reads at start of this one)
-                        // This is already handled by the within-scanline check when instructions
-                        // span the scanline boundary, because gpu_get_mode_for_irq handles overflow.
+                        // OAM STAT projection: mode_irq 0→2 transition at gc=4 (4T propagation)
+                        if ((RAM[STAT] & 0x20) &&
+                                gpu_get_mode_for_irq(gpu_cycles) == 0 &&
+                                gpu_get_mode_for_irq(proj) == 2) {
+                            result |= 0x02;
+                        }
+                        // LYC STAT projection: lyc_delayed clears at gc=8 (8T propagation)
+                        // When we're in the dead zone (gc=0..7) and proj crosses gc=8, LYC fires.
+                        if ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC] && lyc_delayed) {
+                            if (gpu_cycles < 8 && proj >= 8) {
+                                result |= 0x02;
+                            }
+                        }
                     }
                 }
                 return result;
