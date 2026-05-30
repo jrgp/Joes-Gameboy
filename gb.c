@@ -200,7 +200,7 @@ static void compute_mode3_extra(void) {
     if (lcd_startup_line || window_active) {
         extra = (scx_fine < 7) ? scx_fine : 8;
     } else {
-        extra = (scx_fine < 3) ? 0 : (scx_fine < 7) ? 4 : 8;
+        extra = (scx_fine < 4) ? 0 : (scx_fine < 7) ? 4 : 8;
     }
     if (gpu_control.sprite) {
         int height = gpu_control.sprite_tall ? 16 : 8;
