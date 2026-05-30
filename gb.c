@@ -455,6 +455,14 @@ void gpu_write(int pos, byte data){
     if (pos == STAT) {
         // Bits 3-6 are writable; bits 0-2 are read-only
         RAM[STAT] = (RAM[STAT] & 0x87) | (data & 0x78);
+        // DMG STAT write glitch: writing to STAT while LCD is on and NOT in mode 3 causes
+        // a brief LINE-high pulse. This fires a STAT interrupt only if the line was
+        // previously 0 (rising-edge detection). If the line was already 1 (e.g., still
+        // in the same VBlank/mode-1 condition), no new interrupt fires.
+        if (gpu_control.enabled && gpu_get_mode() != 3 && !stat_irq_line) {
+            request_interrupt(INTERRUPT_STAT);
+            stat_irq_line = true;  // mark line high to prevent double-fire below
+        }
         // Writing STAT may activate a new interrupt condition immediately (DMG behaviour)
         stat_check_irq();
     }
@@ -472,6 +480,9 @@ void gpu_write(int pos, byte data){
             // The comparison clock restarts immediately, so LYC=LY is re-evaluated.
             lcd_startup_mode0 = true;
             lcd_startup_line = true;
+            // Recompute mode3_extra for the new scanline immediately, so the
+            // first scanline after lcd_on uses the correct SCX-based extension.
+            compute_mode3_extra();
             // Restore stat_irq_line from the frozen pre-disable state so
             // rising-edge detection works correctly on re-enable:
             // if LYC=LY was true before disable and is still true now, no new interrupt.
