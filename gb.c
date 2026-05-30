@@ -45,6 +45,7 @@ static int  serial_bits_remaining = 0; // bits left in current transfer (8 down 
 static byte serial_out_byte = 0;       // byte to transmit (saved at transfer start)
 bool headless = false;
 long long max_cycles = 0;
+bool gbmicrotest_mode = false; // read 0xFF82 for pass/fail after cycle limit
 
 typedef enum {
     MODEL_DMG = 0,   // DMG-ABC (default)
@@ -5097,6 +5098,19 @@ void headless_main_impl(void) {
     if (!blargg_done) {
         headless_print_blargg_a000();
     }
+    // GBMicrotest: check 0xFF82 (0x01=pass, 0xFF=fail) after run
+    if (gbmicrotest_mode) {
+        byte result = RAM[0xFF82];
+        if (result == 0x01) {
+            printf("Passed\n");
+        } else if (result == 0xFF) {
+            byte actual   = RAM[0xFF80];
+            byte expected = RAM[0xFF81];
+            printf("Failed (actual=0x%02X expected=0x%02X)\n", actual, expected);
+        } else {
+            printf("Unknown (0xFF82=0x%02X)\n", result);
+        }
+    }
 }
 
 int main(int argc, char **argv){
@@ -5106,6 +5120,8 @@ int main(int argc, char **argv){
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--headless") == 0) {
       headless = true;
+    } else if (strcmp(argv[i], "--gbmicrotest") == 0) {
+      gbmicrotest_mode = true;
     } else if (strcmp(argv[i], "--cycles") == 0) {
       if (i + 1 >= argc) {
         fprintf(stderr, "Missing value for --cycles\n");
