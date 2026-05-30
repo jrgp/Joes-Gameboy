@@ -369,6 +369,21 @@ static byte gpu_projected_mode_from_cycles(int pc) {
     if (pc < 260 + mode3_extra) return 3;  // LCD transfer: T=84..259
     return 0;                 // HBlank: T=256..455
 }
+
+// For STAT register reads: 8T propagation delay (wider dead zone than transition detection).
+// STAT-visible boundaries:
+//   Dead zone: T=0..7 shows mode-0 (8T propagation delay)
+//   Mode 2: T=8..87 (80T OAM scan)
+//   Mode 3: T=88..259+mode3_extra
+//   Mode 0 HBlank: T=260+mode3_extra..455
+static byte gpu_projected_mode_for_stat_read(int pc) {
+    if (pc < 0) pc = 0;
+    if (pc < 8)   return 0;  // dead zone: T=0..7 (8T propagation delay)
+    if (pc < 88)  return 2;  // OAM scan visible: T=8..87
+    if (pc < 260 + mode3_extra) return 3;  // LCD transfer: T=88..259
+    return 0;                              // HBlank: T=260..455
+}
+
 byte gpu_get_mode_projected(int projected_cycles) {
     if (!gpu_control.enabled) return 0;
     if (ly153_vblank_active) {
@@ -380,10 +395,51 @@ byte gpu_get_mode_projected(int projected_cycles) {
     if (LY_REG > 144) return 1;
     // LY=144 (VBlank start): 4T propagation delay — proj<4 still shows mode-0.
     if (LY_REG == 144) return (projected_cycles < 4) ? 0 : 1;
+    if (lcd_startup_line) {
+        // The first LCD-on scanline shows startup mode 0 before entering mode 3;
+        // mode 2 is skipped entirely on this line.
+        if (projected_cycles > 456) return gpu_projected_mode_from_cycles(projected_cycles - 456);
+        if (projected_cycles < 84) return 0;
+        if (projected_cycles < 260 + mode3_extra) return 3;
+        return 0;
+    }
     // Normal visible scanline: projected > 456 overflows into next scanline.
     // projected == 456 is still the last T of current HBlank.
     if (projected_cycles > 456) return gpu_projected_mode_from_cycles(projected_cycles - 456);
     return gpu_projected_mode_from_cycles(projected_cycles);
+}
+
+// Returns the STAT-register-visible mode for STAT reads (8T dead zone + ly153 Phase A/B).
+static byte gpu_get_mode_for_stat_read(int projected_cycles) {
+    if (!gpu_control.enabled) return 0;
+    if (ly153_vblank_active) {
+        // VBlank continues until T=455 of Phase B (LY=0 continuation).
+        if (projected_cycles < 456) return 1;
+        int pc = projected_cycles - 456;
+        if (LY_REG == 153) {
+            // Phase A (4T LY=153 stub): projecting past end into Phase B (452T VBlank
+            // continuation). Phase B is still VBlank for its full 452T duration.
+            if (pc < 452) return 1;
+            pc -= 452;  // past Phase B — fall through to new-frame transition
+        }
+        // Phase B end: VBlank→OAM transition.
+        // T=0..3: VBlank still visible (propagation delay keeps mode 1).
+        // T=4..7: dead zone (mode 0).
+        // T=8+: normal OAM scan visible.
+        if (pc < 4) return 1;
+        if (pc < 8) return 0;
+        return gpu_projected_mode_for_stat_read(pc);
+    }
+    if (LY_REG > 144) return 1;
+    if (LY_REG == 144) return (projected_cycles < 4) ? 0 : 1;
+    if (lcd_startup_line) {
+        if (projected_cycles > 456) return gpu_projected_mode_for_stat_read(projected_cycles - 456);
+        if (projected_cycles < 88) return 0;
+        if (projected_cycles < 260 + mode3_extra) return 3;
+        return 0;
+    }
+    if (projected_cycles > 456) return gpu_projected_mode_for_stat_read(projected_cycles - 456);
+    return gpu_projected_mode_for_stat_read(projected_cycles);
 }
 
 // Returns the GPU mode at a projected cycle for STAT INTERRUPT firing.
@@ -433,7 +489,9 @@ static bool vram_write_accessible(int proj) {
     if (LY_REG >= 144)       return true;  // VBlank: always accessible
     if (proj < 0) proj = 0;
     if (ly153_vblank_active && proj < 456) return true; // VBlank continuation
+    bool startup = lcd_startup_line;
     proj %= 456;
+    if (startup) return !(proj >= 88 && proj <= 259 + mode3_extra);
     if (proj >= 88 && proj <= 259 + mode3_extra) return false; // mode-3 pixel pipeline lock
     return true;
 }
@@ -442,15 +500,15 @@ static bool vram_write_accessible(int proj) {
 //   T=8..83   — mode-2 OAM-scan bus held by PPU
 //   T=88..259 — mode-3 pixel pipeline + first 8T of mode-0 OAM bus hold
 // Accessible windows: T<8, T=84..87 (1 M-cycle gap between locks), T>=260.
-// On the LCD startup line lcd_startup_mode0 is true until T=82, so the
-// whole mode-2 window is replaced by mode-0 (no lock).
+// On the LCD startup line, mode 2 is skipped — OAM is accessible until T=88.
 static bool oam_write_accessible(int proj) {
     if (!gpu_control.enabled) return true;
     if (LY_REG >= 144)       return true;  // VBlank: always accessible
-    if (lcd_startup_mode0)   return true;  // startup pseudo-mode 0: no lock
     if (proj < 0) proj = 0;
     if (ly153_vblank_active && proj < 456) return true; // VBlank continuation
+    bool startup = lcd_startup_line;
     proj %= 456;
+    if (startup) return !(proj >= 88 && proj <= 259 + mode3_extra);
     if (proj >= 8  && proj <= 83)  return false; // mode-2 bus lock
     if (proj >= 88 && proj <= 259 + mode3_extra) return false; // mode-3 / early mode-0 lock
     return true;
@@ -508,8 +566,13 @@ byte gpu_read(int pos){
             int projected = gpu_cycles + instr_timer_cycles - 4;
             if (projected < 0) projected = 0;
             bool locked;
-            if (lcd_startup_mode0) {
-                locked = (projected >= 88);
+            bool startup = lcd_startup_line;
+            if (startup && projected > 456) {
+                startup = false;
+                projected -= 456;
+            }
+            if (startup) {
+                locked = (projected >= 88 && projected < 260 + mode3_extra);
             } else if (ly153_vblank_active && projected < 456) {
                 locked = false;
             } else {
@@ -526,19 +589,17 @@ byte gpu_read(int pos){
             byte lyc_flag = lcd_off_lyc_flag ? 0x04 : 0x00;
             return 0x80 | (RAM[STAT] & 0x78) | lyc_flag;
         }
-        // Use projected mode: STAT samples the mode at end of M2 of the read instruction.
-        // projected = gpu_cycles + (instr_timer_cycles - 4) gives the T-cycle of the read.
+        // Use projected mode with 8T STAT-read boundary (Phase A/B for ly153).
         int projected = gpu_cycles + instr_timer_cycles - 4;
-        byte mode = gpu_get_mode_projected(projected);
+        byte mode = gpu_get_mode_for_stat_read(projected);
         // LYC coincidence flag is cleared near end of visible scanlines (hardware pre-clear).
-        // Hardware clears LYC comparison at projected >= 456 (end of LY<144 scanline) to
-        // prevent spurious STAT interrupts during the LY counter wrap.
-        // Note: The dead zone (projected < 4) does NOT clear LYC — hardware still compares
-        // LY==LYC normally in the dead zone (verified by poweron_stat_006 showing LYC set).
+        // Hardware clears LYC comparison at projected > 456 (strictly after LY<144 scanline end)
+        // to prevent spurious STAT interrupts during the LY counter wrap.
+        // At projected == 456 (T=0 of next scanline dead zone), LYC is still visible.
         byte lyc_flag;
         if (!lcd_startup_mode0 &&
-                (projected >= 456 && LY_REG < 144 && !ly153_vblank_active)) {
-            lyc_flag = 0x00; // pre-clear: LYC comparison cleared near scanline end
+                (projected > 456 && LY_REG < 144 && !ly153_vblank_active)) {
+            lyc_flag = 0x00; // pre-clear: LYC comparison cleared after scanline end
         } else {
             lyc_flag = (LY_REG == RAM[LYC]) ? 0x04 : 0x00;
         }
@@ -952,6 +1013,7 @@ void gpu_step(int _cycles){
         // Fire STAT for any newly-active condition after LY change
         stat_check_irq();
     }
+
 
     // Fire deferred scanline render once OAM scan is complete (T>=80).
     // Also recompute mode3_extra here so that SCX writes during OAM scan (mode 2)
@@ -1515,9 +1577,13 @@ byte mem_read(int pos) {
             int projected = gpu_cycles + instr_timer_cycles - 4;
             if (projected < 0) projected = 0;
             bool locked;
-            if (lcd_startup_mode0) {
-                if (projected >= 456) projected = 455;
-                locked = (projected >= 88);
+            bool startup = lcd_startup_line;
+            if (startup && projected > 456) {
+                startup = false;
+                projected -= 456;
+            }
+            if (startup) {
+                locked = (projected >= 88 && projected < 260 + mode3_extra);
             } else if (ly153_vblank_active && projected < 456) {
                 // Extended VBlank continuation: OAM is accessible
                 locked = false;
