@@ -174,10 +174,21 @@ static int mode3_extra = 0;
 // Recompute mode3_extra for the current LY_REG.
 // Must be called right after LY_REG is updated so OAM is scanned for the correct line.
 static void compute_mode3_extra(void) {
-    // SCX fine-scroll penalty is quantized: the background fetcher stalls in
-    // 4T groups: 0 for SCX&7=0, 4T for SCX&7=1-4, 8T for SCX&7=5-7.
+    // Window active on this scanline?
+    bool window_active = gpu_control.window && (int)RAM[WY] <= (int)LY_REG && RAM[WX] <= 166;
+
+    // SCX fine-scroll penalty depends on context:
+    // - Startup line OR window-active line: exact SCX%8 T-cycles (SCX%8=7 → 8T).
+    // - Normal lines without window: quantized in 4T groups (0-3=0T, 4-6=4T, 7=8T).
+    //   When the window is active, the fetcher transitions mid-scanline, which preserves
+    //   the exact SCX penalty rather than allowing it to be absorbed.
     int scx_fine = SCX_REG & 7;
-    int extra = (scx_fine == 0) ? 0 : (scx_fine <= 4 ? 4 : 8);
+    int extra;
+    if (lcd_startup_line || window_active) {
+        extra = (scx_fine < 7) ? scx_fine : 8;
+    } else {
+        extra = (scx_fine < 4) ? 0 : (scx_fine < 7) ? 4 : 8;
+    }
     if (gpu_control.sprite) {
         int height = gpu_control.sprite_tall ? 16 : 8;
         // Track background fetcher phase (0-7) and current pixel position
@@ -265,6 +276,10 @@ static void compute_mode3_extra(void) {
         }
     }
     mode3_extra = extra;
+    // Window startup penalty: adds 4T when the window will render on this line.
+    if (window_active) {
+        mode3_extra += 4;
+    }
 }
 
 void gpu_init(void){
@@ -763,15 +778,16 @@ void gpu_step(int _cycles){
             pending_draw_ly  = ly;
         }
 
-        // Recompute mode-3 extension for the new scanline (SCX fine-scroll + sprite penalty).
-        compute_mode3_extra();
-
         // Fire STAT for any newly-active condition after LY change
         stat_check_irq();
     }
 
     // Fire deferred scanline render once OAM scan is complete (T>=80).
+    // Also recompute mode3_extra here so that SCX writes during OAM scan (mode 2)
+    // are captured before mode 3 starts. This handles both mid-scanline SCX changes
+    // and the LCD startup line (where no LY transition fires the recompute).
     if (pending_drawline && gpu_cycles >= 80) {
+        compute_mode3_extra();
         gpu_drawline(pending_draw_ly);
         pending_drawline = false;
     }
