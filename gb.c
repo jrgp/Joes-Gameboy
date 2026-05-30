@@ -1435,7 +1435,7 @@ static void timer_tick4(void) {
         if (timer_overflow_pending <= 0) {
             timer_overflow_pending = 0;
             RAM[REG_TIMA] = RAM[REG_TMA];
-            request_interrupt(INTERRUPT_TIMER);
+            // Interrupt already fired at overflow time; just reload TMA.
             timer_just_reloaded = true;
         }
     }
@@ -1452,7 +1452,8 @@ static void timer_tick4(void) {
         bool new_bit = (timer_internal >> bit) & 1;
         if (old_bit && !new_bit) {
             if (++RAM[REG_TIMA] == 0) {
-                // TIMA overflow: 4-cycle delay before TMA reload
+                // TIMA overflow: interrupt fires immediately; TMA reload after 4 T-cycles.
+                request_interrupt(INTERRUPT_TIMER);
                 timer_overflow_pending = 4;
             }
         }
@@ -1788,8 +1789,10 @@ void mem_write(int pos, byte data) {
             RAM[REG_DIV] = 0;
             // Falling edge: if timer enabled and selected bit was 1
             if ((RAM[REG_TAC] & 0x04) && was_set) {
-                if (++RAM[REG_TIMA] == 0)
+                if (++RAM[REG_TIMA] == 0) {
+                    request_interrupt(INTERRUPT_TIMER);
                     timer_overflow_pending = 4;
+                }
             }
             break;
         }
