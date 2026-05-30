@@ -172,6 +172,7 @@ static bool lcd_startup_line = false;
 // LYC=LY STAT interrupt fires 8T after the LY change.
 // When set, the LYC check in stat_check_irq is suppressed; it fires in gpu_step at T>=8.
 static bool lyc_delayed = false;
+static bool vblank_irq_delayed = false;
 
 // Projected T-cycle of last CPU write to IF (0xFF0F) — used to suppress OAM/LYC
 // STAT interrupt when CPU write and interrupt fire in the same T-cycle (CPU wins).
@@ -978,8 +979,8 @@ void gpu_step(int _cycles){
             if (ly == 1) lcd_startup_line = false;
 
             if (ly == 144) {
-                // VBlank period starts; VBlank interrupt is unconditional
-                request_interrupt(INTERRUPT_VBLANK);
+                // The VBlank interrupt becomes visible one M-cycle into LY=144.
+                vblank_irq_delayed = true;
             } else if (ly == 153) {
                 // LY=153 lasts only 4T on real DMG hardware, then LY→0 while
                 // VBlank (mode 1) continues for 452T more. Add 452T so the next
@@ -1057,6 +1058,12 @@ void gpu_step(int _cycles){
     if (lyc_delayed && gpu_cycles >= 8) {
         lyc_delayed = false;
         stat_check_irq();
+    }
+    if (vblank_irq_delayed && LY_REG == 144 && gpu_cycles >= 8) {
+        vblank_irq_delayed = false;
+        if (!(if_cleared_proj_ly == LY_REG && if_cleared_proj_gc == 8)) {
+            request_interrupt(INTERRUPT_VBLANK);
+        }
     }
 }
 
@@ -1656,6 +1663,9 @@ byte mem_read(int pos) {
             case INTERRUPT_FLAGS: {
                 // DMG: upper 3 bits of IF are always 1
                 byte result = RAM[pos] | 0xE0;
+                if (vblank_irq_delayed && LY_REG == 144 && instr_timer_cycles >= 12) {
+                    result |= INTERRUPT_VBLANK;
+                }
                 if (gpu_control.enabled && !lcd_startup_mode0 && !stat_irq_line) {
                     int proj = gpu_cycles + instr_timer_cycles - 4;
                     if (LY_REG < 144) {
