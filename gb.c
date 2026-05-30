@@ -533,8 +533,10 @@ static void stat_check_irq(void) {
     // Mode 1 VBlank: fires at T=8 of LY=144 (8T propagation).
     if ((RAM[STAT] & 0x10) && mode_irq == 1)                  line = true;
     // Mode 2 OAM: fires at T=4 (4T after hardware mode 2 start).
-    // Special LY=144 case: fires simultaneously with VBlank for STAT purposes.
-    if ((RAM[STAT] & 0x20) && (mode_irq == 2 || (LY_REG == 144 && gpu_cycles < 80))) line = true;
+    // The LCD startup line skips mode 2, so suppress the normal mode_irq==2 case there.
+    // LY=144 keeps the internal OAM condition for STAT purposes, but it is not visible
+    // until T=4 and ends with the normal OAM-scan window.
+    if ((RAM[STAT] & 0x20) && ((!lcd_startup_line && mode_irq == 2) || (LY_REG == 144 && gpu_cycles >= 4 && gpu_cycles < 84))) line = true;
     if ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC] && !lyc_delayed) line = true; // LYC=LY
     if (line && !stat_irq_line) {
         bool suppressed = false;
@@ -688,7 +690,7 @@ void gpu_write(int pos, byte data){
             bool new_line = false;
             if ((RAM[STAT] & 0x08) && mode_v == 0 && mode_i == 0 && LY_REG < 144) new_line = true;
             if ((RAM[STAT] & 0x10) && mode_i == 1) new_line = true;
-            if ((RAM[STAT] & 0x20) && (mode_i == 2 || (LY_REG == 144 && gpu_cycles < 80))) new_line = true;
+            if ((RAM[STAT] & 0x20) && ((!lcd_startup_line && mode_i == 2) || (LY_REG == 144 && gpu_cycles >= 4 && gpu_cycles < 84))) new_line = true;
             if ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC] && !lyc_delayed) new_line = true;
             stat_irq_line = new_line;
         }
@@ -1568,10 +1570,9 @@ byte mem_read(int pos) {
         // Echo RAM: $E000-$FDFF mirrors WRAM $C000-$DDFF
         return RAM[pos - 0x2000];
     } else if (pos >= 0xFE00 && pos <= 0xFE9F) {
-        // OAM: returns 0xFF when DMA is active (after startup grace) or during GPU modes 2/3.
-        // Lock window per scanline: T=0..259 (mode2 OAM scan T=0..79, mode3 T=80..259+8T early mode0).
-        // On the startup line (lcd_startup_mode0), the mode2 OAM scan is skipped so OAM is
-        // accessible for T<88, then locked from T=88 onward (startup STAT-visible mode3 boundary).
+        // OAM: returns 0xFF when DMA is active (after startup grace) or while the PPU owns
+        // the OAM bus. DMG read locking keeps LY>=1 reads blocked through the early part of
+        // mode 2, exposes a short boundary window, then blocks again for mode 3.
         if (dma_active && dma_oam_locked) return 0xFF;
         if (gpu_control.enabled && LY_REG < 144) {
             int projected = gpu_cycles + instr_timer_cycles - 4;
@@ -1583,14 +1584,12 @@ byte mem_read(int pos) {
                 projected -= 456;
             }
             if (startup) {
-                locked = (projected >= 88 && projected < 260 + mode3_extra);
+                locked = (projected >= 88 && projected <= 259 + mode3_extra);
             } else if (ly153_vblank_active && projected < 456) {
-                // Extended VBlank continuation: OAM is accessible
                 locked = false;
             } else {
-                // Wrap into current-scanline-relative offset (handles multi-scanline overflow)
                 projected %= 456;
-                locked = (projected < 256 + mode3_extra);
+                locked = ((projected <= 87) || (projected >= 96 && projected <= 259 + mode3_extra));
             }
             if (locked) return 0xFF;
         }
@@ -1905,6 +1904,7 @@ char *serial_get_output(void) {
 void mem_init(void){
     memset(RAM, 0, 0xffff + 1);
     memset(ext_ram, 0, sizeof(ext_ram));
+    RAM[DMA] = 0xFF;
     serial_buf_len = 0;
     serial_buf[0] = '\0';
     serial_sb = 0;
