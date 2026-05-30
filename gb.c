@@ -461,9 +461,9 @@ static void stat_check_irq(void) {
     byte mode = gpu_get_mode();
     byte mode_irq = gpu_get_mode_for_irq(gpu_cycles);
     bool line = false;
-    // Mode 0 HBlank: fires at T=260 (8T after hardware mode 3→0 at T=252+mode3_extra).
-    // The `mode == 0` guard prevents false fires during the T=0..7 dead zone (mode_irq
-    // also returns 0 there, but hardware OAM scan has already started so mode != 0).
+    // Mode 0 HBlank: fires at T=260+mode3_extra via mode_irq 3→0 transition (8T propagation).
+    // The `mode_irq == 0` guard fires at T=260 (not T=252) matching hardware IRQ timing.
+    // The `mode == 0` guard prevents false fires during the T=0..7 dead zone.
     if ((RAM[STAT] & 0x08) && mode == 0 && mode_irq == 0 && LY_REG < 144) line = true;
     // Mode 1 VBlank: fires at T=8 of LY=144 (8T propagation).
     if ((RAM[STAT] & 0x10) && mode_irq == 1)                  line = true;
@@ -1513,9 +1513,26 @@ byte mem_read(int pos) {
                        (apu_ch1_active ? 0x01 : 0x00) |
                        (apu_ch2_active ? 0x02 : 0x00) |
                        0x70; // unused bits read as 1
-            case INTERRUPT_FLAGS:
+            case INTERRUPT_FLAGS: {
                 // DMG: upper 3 bits of IF are always 1
-                return RAM[pos] | 0xE0;
+                byte result = RAM[pos] | 0xE0;
+                // Project HBlank STAT interrupt: on hardware the GPU fires the IF bit
+                // concurrently with the M-cycle that reads it.  Our emulator runs
+                // exec_next fully then calls gpu_step, so multi-M-cycle instructions
+                // (LD A,(HL) = 8T, LDH A,(n) = 12T) read IF before gpu_step fires.
+                // Fix: if the mode_irq 3→0 transition occurs between the instruction
+                // start (gpu_cycles) and the projected read T-cycle
+                // (gpu_cycles + instr_timer_cycles - 4), include the STAT bit now.
+                if (gpu_control.enabled && LY_REG < 144 && (RAM[STAT] & 0x08) &&
+                        !lcd_startup_mode0 && !stat_irq_line) {
+                    int proj = gpu_cycles + instr_timer_cycles - 4;
+                    if (gpu_get_mode_for_irq(gpu_cycles) == 3 &&
+                            gpu_get_mode_for_irq(proj) == 0) {
+                        result |= 0x02;
+                    }
+                }
+                return result;
+            }
             case 0xFF01:
                 return serial_sb;
             case 0xFF02: // SC: bits 6-1 always 1
