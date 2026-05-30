@@ -148,6 +148,10 @@ static int mode3_extra = 0;
 // Recompute mode3_extra for the current LY_REG.
 // Must be called right after LY_REG is updated so OAM is scanned for the correct line.
 static void compute_mode3_extra(void) {
+    // Window active on this scanline? Triggers a fetcher-restart penalty.
+    bool window_active = gpu_control.window &&
+                         (int)RAM[WY] <= (int)LY_REG && RAM[WX] <= 166;
+
     // SCX fine-scroll penalty is quantized: the background fetcher stalls in
     // 4T groups: 0 for SCX&7=0, 4T for SCX&7=1-4, 8T for SCX&7=5-7.
     int scx_fine = SCX_REG & 7;
@@ -239,6 +243,12 @@ static void compute_mode3_extra(void) {
         }
     }
     mode3_extra = extra;
+    // Window fetcher-restart penalty: when the window is active on this scanline,
+    // the pixel pipeline discards the current BG fetch and restarts for the window,
+    // extending mode 3 by 4T.
+    if (window_active) {
+        mode3_extra += 4;
+    }
 }
 
 void gpu_init(void){
