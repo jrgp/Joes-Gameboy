@@ -496,6 +496,9 @@ void gpu_write(int pos, byte data){
             // The comparison clock restarts immediately, so LYC=LY is re-evaluated.
             lcd_startup_mode0 = true;
             lcd_startup_line = true;
+            // Queue LY=0 for rendering (fires at T=80 of the first scanline).
+            pending_drawline = true;
+            pending_draw_ly  = 0;
             // Restore stat_irq_line from the frozen pre-disable state so
             // rising-edge detection works correctly on re-enable:
             // if LYC=LY was true before disable and is still true now, no new interrupt.
@@ -527,6 +530,9 @@ void gpu_write(int pos, byte data){
     }
     if (pos == BGP) {
         BGP_REG = data;
+    }
+    if (pos == WX || pos == WY) {
+        RAM[pos] = data;
     }
     if (data > 0) {
  //       printf("wrote %x to %x\n", data, pos);
@@ -710,6 +716,10 @@ void gpu_step(int _cycles){
         } else if (ly > 153) {
             LY_REG = 0;
             window_line = 0;
+            // Queue LY=0 for rendering; the OAM scan for scanline 0 starts
+            // now, so the draw will fire when gpu_cycles reaches 80.
+            pending_drawline = true;
+            pending_draw_ly  = 0;
         } else if (ly < 144) {
             // Defer scanline render to T=80 (end of OAM scan) so that raster
             // effects that poll LY and write SCX/SCY during OAM scan are
