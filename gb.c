@@ -2286,13 +2286,15 @@ void do_interrupts(void){
   byte halt_check_flags = flag_bits;
   if (halted && timer_halt_delay)
       halt_check_flags &= ~INTERRUPT_TIMER;
+  bool woke_from_halt = false;
   if ((halt_check_flags & enabled_bits) > 0) {
+      woke_from_halt = halted;
       halted = false;
   }
 
-  // ISR dispatch: only when CPU is not halted (either was already running,
-  // or the HALT check above just cleared it).
-  if (!halted && interrupts) {
+  // ISR dispatch: if HALT just woke on this M-cycle, let the CPU resume first and
+  // take the interrupt on the following slot.
+  if (!halted && interrupts && !woke_from_halt) {
     if(enabled_bits > 0){
       byte enabled = flag_bits & enabled_bits;
 
