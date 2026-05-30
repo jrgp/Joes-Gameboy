@@ -455,13 +455,17 @@ void gpu_write(int pos, byte data){
     if (pos == STAT) {
         // Bits 3-6 are writable; bits 0-2 are read-only
         RAM[STAT] = (RAM[STAT] & 0x87) | (data & 0x78);
-        // DMG STAT write glitch: writing to STAT while LCD is on and NOT in mode 3 causes
-        // a brief LINE-high pulse. This fires a STAT interrupt only if the line was
-        // previously 0 (rising-edge detection). If the line was already 1 (e.g., still
-        // in the same VBlank/mode-1 condition), no new interrupt fires.
-        if (gpu_control.enabled && gpu_get_mode() != 3 && !stat_irq_line) {
-            request_interrupt(INTERRUPT_STAT);
-            stat_irq_line = true;  // mark line high to prevent double-fire below
+        // DMG STAT write glitch: writing 0x00 to STAT while LCD is on and in mode 0 or 1
+        // causes a brief LINE-high pulse. This fires a STAT interrupt only if the line
+        // was previously 0 (rising-edge detection). The glitch is only triggered by
+        // clearing all interrupt-enable bits (data=0x00 / clear_stat), not by writing
+        // non-zero values that enable interrupt sources.
+        if (data == 0) {
+            byte cur_mode = gpu_get_mode();
+            if (gpu_control.enabled && (cur_mode == 0 || cur_mode == 1) && !stat_irq_line) {
+                request_interrupt(INTERRUPT_STAT);
+                stat_irq_line = true;  // mark line high to prevent double-fire below
+            }
         }
         // Writing STAT may activate a new interrupt condition immediately (DMG behaviour)
         stat_check_irq();
