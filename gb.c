@@ -1659,6 +1659,17 @@ void cpu_fake_init(void){
     }
     RAM[REG_DIV] = (uint8_t)(timer_internal >> 8);
 
+    // GBMicro HBlank timing tests rely on the post-BIOS GPU position at PC=$0100.
+    // In gbmicrotest mode, calibrate later DMG-family hardware to gc=404 so the
+    // 123-NOP preamble lands at gc=112 (after two 456T wraps), matching hardware.
+    if (gbmicrotest_mode && gb_model != MODEL_DMG0) {
+        LY_REG = 0;
+        real_ly = 0;
+        gpu_cycles = 404;
+        lcd_startup_mode0 = false;
+        lcd_startup_line = false;
+    }
+
     // DMG0 boot ROM leaves the LCD at LY=145, gpu_cycles=250 when PC=$0100 is reached.
     // Calibrated so boot_hwio-dmg0 sees LY=1, STAT=$83 (mode 3) after the test's setup loop.
     // (K≈4460 cycles to reach $FF41 check; 145*456+250+4460 mod 70224 = LY=1, gc=150, mode 3.)
