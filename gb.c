@@ -190,7 +190,7 @@ static void compute_mode3_extra(void) {
     if (lcd_startup_line || window_active) {
         extra = (scx_fine < 7) ? scx_fine : 8;
     } else {
-        extra = (scx_fine < 4) ? 0 : (scx_fine < 7) ? 4 : 8;
+        extra = (scx_fine < 3) ? 0 : (scx_fine < 7) ? 4 : 8;
     }
     if (gpu_control.sprite) {
         int height = gpu_control.sprite_tall ? 16 : 8;
@@ -1867,7 +1867,7 @@ void cpu_fake_init(void){
     // N=6 NOPs give mode 0/dead-zone (projected=456 overflows into LY=0 scanline).
     // With preamble=20T (NOP+JP) and gc0=400: gc0+preamble=420; transition fires at NOP 9.
     LY_REG = 0;
-    gpu_cycles = 400;
+    gpu_cycles = 404;
     ly153_vblank_active = true;
 
     // DMG0 boot ROM leaves the LCD at LY=145, gpu_cycles=250 when PC=$0100 is reached.
