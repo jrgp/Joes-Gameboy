@@ -30,7 +30,8 @@ int gpu_cycles;
 int exec_next_start_cycles; // cycles count at start of exec_next (after do_interrupts)
 int cycles; // CPU cycle counter (forward-declared here for gpu_write access)
 byte VRAM[0x2000];  // VRAM is 8KB, not 64KB
-byte LY_REG = 0;    // LY register (0xFF44)
+byte LY_REG = 0;    // LY register (0xFF44) — may show 0 mid-line-153 (hardware quirk)
+byte real_ly = 0;  // Actual scanline counter — never changes mid-scanline
 byte SCX_REG = 0;   // SCX register (0xFF43)
 byte SCY_REG = 0;   // SCY register (0xFF42)
 byte LCDC_REG = 0;  // LCDC register (0xFF40)
@@ -150,7 +151,7 @@ static int mode3_extra = 0;
 static void compute_mode3_extra(void) {
     // Window active on this scanline? Triggers a fetcher-restart penalty.
     bool window_active = gpu_control.window &&
-                         (int)RAM[WY] <= (int)LY_REG && RAM[WX] <= 166;
+                         (int)RAM[WY] <= (int)real_ly && RAM[WX] <= 166;
 
     // SCX fine-scroll penalty is quantized: the background fetcher stalls in
     // 4T groups: 0 for SCX&7=0, 4T for SCX&7=1-4, 8T for SCX&7=5-7.
@@ -171,7 +172,7 @@ static void compute_mode3_extra(void) {
             int ox  = RAM[oam + 1];
             // Sprites with OAM X >= 168 are off-screen to the right — no stall.
             if (ox >= 168) continue;
-            if ((int)LY_REG < oy || (int)LY_REG >= oy + height) continue;
+            if ((int)real_ly < oy || (int)real_ly >= oy + height) continue;
 
             // Effective screen position (clamped: OAM X < 8 → all stall at pixel 0).
             int sp = (ox >= 8) ? ox - 8 : 0;
@@ -255,6 +256,7 @@ void gpu_init(void){
     memset(VRAM, 0, 0x2000);
     gpu_cycles = 0;
     LY_REG = 0;
+    real_ly = 0;
 
     // Initialize GPU control with default values
     gpu_control.enabled = false;
@@ -284,7 +286,7 @@ void gpu_init(void){
 
 byte gpu_get_mode(void) {
     if (!gpu_control.enabled) return 0;
-    if (LY_REG >= 144) return 1;   // VBlank
+    if (real_ly >= 144) return 1;   // VBlank (includes line 153 even after LY_REG resets to 0)
     if (lcd_startup_mode0) return 0; // Startup: mode 0 visible before mode 2 begins
     if (gpu_cycles < 80) return 2;  // OAM scan
     if (gpu_cycles < 252 + mode3_extra) return 3; // LCD transfer (extended by SCX/sprite penalty)
@@ -297,10 +299,10 @@ byte gpu_get_mode(void) {
 // projected_cycles = gpu_cycles + (instr_timer_cycles - 4)
 byte gpu_get_mode_projected(int projected_cycles) {
     if (!gpu_control.enabled) return 0;
-    if (LY_REG > 144) return 1;
+    if (real_ly > 144) return 1;
     // LY=144 (VBlank start): hardware has same 8T propagation delay as mode-2.
     // proj<8 → still shows mode-0 (dead zone), proj>=8 → shows mode-1.
-    if (LY_REG == 144) return (projected_cycles < 8) ? 0 : 1;
+    if (real_ly == 144) return (projected_cycles < 8) ? 0 : 1;
     if (lcd_startup_mode0) return 0; // Startup: mode 0 visible before mode 2 begins
     if (projected_cycles < 0) projected_cycles = 0;
     if (projected_cycles >= 456) projected_cycles = 455;
@@ -323,7 +325,7 @@ byte gpu_get_mode_projected(int projected_cycles) {
 // Unlike OAM, VRAM is always accessible during mode 2.
 static bool vram_write_accessible(int proj) {
     if (!gpu_control.enabled) return true;
-    if (LY_REG >= 144)       return true;  // VBlank: always accessible
+    if (real_ly >= 144)       return true;  // VBlank: always accessible
     if (proj < 0) proj = 0;
     if (proj >= 456) proj -= 456;
     if (proj >= 88 && proj <= 259 + mode3_extra) return false; // mode-3 pixel pipeline lock
@@ -338,7 +340,7 @@ static bool vram_write_accessible(int proj) {
 // whole mode-2 window is replaced by mode-0 (no lock).
 static bool oam_write_accessible(int proj) {
     if (!gpu_control.enabled) return true;
-    if (LY_REG >= 144)       return true;  // VBlank: always accessible
+    if (real_ly >= 144)       return true;  // VBlank: always accessible
     if (lcd_startup_mode0)   return true;  // startup pseudo-mode 0: no lock
     if (proj < 0) proj = 0;
     if (proj >= 456) proj -= 456;           // wrap into next scanline
@@ -359,13 +361,13 @@ static void stat_check_irq(void) {
     byte mode_visible = gpu_get_mode_projected(gpu_cycles);
     bool line = false;
     // Mode 0: fire when both internal mode and STAT-visible mode are 0 (gc>=260).
-    if ((RAM[STAT] & 0x08) && mode == 0 && mode_visible == 0 && LY_REG < 144) line = true;
+    if ((RAM[STAT] & 0x08) && mode == 0 && mode_visible == 0 && real_ly < 144) line = true;
     // Mode 1: use STAT-visible mode-1 (fires at gc=8 of LY=144, same 8T delay as mode-2).
     if ((RAM[STAT] & 0x10) && mode_visible == 1)           line = true; // Mode 1 VBlank
     // Mode 2 OAM: use STAT-visible boundary (T=8, after 8T propagation) so the interrupt
     // fires when mode-2 actually appears in STAT, not at the hardware-internal T=0.
     // Special LY=144 case: hardware fires mode-2 STAT at LY=144 simultaneously with VBlank.
-    if ((RAM[STAT] & 0x20) && (mode_visible == 2 || (LY_REG == 144 && gpu_cycles < 80))) line = true;
+    if ((RAM[STAT] & 0x20) && (mode_visible == 2 || (real_ly == 144 && gpu_cycles < 80))) line = true;
     if ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC])         line = true; // LYC=LY
     if (line && !stat_irq_line) {
         request_interrupt(INTERRUPT_STAT);
@@ -380,7 +382,7 @@ byte gpu_read(int pos){
         // Lock window per scanline: T=84..259 (internal mode3 start + 4T, end + 8T).
         // On the startup line (lcd_startup_mode0), VRAM is accessible for T<88 then
         // locked from T=88 onward (matching the STAT-visible mode3 boundary).
-        if (gpu_control.enabled && LY_REG < 144) {
+        if (gpu_control.enabled && real_ly < 144) {
             int projected = gpu_cycles + instr_timer_cycles - 4;
             if (projected < 0) projected = 0;
             if (projected >= 456) projected = 455;
@@ -423,9 +425,10 @@ byte gpu_read(int pos){
         // after the actual counter wrap). Threshold 464 = 456T wrap + 8T latch delay.
         int ly_threshold = 464;
         if (gpu_cycles + instr_timer_cycles >= ly_threshold) {
-            byte next_ly = LY_REG + 1;
-            if (next_ly > 153) next_ly = 0;
-            return next_ly;
+            // Project to the next scanline's LY value (real_ly + 1, wrapping after 153)
+            byte next_real = (byte)(real_ly + 1);
+            if (next_real > 153) next_real = 0;
+            return next_real;
         }
         return LY_REG;
     }
@@ -463,6 +466,7 @@ void gpu_write(int pos, byte data){
         if (!was_enabled && now_enabled) {
             // LCD just turned on: start from beginning of frame.
             LY_REG = 0;
+            real_ly = 0;
             gpu_cycles = 0;
             // On DMG hardware, LCD startup begins in mode 0, not mode 2.
             // The comparison clock restarts immediately, so LYC=LY is re-evaluated.
@@ -478,6 +482,7 @@ void gpu_write(int pos, byte data){
             // LCD turned off: freeze LYC=LY flag before resetting LY
             lcd_off_lyc_flag = (LY_REG == RAM[LYC]);
             LY_REG = 0;
+            real_ly = 0;
             gpu_cycles = 0;
             window_line = 0;
             stat_irq_line = false;
@@ -670,19 +675,24 @@ void gpu_step(int _cycles){
         int ly_scanline_len = 456; // startup line fires at same T as normal lines
         gpu_cycles -= ly_scanline_len; // preserve remainder for accurate sub-scanline timing
 
-        const byte ly = ++LY_REG;
-
-        // Clear startup-line flag on first LY increment (LY=0→1)
-        if (ly == 1) lcd_startup_line = false;
-
-        if (ly == 144) {
-            // VBlank period starts; VBlank interrupt is unconditional
-            request_interrupt(INTERRUPT_VBLANK);
-        } else if (ly > 153) {
+        real_ly++;
+        if (real_ly > 153) {
+            // End of VBlank: start frame over
+            real_ly = 0;
             LY_REG = 0;
             window_line = 0;
-        } else if (ly < 144) {
-            gpu_drawline(ly);
+        } else {
+            LY_REG = real_ly;
+            // Clear startup-line flag on first LY increment (LY=0→1)
+            if (real_ly == 1) lcd_startup_line = false;
+
+            if (real_ly == 144) {
+                // VBlank period starts; VBlank interrupt is unconditional
+                request_interrupt(INTERRUPT_VBLANK);
+            } else if (real_ly < 144) {
+                gpu_drawline(real_ly);
+            }
+            // real_ly == 153: VBlank continues; LY_REG will drop to 0 after 4 T-cycles
         }
 
         // Recompute mode-3 extension for the new scanline (SCX fine-scroll + sprite penalty).
@@ -690,6 +700,13 @@ void gpu_step(int _cycles){
 
         // Fire STAT for any newly-active condition after LY change
         stat_check_irq();
+    }
+
+    // DMG LY=153 quirk: after 4 T-cycles LY_REG drops to 0 (but mode stays VBlank).
+    // This causes LYC=0 to match twice per frame: once here and once at line 0 start.
+    if (real_ly == 153 && LY_REG == 153 && gpu_cycles >= 4) {
+        LY_REG = 0;
+        stat_check_irq();  // check LYC=0 match now that LY_REG=0
     }
 
     // Check for mode transitions (internal: mode 3→0 HBlank, mode 0→2 new scanline)
@@ -722,7 +739,7 @@ static int oam_accessed_row_at(int t_offset) {
     if (!gpu_control.enabled) return -1;
 
     int projected_cycles = gpu_cycles + t_offset;
-    int projected_ly = LY_REG;
+    int projected_ly = (int)real_ly;
 
     // Handle negative projected_cycles (wrap back to previous scanline)
     while (projected_cycles < 0) {
@@ -1225,7 +1242,7 @@ byte mem_read(int pos) {
         // On the startup line (lcd_startup_mode0), the mode2 OAM scan is skipped so OAM is
         // accessible for T<88, then locked from T=88 onward (startup STAT-visible mode3 boundary).
         if (dma_active && dma_oam_locked) return 0xFF;
-        if (gpu_control.enabled && LY_REG < 144) {
+        if (gpu_control.enabled && real_ly < 144) {
             int projected = gpu_cycles + instr_timer_cycles - 4;
             if (projected < 0) projected = 0;
             if (projected >= 456) projected = 455;
@@ -1647,6 +1664,7 @@ void cpu_fake_init(void){
     // (K≈4460 cycles to reach $FF41 check; 145*456+250+4460 mod 70224 = LY=1, gc=150, mode 3.)
     if (gb_model == MODEL_DMG0) {
         LY_REG = 145;
+        real_ly = 145;
         gpu_cycles = 250;
     }
 
