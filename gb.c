@@ -1109,12 +1109,17 @@ static void timer_tick4(void) {
             }
         }
     }
-    // Serial clock: internal clock uses falling edge of timer_internal bit 9 (8192 Hz).
-    // Each falling edge shifts one bit; after 8 bits the transfer completes.
+    // Serial clock: internal clock uses falling edge of timer_internal bit 8 (8192 Hz).
+    // Bit 8 (period=512T) gives 8192 Hz = 4194304/512 Hz. Each falling edge shifts one bit.
+    // We fire 4T early (when (timer_internal & 0x1FF) == 0x1FC, i.e. 4T before the real
+    // falling edge) so the interrupt flag is set during the preceding instruction's opcode
+    // fetch, matching the GB hardware behaviour where the interrupt is checked at the START
+    // of the M1 cycle and fires before that instruction's body runs.
     if (serial_active) {
-        bool old_bit9 = (old_internal >> 9) & 1;
-        bool new_bit9 = (timer_internal >> 9) & 1;
-        if (old_bit9 && !new_bit9) {
+        bool old_bit8 = (old_internal >> 8) & 1;
+        // Fire 4T before the actual falling edge so do_interrupts() can dispatch
+        // before the next instruction executes (matching DMG hardware timing).
+        if (old_bit8 && ((timer_internal & 0x1FF) == 0x1FC)) {
             // Shift SB left, shift in 1 from unconnected external pin
             serial_sb = (serial_sb << 1) | 1;
             RAM[0xFF01] = serial_sb;
@@ -1633,7 +1638,7 @@ void cpu_fake_init(void){
             // CGB-only ROMs ($0143=$C0) expect A=$11; DMG/CGB-enhanced use $01.
             A = (cart_cgb_flag == 0xC0) ? 0x11 : 0x01;
             F = 0xB0; B = 0x00; C = 0x13; D = 0x00; E = 0xD8; H = 0x01; L = 0x4D;
-            // DMG-ABC post-boot-ROM: timer at $ABCC (DIV reads $AB after preamble).
+            // DMG-ABC post-boot-ROM: timer at $ABC8 (calibrated from boot_div-dmgABCmgb).
             timer_internal = 0xABC8;
             break;
     }
