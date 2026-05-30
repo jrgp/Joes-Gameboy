@@ -27,6 +27,8 @@ extern byte RAM[0xffff + 1];
 // GPU
 //
 int gpu_cycles;
+static bool pending_drawline = false;   // deferred scanline render (fires at T=80)
+static byte pending_draw_ly = 0;
 int exec_next_start_cycles; // cycles count at start of exec_next (after do_interrupts)
 int cycles; // CPU cycle counter (forward-declared here for gpu_write access)
 byte VRAM[0x2000];  // VRAM is 8KB, not 64KB
@@ -45,6 +47,30 @@ static int  serial_bits_remaining = 0; // bits left in current transfer (8 down 
 static byte serial_out_byte = 0;       // byte to transmit (saved at transfer start)
 bool headless = false;
 long long max_cycles = 0;
+
+// Joypad injection: list of (frame, button_state) events for headless automation.
+#define MAX_JOYPAD_EVENTS 128
+typedef struct {
+    int frame;       // GB frame number (70224 T-cycles each) to apply this event
+    int duration;    // frames to hold the buttons (default 1)
+    bool A, B, START, SELECT, UP, DOWN, LEFT, RIGHT;
+} JoypadEvent;
+static JoypadEvent joypad_events[MAX_JOYPAD_EVENTS];
+static int joypad_event_count = 0;
+
+#define MAX_SCREENSHOT_REQUESTS 32
+typedef struct {
+    int frame;
+    char filename[1024];
+    bool done;
+} ScreenshotRequest;
+static ScreenshotRequest screenshot_requests[MAX_SCREENSHOT_REQUESTS];
+static int screenshot_request_count = 0;
+
+static bool cpu_debug_range_enabled = false;
+static long long cpu_debug_start_cycle = 0;
+static long long cpu_debug_end_cycle = 0;
+static long long total_cpu_cycles = 0;
 
 typedef enum {
     MODEL_DMG = 0,   // DMG-ABC (default)
@@ -244,6 +270,7 @@ void gpu_init(void){
     memset(VRAM, 0, 0x2000);
     gpu_cycles = 0;
     LY_REG = 0;
+    pending_drawline = false;
 
     // Initialize GPU control with default values
     gpu_control.enabled = false;
@@ -482,6 +509,7 @@ void gpu_write(int pos, byte data){
             gpu_cycles = 0;
             window_line = 0;
             stat_irq_line = false;
+            pending_drawline = false;
         }
     }
     if (pos == LY) {
@@ -683,7 +711,11 @@ void gpu_step(int _cycles){
             LY_REG = 0;
             window_line = 0;
         } else if (ly < 144) {
-            gpu_drawline(ly);
+            // Defer scanline render to T=80 (end of OAM scan) so that raster
+            // effects that poll LY and write SCX/SCY during OAM scan are
+            // reflected in the rendered output, matching real hardware behaviour.
+            pending_drawline = true;
+            pending_draw_ly  = ly;
         }
 
         // Recompute mode-3 extension for the new scanline (SCX fine-scroll + sprite penalty).
@@ -691,6 +723,12 @@ void gpu_step(int _cycles){
 
         // Fire STAT for any newly-active condition after LY change
         stat_check_irq();
+    }
+
+    // Fire deferred scanline render once OAM scan is complete (T>=80).
+    if (pending_drawline && gpu_cycles >= 80) {
+        gpu_drawline(pending_draw_ly);
+        pending_drawline = false;
     }
 
     // Check for mode transitions (internal: mode 3→0 HBlank, mode 0→2 new scanline)
@@ -1563,6 +1601,7 @@ void cpu_init(void){
     H = 0;
     cycles = 0;
     instr_timer_cycles = 0;
+    total_cpu_cycles = 0;
     PC = 0;
     SP = 0;
     interrupts = false;
@@ -1582,12 +1621,33 @@ void cpu_init_debug_file(void){
 void cpu_close_debug_file(void){
   if (debug_logfile != NULL) {
     fclose(debug_logfile);
+    debug_logfile = NULL;
   }
+}
+
+void cpu_update_debug_window(long long current_total_cycles) {
+    if (!cpu_debug_range_enabled) {
+        if (debug_logfile != NULL) {
+            cpu_close_debug_file();
+        }
+        return;
+    }
+
+    bool should_log = current_total_cycles >= cpu_debug_start_cycle &&
+                      current_total_cycles < cpu_debug_end_cycle;
+    if (should_log) {
+        if (debug_logfile == NULL) {
+            cpu_init_debug_file();
+        }
+    } else if (debug_logfile != NULL) {
+        cpu_close_debug_file();
+    }
 }
 
 void cpu_fake_init(void){
     cycles = 0;
     instr_timer_cycles = 0;
+    total_cpu_cycles = 0;
     PC = 0x0100;
     SP = 0xFFFE;
     interrupts = false;
@@ -4920,6 +4980,47 @@ void sdl_display(void){
 }
 
 
+void dump_screenshot_ppm(const char *filename) {
+    FILE *fp = fopen(filename, "wb");
+    if (fp == NULL) {
+        fprintf(stderr, "Failed to open screenshot file %s: ", filename);
+        perror(NULL);
+        exit(1);
+    }
+
+    fprintf(fp, "P6\n%d %d\n255\n", VIEWPORT_WIDTH, VIEWPORT_HEIGHT);
+    for (int y = 0; y < VIEWPORT_HEIGHT; y++) {
+        for (int x = 0; x < VIEWPORT_WIDTH; x++) {
+            const uint32_t pixel = pixels[y * VIEWPORT_WIDTH + x];
+            const byte rgb[3] = {
+                (byte)((pixel >> 16) & 0xFF),
+                (byte)((pixel >> 8) & 0xFF),
+                (byte)(pixel & 0xFF),
+            };
+            fwrite(rgb, 1, sizeof(rgb), fp);
+        }
+    }
+
+    fclose(fp);
+}
+
+void maybe_dump_screenshot(int completed_frame) {
+    for (int i = 0; i < screenshot_request_count; i++) {
+        ScreenshotRequest *req = &screenshot_requests[i];
+        if (!req->done && req->frame == completed_frame) {
+            dump_screenshot_ppm(req->filename);
+            req->done = true;
+            fprintf(stderr, "[screenshot] frame %d -> %s\n", completed_frame, req->filename);
+        }
+    }
+}
+
+void maybe_dump_completed_frames(int previous_frame, int new_frame) {
+    for (int completed_frame = previous_frame; completed_frame < new_frame; completed_frame++) {
+        maybe_dump_screenshot(completed_frame);
+    }
+}
+
 bool frame_headless(void){
     static int frame_count = 0;
     frame_count++;
@@ -4935,6 +5036,7 @@ bool frame_headless(void){
                 break;
         //        return false;
             }
+            cpu_update_debug_window(total_cpu_cycles);
             instr_timer_cycles = 0;
             int prevcycles = cycles;
             do_interrupts();
@@ -4952,6 +5054,7 @@ bool frame_headless(void){
             gpu_step(cpu_cycles);
             timer_step(cpu_cycles - instr_timer_cycles);
             dma_step(cpu_cycles - instr_timer_cycles);
+            total_cpu_cycles += dispatch_cycles + cpu_cycles;
             instruction_count++;
 
             // Safety check for infinite loops
@@ -4968,9 +5071,11 @@ bool frame_headless(void){
 }
 
 bool frame(void){
+    static int completed_frame = 0;
     const uint32_t start_ticks = SDL_GetTicks();
 
     frame_headless();
+    maybe_dump_screenshot(completed_frame++);
     sdl_display();
 
     const uint32_t diff = SDL_GetTicks() - start_ticks;
@@ -5063,9 +5168,23 @@ void headless_print_blargg_a000(void) {
 
 void headless_main_impl(void) {
     long long total_cycles = 0;
+    int current_frame = 0;
+    // Hang detection: ring buffer of last 64 PCs, and consecutive-same-range counter.
+    #define HANG_RANGE 256
+    #define HANG_THRESH 2000000
+    #define PC_RING 64
+    word pc_ring[PC_RING];
+    int pc_ring_idx = 0;
+    int hang_count = 0;
+    word hang_range_min = 0;
+    memset(pc_ring, 0, sizeof(pc_ring));
+    // Instruction counting for periodic PC reports (stderr when --cycles set)
+    long long instr_count = 0;
+
     while (1) {
         if (max_cycles > 0 && total_cycles >= max_cycles) {
-            printf("\n[headless] cycle limit %lld reached, stopping\n", max_cycles);
+            printf("\n[headless] cycle limit %lld reached (frame %d), stopping\n",
+                   max_cycles, current_frame);
             break;
         }
         if (blargg_done) {
@@ -5073,19 +5192,69 @@ void headless_main_impl(void) {
             break;
         }
         // Drain blargg A004 text buffer before it overflows into WRAM ($C000+).
-        // Monitor the blargg write pointer at $D883/$D884: when it reaches $BF00
-        // (near the end of the 8KB ext_ram bank), reset it to $A004 and clear the
-        // buffer. This is safe to check after each instruction since the pointer
-        // only advances during blargg text writes (very infrequent).
         if (headless && !blargg_done &&
             ext_ram[1] == 0xDE && ext_ram[2] == 0xB0 && ext_ram[3] == 0x61) {
             uint16_t txt_ptr = ((uint16_t)RAM[0xD884] << 8) | RAM[0xD883];
             if (txt_ptr >= 0xBF00) {
-                RAM[0xD883] = 0x04;  // reset write pointer low byte → $A004
-                RAM[0xD884] = 0xA0;  // reset write pointer high byte
+                RAM[0xD883] = 0x04;
+                RAM[0xD884] = 0xA0;
                 memset(&ext_ram[4], 0, 0x2000 - 4);
             }
         }
+
+        // Update frame counter and apply joypad injection events.
+        int new_frame = (int)(total_cycles / 70224);
+        if (new_frame != current_frame) {
+            maybe_dump_completed_frames(current_frame, new_frame);
+            current_frame = new_frame;
+            // Release all buttons first, then re-apply active events.
+            joypad_buttons.A = joypad_buttons.B = false;
+            joypad_buttons.START = joypad_buttons.SELECT = false;
+            joypad_buttons.UP = joypad_buttons.DOWN = false;
+            joypad_buttons.LEFT = joypad_buttons.RIGHT = false;
+            for (int j = 0; j < joypad_event_count; j++) {
+                if (current_frame >= joypad_events[j].frame &&
+                    current_frame < joypad_events[j].frame + joypad_events[j].duration) {
+                    if (joypad_events[j].A)      joypad_buttons.A      = true;
+                    if (joypad_events[j].B)      joypad_buttons.B      = true;
+                    if (joypad_events[j].START)  joypad_buttons.START  = true;
+                    if (joypad_events[j].SELECT) joypad_buttons.SELECT = true;
+                    if (joypad_events[j].UP)     joypad_buttons.UP     = true;
+                    if (joypad_events[j].DOWN)   joypad_buttons.DOWN   = true;
+                    if (joypad_events[j].LEFT)   joypad_buttons.LEFT   = true;
+                    if (joypad_events[j].RIGHT)  joypad_buttons.RIGHT  = true;
+                }
+            }
+        }
+
+        // Hang detection: if PC stays within a HANG_RANGE-byte window for HANG_THRESH
+        // consecutive instructions, we're stuck in a tight loop.
+        word cur_pc = PC;
+        pc_ring[pc_ring_idx++ & (PC_RING - 1)] = cur_pc;
+        if (cur_pc >= hang_range_min && cur_pc < hang_range_min + HANG_RANGE) {
+            if (++hang_count >= HANG_THRESH) {
+                fprintf(stderr, "\n[headless] HANG DETECTED at frame %d (total cycles %lld)\n",
+                        current_frame, total_cycles);
+                fprintf(stderr, "[headless] PC window: $%04X-$%04X\n",
+                        hang_range_min, (word)(hang_range_min + HANG_RANGE - 1));
+                fprintf(stderr, "[headless] Last PCs: ");
+                for (int j = 0; j < PC_RING; j++) {
+                    int idx = (pc_ring_idx - PC_RING + j) & (PC_RING - 1);
+                    fprintf(stderr, "$%04X ", pc_ring[idx]);
+                }
+                fprintf(stderr, "\n");
+                fprintf(stderr, "[headless] Regs: A=%02X B=%02X C=%02X D=%02X E=%02X H=%02X L=%02X SP=%04X\n",
+                        A, B, C, D, E, H, L, SP);
+                fprintf(stderr, "[headless] STAT=%02X LY=%02X IE=%02X IF=%02X IME=%d\n",
+                        RAM[STAT], LY_REG, RAM[INTERRUPT_ENABLE], RAM[INTERRUPT_FLAGS], interrupts);
+                break;
+            }
+        } else {
+            hang_range_min = cur_pc & ~(HANG_RANGE - 1);
+            hang_count = 1;
+        }
+
+        cpu_update_debug_window(total_cycles);
         instr_timer_cycles = 0;
         int prevcycles = cycles;
         do_interrupts();
@@ -5103,7 +5272,14 @@ void headless_main_impl(void) {
         timer_step(cpu_cycles - instr_timer_cycles);
         apu_step(cpu_cycles);
         dma_step(cpu_cycles - instr_timer_cycles);
-        total_cycles += cpu_cycles;
+        total_cycles += dispatch_cycles + cpu_cycles;
+        total_cpu_cycles = total_cycles;
+        instr_count++;
+        // Every 5M instructions, emit a progress line to stderr so we can see where game is.
+        if (max_cycles > 0 && (instr_count % 5000000) == 0) {
+            fprintf(stderr, "[trace] frame=%d instr=%lld cycles=%lld PC=$%04X A=%02X B=%02X\n",
+                    current_frame, instr_count, total_cycles, PC, A, B);
+        }
     }
     // If cycle limit hit but A000 output present, still print it
     if (!blargg_done) {
@@ -5137,6 +5313,76 @@ int main(int argc, char **argv){
       else if (strcmp(m, "sgb2") == 0) gb_model = MODEL_SGB2;
       else if (strcmp(m, "cgb") == 0 || strcmp(m, "gbc") == 0 || strcmp(m, "S") == 0) gb_model = MODEL_GBC;
       else { fprintf(stderr, "Unknown model: %s\n", m); return 1; }
+    } else if (strcmp(argv[i], "--joypad") == 0) {
+      // Format: frame:BUTTONS[:duration] e.g. "120:A" or "200:START:3" or "300:A,B:2"
+      if (i + 1 >= argc) {
+        fprintf(stderr, "Missing value for --joypad\n");
+        return 1;
+      }
+      if (joypad_event_count >= MAX_JOYPAD_EVENTS) {
+        fprintf(stderr, "Too many --joypad events (max %d)\n", MAX_JOYPAD_EVENTS);
+        return 1;
+      }
+      const char *spec = argv[++i];
+      JoypadEvent *ev = &joypad_events[joypad_event_count++];
+      memset(ev, 0, sizeof(*ev));
+      ev->duration = 1;
+      // Parse frame number
+      char *end;
+      ev->frame = (int)strtol(spec, &end, 10);
+      if (*end != ':') { fprintf(stderr, "Bad --joypad format: %s\n", spec); return 1; }
+      // Parse buttons (comma-separated) and optional duration after second colon
+      const char *p = end + 1;
+      while (*p && *p != ':') {
+          if (strncasecmp(p, "START", 5) == 0)   { ev->START  = true; p += 5; }
+          else if (strncasecmp(p, "SELECT", 6) == 0) { ev->SELECT = true; p += 6; }
+          else if (strncasecmp(p, "RIGHT", 5) == 0)  { ev->RIGHT  = true; p += 5; }
+          else if (strncasecmp(p, "LEFT", 4) == 0)   { ev->LEFT   = true; p += 4; }
+          else if (strncasecmp(p, "DOWN", 4) == 0)   { ev->DOWN   = true; p += 4; }
+          else if (strncasecmp(p, "UP", 2) == 0)     { ev->UP     = true; p += 2; }
+          else if (*p == 'A' || *p == 'a')            { ev->A      = true; p++; }
+          else if (*p == 'B' || *p == 'b')            { ev->B      = true; p++; }
+          else if (*p == ',') p++;
+          else { fprintf(stderr, "Unknown button in --joypad: %c\n", *p); return 1; }
+      }
+      if (*p == ':') ev->duration = (int)strtol(p + 1, NULL, 10);
+    } else if (strcmp(argv[i], "--screenshot") == 0) {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "Missing value for --screenshot\n");
+        return 1;
+      }
+      if (screenshot_request_count >= MAX_SCREENSHOT_REQUESTS) {
+        fprintf(stderr, "Too many --screenshot requests (max %d)\n", MAX_SCREENSHOT_REQUESTS);
+        return 1;
+      }
+      const char *spec = argv[++i];
+      char *end;
+      ScreenshotRequest *req = &screenshot_requests[screenshot_request_count++];
+      memset(req, 0, sizeof(*req));
+      req->frame = (int)strtol(spec, &end, 10);
+      if (*end != ':' || end[1] == '\0') {
+        fprintf(stderr, "Bad --screenshot format: %s\n", spec);
+        return 1;
+      }
+      strncpy(req->filename, end + 1, sizeof(req->filename) - 1);
+    } else if (strcmp(argv[i], "--cpu-debug-range") == 0) {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "Missing value for --cpu-debug-range\n");
+        return 1;
+      }
+      const char *spec = argv[++i];
+      char *end;
+      cpu_debug_start_cycle = strtoll(spec, &end, 10);
+      if (*end != ':') {
+        fprintf(stderr, "Bad --cpu-debug-range format: %s\n", spec);
+        return 1;
+      }
+      cpu_debug_end_cycle = strtoll(end + 1, &end, 10);
+      if (*end != '\0' || cpu_debug_end_cycle <= cpu_debug_start_cycle) {
+        fprintf(stderr, "Bad --cpu-debug-range format: %s\n", spec);
+        return 1;
+      }
+      cpu_debug_range_enabled = true;
     } else if (strncmp(argv[i], "--", 2) == 0) {
       fprintf(stderr, "Unknown option: %s\n", argv[i]);
       return 1;
@@ -5144,8 +5390,6 @@ int main(int argc, char **argv){
       rom = argv[i];
     }
   }
-// cpu_init_debug_file(); // Disabled to prevent interference
-
   cart_load(rom);
 
   mem_init();
