@@ -169,6 +169,10 @@ static bool lcd_startup_mode0 = false;
 // Used to apply a later LY projection threshold on the startup line (+12T vs normal).
 static bool lcd_startup_line = false;
 
+// LYC=LY STAT interrupt fires 8T after the LY change (same propagation delay as mode-2).
+// When set, the LYC check in stat_check_irq is suppressed; it fires in gpu_step at T>=8.
+static bool lyc_delayed = false;
+
 // Per-scanline mode-3 extension (T-cycles beyond 172).
 // Accounts for fine-scroll penalty (SCX & 7) and sprite-fetch stall (6T per sprite, max 10).
 // Recomputed at the start of each new scanline; used by all mode-boundary queries.
@@ -320,6 +324,7 @@ void gpu_init(void){
     RAM[SCY] = 0;
     lcd_startup_mode0 = false;
     lcd_startup_line = false;
+    lyc_delayed = false;
 
     // Test tile data initialization removed - let the ROM provide its own data
 }
@@ -465,7 +470,7 @@ static void stat_check_irq(void) {
     // Mode 2 OAM: fires at T=8 (8T after hardware mode 2 start).
     // Special LY=144 case: fires simultaneously with VBlank for STAT purposes.
     if ((RAM[STAT] & 0x20) && (mode_irq == 2 || (LY_REG == 144 && gpu_cycles < 80))) line = true;
-    if ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC])             line = true; // LYC=LY
+    if ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC] && !lyc_delayed) line = true; // LYC=LY
     if (line && !stat_irq_line) {
         request_interrupt(INTERRUPT_STAT);
     }
@@ -527,6 +532,12 @@ byte gpu_read(int pos){
         // after the actual counter wrap). Threshold 464 = 456T wrap + 8T latch delay.
         // During ly153_vblank_active the scanline end does NOT increment LY (it stays 0),
         // so suppress the projection to prevent erroneously returning LY=1.
+
+        // LY=153 stub: the short 4T scanline is visible only for T=0..3 (gc=452..455
+        // with the stub starting at gc=452). At T=4 (gc+instr >= 456) LY transitions to 0.
+        if (ly153_vblank_active && LY_REG == 153 && gpu_cycles + instr_timer_cycles >= 456) {
+            return 0;
+        }
         int ly_threshold = 464;
         if (!ly153_vblank_active && gpu_cycles + instr_timer_cycles >= ly_threshold) {
             byte next_ly = LY_REG + 1;
@@ -558,8 +569,22 @@ void gpu_write(int pos, byte data){
     if (pos == STAT) {
         // Bits 3-6 are writable; bits 0-2 are read-only
         RAM[STAT] = (RAM[STAT] & 0x87) | (data & 0x78);
-        // Writing STAT may activate a new interrupt condition immediately (DMG behaviour)
-        stat_check_irq();
+        // When STAT is written: update stat_irq_line to reflect the new condition WITHOUT
+        // firing an interrupt. This avoids false rising-edge triggers when STAT interrupt
+        // bits are set while a condition (e.g. mode-2 OAM) is already active.
+        // The correct interrupt fires on the next natural rising edge (e.g. T=8 of next
+        // scanline). The DMG write-glitch (fires during mode-0/mode-1) is handled
+        // separately by the stat_write_glitch logic (currently not implemented).
+        {
+            byte mode_i = gpu_get_mode_for_irq(gpu_cycles);
+            byte mode_v = gpu_get_mode_projected(gpu_cycles);
+            bool new_line = false;
+            if ((RAM[STAT] & 0x08) && mode_v == 0 && mode_i == 0 && LY_REG < 144) new_line = true;
+            if ((RAM[STAT] & 0x10) && mode_i == 1) new_line = true;
+            if ((RAM[STAT] & 0x20) && (mode_i == 2 || (LY_REG == 144 && gpu_cycles < 80))) new_line = true;
+            if ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC] && !lyc_delayed) new_line = true;
+            stat_irq_line = new_line;
+        }
     }
     if (pos == LCDC) {
         bool was_enabled = bit_check(LCDC_REG, 7);
@@ -578,6 +603,8 @@ void gpu_write(int pos, byte data){
             // Queue LY=0 for rendering (fires at T=80 of the first scanline).
             pending_drawline = true;
             pending_draw_ly  = 0;
+            // Delay LYC interrupt to T=8 of the startup scanline.
+            lyc_delayed = true;
             // Restore stat_irq_line from the frozen pre-disable state so
             // rising-edge detection works correctly on re-enable:
             // if LYC=LY was true before disable and is still true now, no new interrupt.
@@ -591,6 +618,7 @@ void gpu_write(int pos, byte data){
             gpu_cycles = 0;
             window_line = 0;
             ly153_vblank_active = false;  // clear VBlank continuation on LCD off
+            lyc_delayed = false;
             stat_irq_line = false;
             pending_drawline = false;
         }
@@ -821,12 +849,19 @@ void gpu_step(int _cycles){
         gpu_cycles -= ly_scanline_len; // preserve remainder for accurate sub-scanline timing
 
         if (ly153_vblank_active) {
-            // End of 452T LY=0/VBlank continuation after LY=153 short scanline.
-            // VBlank ends here; OAM scan for LY=0 is about to begin.
-            ly153_vblank_active = false;
-            window_line = 0;
-            pending_drawline = true;
-            pending_draw_ly  = 0;
+            if (LY_REG == 153) {
+                // End of 4T LY=153 stub. Transition to LY=0 VBlank continuation (452T).
+                // Add 4T offset so the next gc>=456 fires after 452T, not 456T.
+                LY_REG = 0;
+                gpu_cycles += 4;
+                lyc_delayed = true; // LYC=0 interrupt fires 8T into the continuation
+            } else {
+                // End of 452T LY=0/VBlank continuation. OAM scan for LY=0 begins.
+                ly153_vblank_active = false;
+                window_line = 0;
+                pending_drawline = true;
+                pending_draw_ly  = 0;
+            }
         } else {
             const byte ly = ++LY_REG;
 
@@ -839,14 +874,17 @@ void gpu_step(int _cycles){
             } else if (ly == 153) {
                 // LY=153 lasts only 4T on real DMG hardware, then LY→0 while
                 // VBlank (mode 1) continues for 452T more. Add 452T so the next
-                // gpu_cycles>=456 fires 4T from now.
+                // gpu_cycles>=456 fires 4T from now (end of the 4T LY=153 stub).
                 gpu_cycles += 452;
                 if (gpu_cycles >= 456) {
-                    // 4T window already elapsed within this step; transition immediately.
+                    // 4T stub already elapsed within this step; immediately set LY=0.
+                    // Add 4T compensation so the 452T continuation ends at the right time.
                     gpu_cycles -= 456;
                     LY_REG = 0;
+                    gpu_cycles += 4;
                 }
                 ly153_vblank_active = true;
+                lyc_delayed = true; // LYC interrupt fires 8T after LY=153/0 boundary
             } else if (ly > 153) {
                 // Fallback (shouldn't normally reach here with ly153 logic above)
                 LY_REG = 0;
@@ -862,6 +900,9 @@ void gpu_step(int _cycles){
             }
         }
 
+        // LYC interrupt fires 8T after scanline start (same propagation as mode 2).
+        // Set lyc_delayed before calling stat_check_irq so LYC is suppressed here.
+        if (!lyc_delayed) lyc_delayed = true; // new scanline: delay LYC to T=8
         // Fire STAT for any newly-active condition after LY change
         stat_check_irq();
     }
@@ -898,6 +939,13 @@ void gpu_step(int _cycles){
 
     // LYC coincidence: check whenever LY changed
     if (LY_REG != prev_ly) {
+        stat_check_irq();
+    }
+
+    // Fire delayed LYC interrupt at T>=8 of new scanline (8T propagation, same as mode-2).
+    // lyc_delayed is set whenever LY changes; cleared here once gpu_cycles reaches T=8.
+    if (lyc_delayed && gpu_cycles >= 8) {
+        lyc_delayed = false;
         stat_check_irq();
     }
 }
