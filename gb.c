@@ -174,6 +174,11 @@ static bool lcd_startup_line = false;
 static bool lyc_delayed = false;
 static bool vblank_irq_delayed = false;
 
+// STAT interrupt mode-irq transition 4T HALT wakeup delay.
+// Set when a HBlank (mode_irq 3→0) or OAM (mode_irq *→2) transition fires STAT IF;
+// cleared at the start of the next gpu_step so that HALT wakes one M-cycle after STAT rises.
+static bool stat_halt_delay = false;
+
 // Projected T-cycle of last CPU write to IF (0xFF0F) — used to suppress OAM/LYC
 // STAT interrupt when CPU write and interrupt fire in the same T-cycle (CPU wins).
 static int if_cleared_proj_gc = -100;
@@ -941,6 +946,8 @@ void gpu_drawline(byte ly){
 void gpu_step(int _cycles){
     if (!gpu_control.enabled) return;
 
+    stat_halt_delay = false;  // clear one-shot HALT delay from previous STAT mode transition
+
     byte prev_mode = gpu_get_mode();
     byte prev_mode_visible = gpu_get_mode_projected(gpu_cycles);
     byte prev_mode_irq = gpu_get_mode_for_irq(gpu_cycles);
@@ -1045,6 +1052,22 @@ void gpu_step(int _cycles){
     // This fires mode-2 STAT interrupt at T=4 and mode-0 STAT interrupt at T=260.
     byte new_mode_irq = gpu_get_mode_for_irq(gpu_cycles);
     if (new_mode_irq != prev_mode_irq) {
+        // HBlank (3→0) and OAM (*→2) mode-irq transitions require a 4T HALT wakeup
+        // delay: hardware HALT wakes one M-cycle (4T) after STAT IF rises.
+        // For OAM (gc=4): always apply (4%4==0, exact boundary).
+        // For HBlank: apply only when HBlank fires at or 1T before a 4T boundary
+        //   (260+mode3_extra)%4 ∈ {0,3}.  When extra is 1-2 or 5-6 (startup-line
+        //   sub-4T values), detection already lands at the right 4T boundary — no
+        //   extra delay needed.  On regular lines mode3_extra ∈ {0,4,8} so
+        //   (260+extra)%4==0 always, meaning the delay always applies there.
+        if (new_mode_irq == 2) {
+            stat_halt_delay = true;  // OAM: always exact 4T boundary
+        } else if (new_mode_irq == 0) {
+            int hblank_gc = 260 + mode3_extra;
+            if ((hblank_gc % 4) == 0 || (hblank_gc % 4) == 3) {
+                stat_halt_delay = true;
+            }
+        }
         stat_check_irq();
     }
 
@@ -2286,6 +2309,8 @@ void do_interrupts(void){
   byte halt_check_flags = flag_bits;
   if (halted && timer_halt_delay)
       halt_check_flags &= ~INTERRUPT_TIMER;
+  if (halted && stat_halt_delay)
+      halt_check_flags &= ~INTERRUPT_STAT;
   if ((halt_check_flags & enabled_bits) > 0) {
       halted = false;
   }
