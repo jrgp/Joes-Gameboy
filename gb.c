@@ -571,8 +571,9 @@ void gpu_render_tile(byte ly, int xprefix, int tile_row, byte tileIndex,
 
     int row = flipy ? (7 - tile_row) : tile_row;
     const int addr = data_base + actual * 16;
-    const byte hi = mem_read(addr + row * 2);
-    const byte lo = mem_read(addr + row * 2 + 1);
+    // PPU has direct VRAM access (bypasses the CPU-facing lock that returns 0xFF).
+    const byte hi = VRAM[(addr + row * 2)     - 0x8000];
+    const byte lo = VRAM[(addr + row * 2 + 1) - 0x8000];
 
     for (int i = 0; i < 8; i++) {
         int x = xprefix + (flipx ? (7 - i) : i);
@@ -594,7 +595,7 @@ void gpu_draw_bg(byte ly){
         for (int tile = 0; tile <= 20; tile++) {
             int map_x = ((SCX_REG / 8) + tile) & 31;
             int map_y = ((ly + SCY_REG) / 8) & 31;
-            int tileIndex = mem_read(gpu_control.bgtilemap + (map_y * 32) + map_x);
+            int tileIndex = VRAM[(gpu_control.bgtilemap + (map_y * 32) + map_x) - 0x8000];
             gpu_render_tile(ly, tile * 8 - fine_x, fine_y, tileIndex,
                             BGP, false, false, false, false);
         }
@@ -611,13 +612,17 @@ void gpu_draw_window(byte ly){
     int wy = RAM[WY];
     int wx = (int)RAM[WX] - 7;  // WX=7 means window starts at x=0
     if (ly < wy) return;
+    // WX >= 167 (wx >= 160) means window is completely off-screen.
+    // On real hardware, window_line only increments when at least one window pixel
+    // is rendered. If WX is off-screen, no pixels draw and window_line must not advance.
+    if (wx >= VIEWPORT_WIDTH) return;
     int fine_y = window_line & 7;
     for (int tile = 0; tile <= 20; tile++) {
         int xpos = wx + tile * 8;
         if (xpos >= VIEWPORT_WIDTH) break;
         int map_x = tile & 31;
         int map_y = (window_line / 8) & 31;
-        int tileIndex = mem_read(gpu_control.windowtilemap + (map_y * 32) + map_x);
+        int tileIndex = VRAM[(gpu_control.windowtilemap + (map_y * 32) + map_x) - 0x8000];
         gpu_render_tile(ly, xpos, fine_y, tileIndex,
                         BGP, false, false, false, false);
     }
@@ -627,16 +632,44 @@ void gpu_draw_window(byte ly){
 void gpu_draw_sprites(byte ly){
     if (!gpu_control.sprite) return;
     int sprite_height = gpu_control.sprite_tall ? 16 : 8;
-    // Render in reverse OAM order so sprite 0 has highest priority (drawn last = on top)
-    for (int i = 39; i >= 0; i--) {
+
+    // DMG: at most 10 sprites per scanline (OAM scan selects first 10 visible by Y overlap,
+    // filtering out fully off-screen sprites by X). After selection, DMG renders by
+    // X-coordinate priority: smaller X wins; OAM index breaks ties (lower = higher priority).
+    int visible[10];
+    int n_visible = 0;
+    for (int i = 0; i < 40 && n_visible < 10; i++) {
         const int oam = 0xFE00 + (i * 4);
-        const int oam_y = RAM[oam];        // byte 0 = Y pos (actual_y + 16)
-        const int oam_x = RAM[oam + 1];    // byte 1 = X pos (actual_x + 8)
+        const int oam_y = RAM[oam];
+        const int oam_x = RAM[oam + 1];
         const int actual_y = oam_y - 16;
         const int actual_x = oam_x - 8;
-
         if (actual_y > (int)ly || (actual_y + sprite_height) <= (int)ly) continue;
         if (actual_x <= -8 || actual_x >= VIEWPORT_WIDTH) continue;
+        visible[n_visible++] = i;
+    }
+
+    // Sort visible[] by X descending (largest X rendered first = lowest priority);
+    // tiebreak: OAM index descending. This ensures smallest-X / lowest-OAM index
+    // sprites are drawn last (on top), matching DMG hardware priority.
+    for (int a = 0; a < n_visible - 1; a++) {
+        for (int b = a + 1; b < n_visible; b++) {
+            int xa = RAM[0xFE00 + visible[a]*4 + 1];
+            int xb = RAM[0xFE00 + visible[b]*4 + 1];
+            if (xb > xa || (xb == xa && visible[b] > visible[a])) {
+                int tmp = visible[a]; visible[a] = visible[b]; visible[b] = tmp;
+            }
+        }
+    }
+
+    // Render sprites in sorted order (lowest priority first, highest priority last).
+    for (int s = 0; s < n_visible; s++) {
+        const int i = visible[s];
+        const int oam = 0xFE00 + (i * 4);
+        const int oam_y = RAM[oam];
+        const int oam_x = RAM[oam + 1];
+        const int actual_y = oam_y - 16;
+        const int actual_x = oam_x - 8;
 
         byte tileIndex = RAM[oam + 2];
         const byte flags = RAM[oam + 3];
@@ -660,8 +693,8 @@ void gpu_draw_sprites(byte ly){
             // Render pixel-by-pixel with priority check
             int row = tile_row;
             const int addr = 0x8000 + tileIndex * 16;
-            const byte hi = mem_read(addr + row * 2);
-            const byte lo = mem_read(addr + row * 2 + 1);
+            const byte hi = VRAM[(addr + row * 2)     - 0x8000];
+            const byte lo = VRAM[(addr + row * 2 + 1) - 0x8000];
             for (int pi = 0; pi < 8; pi++) {
                 int x = actual_x + (flipx ? (7 - pi) : pi);
                 if (x < 0 || x >= VIEWPORT_WIDTH) continue;
@@ -681,6 +714,7 @@ void gpu_draw_sprites(byte ly){
 }
 
 void gpu_drawline(byte ly){
+    memset(bg_scanline, 0, sizeof(bg_scanline));  // reset per-scanline BG color tracker
     gpu_draw_bg(ly);
     gpu_draw_window(ly);
     gpu_draw_sprites(ly);
