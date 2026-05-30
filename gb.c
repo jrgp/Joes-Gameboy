@@ -1570,26 +1570,38 @@ byte mem_read(int pos) {
         // Echo RAM: $E000-$FDFF mirrors WRAM $C000-$DDFF
         return RAM[pos - 0x2000];
     } else if (pos >= 0xFE00 && pos <= 0xFE9F) {
-        // OAM: returns 0xFF when DMA is active (after startup grace) or while the PPU owns
-        // the OAM bus. DMG read locking keeps LY>=1 reads blocked through the early part of
-        // mode 2, exposes a short boundary window, then blocks again for mode 3.
+        // OAM read lock: 0xFF when DMA active or PPU owns the OAM bus.
+        // Lock window on normal lines: T=0..259 (modes 2+3).
+        // Accessible: T=260..455 (mode 0 HBlank).
+        // Overflow (projected>=456): 4T dead zone at start of next scanline
+        // (T=0..3 accessible, T=4..259 locked) — EXCEPT after the startup line
+        // where the first real mode-2 OAM scan starts with no dead zone.
+        // Startup line lock: T=88..259 only (mode 2 skipped on startup).
         if (dma_active && dma_oam_locked) return 0xFF;
         if (gpu_control.enabled && LY_REG < 144) {
             int projected = gpu_cycles + instr_timer_cycles - 4;
             if (projected < 0) projected = 0;
             bool locked;
-            bool startup = lcd_startup_line;
-            if (startup && projected > 456) {
-                startup = false;
-                projected -= 456;
-            }
-            if (startup) {
-                locked = (projected >= 88 && projected <= 259 + mode3_extra);
-            } else if (ly153_vblank_active && projected < 456) {
-                locked = false;
+            if (ly153_vblank_active) {
+                locked = false;  // VBlank continuation: OAM accessible
+            } else if (lcd_startup_line) {
+                if (projected >= 456) {
+                    // Overflowing into LY=1: first real mode-2 scan, no dead zone.
+                    projected -= 456;
+                    locked = (projected < 260 + mode3_extra);
+                } else {
+                    // On the startup line itself: only mode-3 window is locked.
+                    locked = (projected >= 88 && projected < 260 + mode3_extra);
+                }
             } else {
-                projected %= 456;
-                locked = ((projected <= 87) || (projected >= 96 && projected <= 259 + mode3_extra));
+                // Normal visible scanline (LY=1..143).
+                if (projected >= 456) {
+                    // Overflow into next scanline: 4T propagation dead zone.
+                    projected -= 456;
+                    locked = (projected >= 4 && projected < 260 + mode3_extra);
+                } else {
+                    locked = (projected < 260 + mode3_extra);
+                }
             }
             if (locked) return 0xFF;
         }
