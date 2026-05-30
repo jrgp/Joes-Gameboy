@@ -27,11 +27,6 @@ extern byte RAM[0xffff + 1];
 // GPU
 //
 int gpu_cycles;
-static bool pending_drawline = false;   // deferred scanline render (fires at T=80)
-static byte pending_draw_ly = 0;
-// LY=153 short-scanline hardware quirk: LY=153 lasts only 4T on DMG, then LY→0 while
-// VBlank (mode 1) continues for 452T more before OAM scan starts for LY=0.
-static bool ly153_vblank_active = false;
 int exec_next_start_cycles; // cycles count at start of exec_next (after do_interrupts)
 int cycles; // CPU cycle counter (forward-declared here for gpu_write access)
 byte VRAM[0x2000];  // VRAM is 8KB, not 64KB
@@ -50,31 +45,6 @@ static int  serial_bits_remaining = 0; // bits left in current transfer (8 down 
 static byte serial_out_byte = 0;       // byte to transmit (saved at transfer start)
 bool headless = false;
 long long max_cycles = 0;
-bool gbmicrotest_mode = false; // read 0xFF82 for pass/fail after cycle limit
-
-// Joypad injection: list of (frame, button_state) events for headless automation.
-#define MAX_JOYPAD_EVENTS 128
-typedef struct {
-    int frame;       // GB frame number (70224 T-cycles each) to apply this event
-    int duration;    // frames to hold the buttons (default 1)
-    bool A, B, START, SELECT, UP, DOWN, LEFT, RIGHT;
-} JoypadEvent;
-static JoypadEvent joypad_events[MAX_JOYPAD_EVENTS];
-static int joypad_event_count = 0;
-
-#define MAX_SCREENSHOT_REQUESTS 32
-typedef struct {
-    int frame;
-    char filename[1024];
-    bool done;
-} ScreenshotRequest;
-static ScreenshotRequest screenshot_requests[MAX_SCREENSHOT_REQUESTS];
-static int screenshot_request_count = 0;
-
-static bool cpu_debug_range_enabled = false;
-static long long cpu_debug_start_cycle = 0;
-static long long cpu_debug_end_cycle = 0;
-static long long total_cpu_cycles = 0;
 
 typedef enum {
     MODEL_DMG = 0,   // DMG-ABC (default)
@@ -169,27 +139,6 @@ static bool lcd_startup_mode0 = false;
 // Used to apply a later LY projection threshold on the startup line (+12T vs normal).
 static bool lcd_startup_line = false;
 
-// LYC=LY STAT interrupt fires 8T after the LY change.
-// When set, the LYC check in stat_check_irq is suppressed; it fires in gpu_step at T>=8.
-static bool lyc_delayed = false;
-static bool vblank_irq_delayed = false;
-
-// STAT interrupt mode-irq transition 4T HALT wakeup delay.
-// Set when a HBlank (mode_irq 3→0) or OAM (mode_irq *→2) transition fires STAT IF;
-// cleared at the start of the next gpu_step so that HALT wakes one M-cycle after STAT rises.
-static bool stat_halt_delay = false;
-
-// Set when STAT is written while gpu_cycles is in the dead zone (gc<4).
-// Cleared before each instruction. Suppresses the dead-zone→OAM interrupt that would
-// otherwise fire at gc=4 within the same scanline (hardware does not fire OAM interrupt
-// when STAT is written during the dead zone of the current scanline).
-static bool stat_written_in_dead_zone = false;
-
-// Projected T-cycle of last CPU write to IF (0xFF0F) — used to suppress OAM/LYC
-// STAT interrupt when CPU write and interrupt fire in the same T-cycle (CPU wins).
-static int if_cleared_proj_gc = -100;
-static int if_cleared_proj_ly = -100;
-
 // Per-scanline mode-3 extension (T-cycles beyond 172).
 // Accounts for fine-scroll penalty (SCX & 7) and sprite-fetch stall (6T per sprite, max 10).
 // Recomputed at the start of each new scanline; used by all mode-boundary queries.
@@ -198,21 +147,10 @@ static int mode3_extra = 0;
 // Recompute mode3_extra for the current LY_REG.
 // Must be called right after LY_REG is updated so OAM is scanned for the correct line.
 static void compute_mode3_extra(void) {
-    // Window active on this scanline?
-    bool window_active = gpu_control.window && (int)RAM[WY] <= (int)LY_REG && RAM[WX] <= 166;
-
-    // SCX fine-scroll penalty depends on context:
-    // - Startup line OR window-active line: exact SCX%8 T-cycles (SCX%8=7 → 8T).
-    // - Normal lines without window: quantized in 4T groups (0-3=0T, 4-6=4T, 7=8T).
-    //   When the window is active, the fetcher transitions mid-scanline, which preserves
-    //   the exact SCX penalty rather than allowing it to be absorbed.
+    // SCX fine-scroll penalty is quantized: the background fetcher stalls in
+    // 4T groups: 0 for SCX&7=0, 4T for SCX&7=1-4, 8T for SCX&7=5-7.
     int scx_fine = SCX_REG & 7;
-    int extra;
-    if (lcd_startup_line || window_active) {
-        extra = (scx_fine < 7) ? scx_fine : 8;
-    } else {
-        extra = (scx_fine < 3) ? 0 : (scx_fine < 7) ? 4 : 8;
-    }
+    int extra = (scx_fine == 0) ? 0 : (scx_fine <= 4 ? 4 : 8);
     if (gpu_control.sprite) {
         int height = gpu_control.sprite_tall ? 16 : 8;
         // Track background fetcher phase (0-7) and current pixel position
@@ -300,20 +238,12 @@ static void compute_mode3_extra(void) {
         }
     }
     mode3_extra = extra;
-    // Window startup penalty: adds 4T when the window will render on this line.
-    if (window_active) {
-        mode3_extra += 4;
-    }
 }
 
 void gpu_init(void){
     memset(VRAM, 0, 0x2000);
     gpu_cycles = 0;
     LY_REG = 0;
-    pending_drawline = false;
-    ly153_vblank_active = false;
-    if_cleared_proj_gc = -100;
-    if_cleared_proj_ly = -100;
 
     // Initialize GPU control with default values
     gpu_control.enabled = false;
@@ -326,31 +256,23 @@ void gpu_init(void){
     gpu_control.bgtilemap = 0x9800;
     gpu_control.windowtilemap = 0x9800;
 
-    // Set LCDC directly without going through gpu_write (which would trigger LCD startup mode).
-    // The LCD was on continuously during the boot ROM; there's no "just turned on" event here.
-    LCDC_REG = 0x91;  // LCD enabled, BG tile data at 0x8000, BG enabled
-    gpu_parse_control(0x91);
-    RAM[LCDC] = 0x91;
+    // Set default LCDC register value (display enabled, background enabled)
+    mem_write(LCDC, 0x91);  // 10010001 - LCD enabled, BG enabled, BG tile data at 0x8000, BG tile map at 0x9800
 
     // Set default BGP register (white, light gray, dark gray, black)
-    BGP_REG = 0xFC;
-    RAM[BGP] = 0xFC;
+    mem_write(BGP, 0xFC);   // 11111100 - white, light gray, dark gray, black
+
+    // printf("GPU initialized: LCDC=0x%02X, BGP=0x%02X\n", mem_read(LCDC), mem_read(BGP));
 
     // Initialize scroll registers
-    SCX_REG = 0;
-    SCY_REG = 0;
-    RAM[SCX] = 0;
-    RAM[SCY] = 0;
-    lcd_startup_mode0 = false;
-    lcd_startup_line = false;
-    lyc_delayed = false;
+    mem_write(SCX, 0);
+    mem_write(SCY, 0);
 
     // Test tile data initialization removed - let the ROM provide its own data
 }
 
 byte gpu_get_mode(void) {
     if (!gpu_control.enabled) return 0;
-    if (ly153_vblank_active) return 1;  // LY=153→0 transition: VBlank continues
     if (LY_REG >= 144) return 1;   // VBlank
     if (lcd_startup_mode0) return 0; // Startup: mode 0 visible before mode 2 begins
     if (gpu_cycles < 80) return 2;  // OAM scan
@@ -362,135 +284,27 @@ byte gpu_get_mode(void) {
 // Used for STAT reads and OAM/VRAM locking — accounts for the T-cycle within
 // the current instruction at which the memory access actually occurs.
 // projected_cycles = gpu_cycles + (instr_timer_cycles - 4)
-//
-// STAT-visible boundaries:
-//   Dead zone: T=0..3 shows mode-0 before PPU OAM-scan is visible (4T propagation delay)
-//   Mode 2: T=4..83 (80T)
-//   Mode 3: T=84..255+mode3_extra (172T base)
-//   Mode 0 HBlank: T=256+mode3_extra..455 (200T base)
-//
-// Overflow: projected can exceed 456T (end of scanline), meaning the read fires in the
-// next scanline. The overflow is handled differently for ly153 vs normal lines:
-//   ly153_vblank_active: projected >= 456 → samples into LY=0 first scanline
-//   Normal LY<144: projected > 456 → samples into next scanline
-static byte gpu_projected_mode_from_cycles(int pc) {
-    if (lcd_startup_mode0) return 0;
-    if (pc < 0) pc = 0;
-    if (pc < 4)   return 0;  // dead zone: T=0..3 (4T propagation delay)
-    if (pc < 84)  return 2;  // OAM scan visible: T=4..83
-    if (pc < 260 + mode3_extra) return 3;  // LCD transfer: T=84..259
-    return 0;                 // HBlank: T=256..455
-}
-
-// For STAT register reads: 8T propagation delay (wider dead zone than transition detection).
-// STAT-visible boundaries:
-//   Dead zone: T=0..7 shows mode-0 (8T propagation delay)
-//   Mode 2: T=8..87 (80T OAM scan)
-//   Mode 3: T=88..259+mode3_extra
-//   Mode 0 HBlank: T=260+mode3_extra..455
-static byte gpu_projected_mode_for_stat_read(int pc) {
-    if (pc < 0) pc = 0;
-    if (pc < 8)   return 0;  // dead zone: T=0..7 (8T propagation delay)
-    if (pc < 88)  return 2;  // OAM scan visible: T=8..87
-    if (pc < 260 + mode3_extra) return 3;  // LCD transfer: T=88..259
-    return 0;                              // HBlank: T=260..455
-}
-
 byte gpu_get_mode_projected(int projected_cycles) {
     if (!gpu_control.enabled) return 0;
-    if (ly153_vblank_active) {
-        // VBlank continues until end of the 456T LY=153 scanline slot.
-        // projected >= 456 means the read samples into the first LY=0 scanline.
-        if (projected_cycles < 456) return 1;
-        return gpu_projected_mode_from_cycles(projected_cycles - 456);
-    }
     if (LY_REG > 144) return 1;
-    // LY=144 (VBlank start): 4T propagation delay — proj<4 still shows mode-0.
-    if (LY_REG == 144) return (projected_cycles < 4) ? 0 : 1;
-    if (lcd_startup_line) {
-        // The first LCD-on scanline shows startup mode 0 before entering mode 3;
-        // mode 2 is skipped entirely on this line.
-        if (projected_cycles > 456) return gpu_projected_mode_from_cycles(projected_cycles - 456);
-        if (projected_cycles < 84) return 0;
-        if (projected_cycles < 260 + mode3_extra) return 3;
-        return 0;
-    }
-    // Normal visible scanline: projected > 456 overflows into next scanline.
-    // projected == 456 is still the last T of current HBlank.
-    if (projected_cycles > 456) return gpu_projected_mode_from_cycles(projected_cycles - 456);
-    return gpu_projected_mode_from_cycles(projected_cycles);
-}
-
-// Returns the STAT-register-visible mode for STAT reads (8T dead zone + ly153 Phase A/B).
-static byte gpu_get_mode_for_stat_read(int projected_cycles) {
-    if (!gpu_control.enabled) return 0;
-    if (ly153_vblank_active) {
-        // VBlank continues until T=455 of Phase B (LY=0 continuation).
-        if (projected_cycles < 456) return 1;
-        int pc = projected_cycles - 456;
-        if (LY_REG == 153) {
-            // Phase A (4T LY=153 stub): projecting past end into Phase B (452T VBlank
-            // continuation). Phase B is still VBlank for its full 452T duration.
-            if (pc < 452) return 1;
-            pc -= 452;  // past Phase B — fall through to new-frame transition
-        }
-        // Phase B end: VBlank→OAM transition.
-        // T=0..3: VBlank still visible (propagation delay keeps mode 1).
-        // T=4..7: dead zone (mode 0).
-        // T=8+: normal OAM scan visible.
-        if (pc < 4) return 1;
-        if (pc < 8) return 0;
-        return gpu_projected_mode_for_stat_read(pc);
-    }
-    if (LY_REG > 144) return 1;
-    if (LY_REG == 144) return (projected_cycles < 4) ? 0 : 1;
-    if (lcd_startup_line) {
-        if (projected_cycles > 456) return gpu_projected_mode_for_stat_read(projected_cycles - 456);
-        if (projected_cycles < 88) return 0;
-        if (projected_cycles < 260 + mode3_extra) return 3;
-        return 0;
-    }
-    if (projected_cycles > 456) return gpu_projected_mode_for_stat_read(projected_cycles - 456);
-    return gpu_projected_mode_for_stat_read(projected_cycles);
-}
-
-// Returns the GPU mode at a projected cycle for STAT INTERRUPT firing.
-// STAT interrupts fire with 4T propagation delay for OAM/LYC, 8T for HBlank.
-// Boundaries: dead zone T=0..3, mode 2 T=4..87, mode 3 T=88..259, mode 0 T=260..455.
-static byte gpu_irq_mode_from_cycles(int pc) {
-    if (lcd_startup_mode0) return 0;
-    if (pc < 0) pc = 0;
-    if (pc < 4)   return 0;  // dead zone: T=0..3 (4T propagation)
-    if (pc < 88)  return 2;  // OAM scan: T=4..87
-    if (pc < 260 + mode3_extra) return 3;  // LCD transfer: T=88..259
-    return 0;                 // HBlank: T=260..455
-}
-static byte gpu_get_mode_for_irq(int gc) {
-    if (!gpu_control.enabled) return 0;
-    if (ly153_vblank_active) {
-        if (gc < 456) return 1;
-        return gpu_irq_mode_from_cycles(gc - 456);
-    }
-    if (LY_REG > 144) return 1;
-    if (LY_REG == 144) return (gc < 8) ? 0 : 1;
-    if (gc > 456) return gpu_irq_mode_from_cycles(gc - 456);
-    return gpu_irq_mode_from_cycles(gc);
+    // LY=144 (VBlank start): hardware has same 8T propagation delay as mode-2.
+    // proj<8 → still shows mode-0 (dead zone), proj>=8 → shows mode-1.
+    if (LY_REG == 144) return (projected_cycles < 8) ? 0 : 1;
+    if (lcd_startup_mode0) return 0; // Startup: mode 0 visible before mode 2 begins
+    if (projected_cycles < 0) projected_cycles = 0;
+    if (projected_cycles >= 456) projected_cycles = 455;
+    // STAT-visible mode boundaries include propagation delays vs hardware-internal.
+    // Hardware:     mode2=0..80,  mode3=80..252,  mode0=252..456
+    // STAT-visible: mode2=8..88,  mode3=88..260,  mode0=0..8 and 260..456
+    // The 8T propagation at mode-2 start creates a brief mode-0 window at each
+    // line's beginning before the PPU's OAM-scan lock is visible in STAT.
+    if (projected_cycles < 8) return 0;
+    if (projected_cycles < 88) return 2;
+    if (projected_cycles < 260 + mode3_extra) return 3;
+    return 0;
 }
 
 // Mode calculation for OAM/VRAM read locking and interrupt comparisons.
-// Uses the hardware-internal mode boundaries (80/252) which differ from the
-// STAT-read-visible boundaries (84/260) by 4-8T propagation delay.
-static byte gpu_get_mode_for_lock(int projected_cycles) {
-    if (!gpu_control.enabled) return 0;
-    if (ly153_vblank_active) return 1;  // LY=153→0 transition: VBlank continues
-    if (LY_REG >= 144) return 1;
-    if (lcd_startup_mode0) return 0;
-    if (projected_cycles < 0) projected_cycles = 0;
-    if (projected_cycles >= 456) projected_cycles = 455;
-    if (projected_cycles < 80) return 2;
-    if (projected_cycles < 252 + mode3_extra) return 3;
-    return 0;
-}
 
 // Returns true if VRAM writes are allowed at the projected T-cycle offset.
 // VRAM is locked only during mode 3 (pixel pipeline), starting 8T after mode 3 begins
@@ -500,10 +314,7 @@ static bool vram_write_accessible(int proj) {
     if (!gpu_control.enabled) return true;
     if (LY_REG >= 144)       return true;  // VBlank: always accessible
     if (proj < 0) proj = 0;
-    if (ly153_vblank_active && proj < 456) return true; // VBlank continuation
-    bool startup = lcd_startup_line;
-    proj %= 456;
-    if (startup) return !(proj >= 88 && proj <= 259 + mode3_extra);
+    if (proj >= 456) proj -= 456;
     if (proj >= 88 && proj <= 259 + mode3_extra) return false; // mode-3 pixel pipeline lock
     return true;
 }
@@ -512,15 +323,14 @@ static bool vram_write_accessible(int proj) {
 //   T=8..83   — mode-2 OAM-scan bus held by PPU
 //   T=88..259 — mode-3 pixel pipeline + first 8T of mode-0 OAM bus hold
 // Accessible windows: T<8, T=84..87 (1 M-cycle gap between locks), T>=260.
-// On the LCD startup line, mode 2 is skipped — OAM is accessible until T=88.
+// On the LCD startup line lcd_startup_mode0 is true until T=82, so the
+// whole mode-2 window is replaced by mode-0 (no lock).
 static bool oam_write_accessible(int proj) {
     if (!gpu_control.enabled) return true;
     if (LY_REG >= 144)       return true;  // VBlank: always accessible
+    if (lcd_startup_mode0)   return true;  // startup pseudo-mode 0: no lock
     if (proj < 0) proj = 0;
-    if (ly153_vblank_active && proj < 456) return true; // VBlank continuation
-    bool startup = lcd_startup_line;
-    proj %= 456;
-    if (startup) return !(proj >= 88 && proj <= 259 + mode3_extra);
+    if (proj >= 456) proj -= 456;           // wrap into next scanline
     if (proj >= 8  && proj <= 83)  return false; // mode-2 bus lock
     if (proj >= 88 && proj <= 259 + mode3_extra) return false; // mode-3 / early mode-0 lock
     return true;
@@ -533,38 +343,21 @@ static void stat_check_irq(void) {
         stat_irq_line = false;
         return;
     }
-    // STAT interrupts use 4T propagation delay for OAM and 8T for HBlank/VBlank/LYC.
-    // This preserves hblank_int and int_vblank1 timing with mode 0 interrupt at T=260.
     byte mode = gpu_get_mode();
-    byte mode_irq = gpu_get_mode_for_irq(gpu_cycles);
+    // STAT-visible mode uses 8T propagation delay (same as STAT register reads).
+    byte mode_visible = gpu_get_mode_projected(gpu_cycles);
     bool line = false;
-    // Mode 0 HBlank: fires at T=260+mode3_extra via mode_irq 3→0 transition (8T propagation).
-    // The `mode_irq == 0` guard fires at T=260 (not T=252) matching hardware IRQ timing.
-    // The `mode == 0` guard prevents false fires during the T=0..7 dead zone.
-    if ((RAM[STAT] & 0x08) && mode == 0 && mode_irq == 0 && LY_REG < 144) line = true;
-    // Mode 1 VBlank: fires at T=8 of LY=144 (8T propagation).
-    if ((RAM[STAT] & 0x10) && mode_irq == 1)                  line = true;
-    // Mode 2 OAM: fires at T=4 (4T after hardware mode 2 start).
-    // The LCD startup line skips mode 2, so suppress the normal mode_irq==2 case there.
-    // LY=144 keeps the internal OAM condition for STAT purposes, but it is not visible
-    // until T=4 and ends with the normal OAM-scan window.
-    if ((RAM[STAT] & 0x20) && ((!lcd_startup_line && mode_irq == 2) || (LY_REG == 144 && gpu_cycles >= 4 && gpu_cycles < 84))) line = true;
-    if ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC] && !lyc_delayed) line = true; // LYC=LY
+    // Mode 0: fire when both internal mode and STAT-visible mode are 0 (gc>=260).
+    if ((RAM[STAT] & 0x08) && mode == 0 && mode_visible == 0 && LY_REG < 144) line = true;
+    // Mode 1: use STAT-visible mode-1 (fires at gc=8 of LY=144, same 8T delay as mode-2).
+    if ((RAM[STAT] & 0x10) && mode_visible == 1)           line = true; // Mode 1 VBlank
+    // Mode 2 OAM: use STAT-visible boundary (T=8, after 8T propagation) so the interrupt
+    // fires when mode-2 actually appears in STAT, not at the hardware-internal T=0.
+    // Special LY=144 case: hardware fires mode-2 STAT at LY=144 simultaneously with VBlank.
+    if ((RAM[STAT] & 0x20) && (mode_visible == 2 || (LY_REG == 144 && gpu_cycles < 80))) line = true;
+    if ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC])         line = true; // LYC=LY
     if (line && !stat_irq_line) {
-        bool suppressed = false;
-        if (if_cleared_proj_ly == LY_REG) {
-            bool oam_firing = (mode_irq == 2);
-            bool vblank_firing = ((RAM[STAT] & 0x10) && mode_irq == 1 && LY_REG == 144);
-            bool lyc_firing = ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC] && !lyc_delayed && gpu_cycles < 88);
-            // Suppress OAM fire only if LYC is NOT independently firing at gc=8.
-            // When IF is cleared at proj=4, it suppresses the OAM at gc=4. But if LYC fires
-            // at gc=8 and OAM condition is still true (mode=2), don't suppress the LYC fire.
-            if (oam_firing && !lyc_firing && if_cleared_proj_gc == 4) suppressed = true;
-            if ((vblank_firing || lyc_firing) && if_cleared_proj_gc == 8) suppressed = true;
-        }
-        if (!suppressed) {
-            request_interrupt(INTERRUPT_STAT);
-        }
+        request_interrupt(INTERRUPT_STAT);
     }
     stat_irq_line = line;
 }
@@ -579,18 +372,11 @@ byte gpu_read(int pos){
         if (gpu_control.enabled && LY_REG < 144) {
             int projected = gpu_cycles + instr_timer_cycles - 4;
             if (projected < 0) projected = 0;
+            if (projected >= 456) projected = 455;
             bool locked;
-            bool startup = lcd_startup_line;
-            if (startup && projected > 456) {
-                startup = false;
-                projected -= 456;
-            }
-            if (startup) {
-                locked = (projected >= 88 && projected < 260 + mode3_extra);
-            } else if (ly153_vblank_active && projected < 456) {
-                locked = false;
+            if (lcd_startup_mode0) {
+                locked = (projected >= 88);
             } else {
-                projected %= 456;
                 locked = (projected >= 84 && projected < 260 + mode3_extra);
             }
             if (locked) return 0xFF;
@@ -603,17 +389,16 @@ byte gpu_read(int pos){
             byte lyc_flag = lcd_off_lyc_flag ? 0x04 : 0x00;
             return 0x80 | (RAM[STAT] & 0x78) | lyc_flag;
         }
-        // Use projected mode with 8T STAT-read boundary (Phase A/B for ly153).
+        // Use projected mode: STAT samples the mode at end of M2 of the read instruction.
+        // projected = gpu_cycles + (instr_timer_cycles - 4) gives the T-cycle of the read.
         int projected = gpu_cycles + instr_timer_cycles - 4;
-        byte mode = gpu_get_mode_for_stat_read(projected);
-        // LYC coincidence flag is cleared near end of visible scanlines (hardware pre-clear).
-        // Hardware clears LYC comparison at projected > 456 (strictly after LY<144 scanline end)
-        // to prevent spurious STAT interrupts during the LY counter wrap.
-        // At projected == 456 (T=0 of next scanline dead zone), LYC is still visible.
+        byte mode = gpu_get_mode_projected(projected);
+        // LYC comparison: during the first 8T of a new scanline (projected < 8, outside
+        // the startup mode0 window), the hardware comparison circuit is in a reset/dead
+        // zone — the flag reads as 0 regardless of LYC. After 8T, normal comparison resumes.
         byte lyc_flag;
-        if (!lcd_startup_mode0 &&
-                (projected > 456 && LY_REG < 144 && !ly153_vblank_active)) {
-            lyc_flag = 0x00; // pre-clear: LYC comparison cleared after scanline end
+        if (!lcd_startup_mode0 && projected < 8) {
+            lyc_flag = 0x00; // dead zone: LYC comparison cleared at line start
         } else {
             lyc_flag = (LY_REG == RAM[LYC]) ? 0x04 : 0x00;
         }
@@ -625,16 +410,8 @@ byte gpu_read(int pos){
         // startup and normal lines), but the LY register read reflects the new value
         // only 8T later (the hardware comparison clock latches the new LY one M-cycle
         // after the actual counter wrap). Threshold 464 = 456T wrap + 8T latch delay.
-        // During ly153_vblank_active the scanline end does NOT increment LY (it stays 0),
-        // so suppress the projection to prevent erroneously returning LY=1.
-
-        // LY=153 stub: the short 4T scanline is visible only for T=0..3 (gc=452..455
-        // with the stub starting at gc=452). At T=4 (gc+instr >= 456) LY transitions to 0.
-        if (ly153_vblank_active && LY_REG == 153 && gpu_cycles + instr_timer_cycles >= 456) {
-            return 0;
-        }
         int ly_threshold = 464;
-        if (!ly153_vblank_active && gpu_cycles + instr_timer_cycles >= ly_threshold) {
+        if (gpu_cycles + instr_timer_cycles >= ly_threshold) {
             byte next_ly = LY_REG + 1;
             if (next_ly > 153) next_ly = 0;
             return next_ly;
@@ -662,62 +439,10 @@ void gpu_write(int pos, byte data){
         VRAM[pos - 0x8000] = data;
     }
     if (pos == STAT) {
-        // Track dead-zone STAT writes to suppress spurious dead-zone→OAM transitions.
-        if (gpu_cycles < 4) stat_written_in_dead_zone = true;
-        // DMG STAT write glitch: writing STAT with all interrupt-enable bits cleared
-        // (data & 0x78 == 0) while in modes 0, 1, or 2 (not pixel mode 3) causes a
-        // momentary STAT IRQ pulse on hardware, firing a spurious interrupt.
-        //
-        // The glitch fires if:
-        //   - data & 0x78 == 0 (all enable bits being cleared — writing non-zero enable
-        //     bits to STAT during HBlank does NOT trigger the glitch on hardware)
-        //   - AND the current PPU mode is not pixel-render (mode 3):
-        //     - HBlank (mode 0): gc >= 260, projected gc also in HBlank range
-        //     - OAM scan (mode 2): gc in [4..87], LY < 144
-        //     - VBlank (mode 1): LY 144..153
-        //   - Dead zone gc=0..3 at scanline start does NOT trigger the glitch
-        // On the LCD startup line, the initial ~36 T-cycles behave like mode 0.
-        if (gpu_control.enabled && (data & 0x78) == 0) {
-            bool glitch;
-            if (lcd_startup_mode0) {
-                glitch = (gpu_cycles < 36);
-            } else {
-                int proj_tc = gpu_cycles + instr_timer_cycles - 4;
-                bool hblank_at_m1 = (gpu_cycles >= 260 && LY_REG < 144);
-                bool hblank_at_m3 = (proj_tc >= 260 && proj_tc < 456 && LY_REG < 144);
-                bool in_oam       = (gpu_cycles >= 4 && gpu_cycles < 88 && LY_REG < 144);
-                bool in_vblank    = (LY_REG >= 144 && LY_REG <= 153);
-                glitch = hblank_at_m1 || hblank_at_m3 || in_oam || in_vblank;
-            }
-            if (glitch) {
-                request_interrupt(INTERRUPT_STAT);
-            }
-        }
         // Bits 3-6 are writable; bits 0-2 are read-only
         RAM[STAT] = (RAM[STAT] & 0x87) | (data & 0x78);
-        // When STAT is written: update stat_irq_line to reflect the new condition WITHOUT
-        // firing an interrupt. This avoids false rising-edge triggers when STAT interrupt
-        // bits are set while a condition (e.g. mode-2 OAM) is already active.
-        // For the OAM condition: use the INTERNAL mode (gpu_get_mode()) in addition to the
-        // propagation-delayed mode_irq. At gc=0..3 (dead zone), the internal mode is already
-        // OAM (mode 2) while mode_irq is still 0. If STAT is written with OAM enable during
-        // the dead zone, stat_irq_line should reflect the internal OAM state (true), so that
-        // the rising edge does NOT re-fire when mode_irq transitions to 2 at gc=4.
-        // Without this, the lyc_delayed and mode-transition stat_check_irq calls at gc=4..8
-        // would see a 0→1 transition and fire a spurious OAM interrupt.
-        {
-            byte mode_i = gpu_get_mode_for_irq(gpu_cycles);
-            byte mode_v = gpu_get_mode_projected(gpu_cycles);
-            byte mode_int = gpu_get_mode();  // internal mode without propagation delay
-            bool new_line = false;
-            if ((RAM[STAT] & 0x08) && mode_v == 0 && mode_i == 0 && LY_REG < 144) new_line = true;
-            if ((RAM[STAT] & 0x10) && mode_i == 1) new_line = true;
-            // OAM: use internal mode so that dead-zone writes (gc=0..3, internal mode=2)
-            // set stat_irq_line=true, preventing a spurious interrupt at gc=4.
-            if ((RAM[STAT] & 0x20) && ((!lcd_startup_line && (mode_i == 2 || mode_int == 2)) || (LY_REG == 144 && gpu_cycles >= 4 && gpu_cycles < 84))) new_line = true;
-            if ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC] && !lyc_delayed) new_line = true;
-            stat_irq_line = new_line;
-        }
+        // Writing STAT may activate a new interrupt condition immediately (DMG behaviour)
+        stat_check_irq();
     }
     if (pos == LCDC) {
         bool was_enabled = bit_check(LCDC_REG, 7);
@@ -728,16 +453,10 @@ void gpu_write(int pos, byte data){
             // LCD just turned on: start from beginning of frame.
             LY_REG = 0;
             gpu_cycles = 0;
-            ly153_vblank_active = false;  // fresh start, not in VBlank continuation
             // On DMG hardware, LCD startup begins in mode 0, not mode 2.
             // The comparison clock restarts immediately, so LYC=LY is re-evaluated.
             lcd_startup_mode0 = true;
             lcd_startup_line = true;
-            // Queue LY=0 for rendering (fires at T=80 of the first scanline).
-            pending_drawline = true;
-            pending_draw_ly  = 0;
-            // Delay LYC interrupt to T=8 of the startup scanline.
-            lyc_delayed = true;
             // Restore stat_irq_line from the frozen pre-disable state so
             // rising-edge detection works correctly on re-enable:
             // if LYC=LY was true before disable and is still true now, no new interrupt.
@@ -750,10 +469,7 @@ void gpu_write(int pos, byte data){
             LY_REG = 0;
             gpu_cycles = 0;
             window_line = 0;
-            ly153_vblank_active = false;  // clear VBlank continuation on LCD off
-            lyc_delayed = false;
             stat_irq_line = false;
-            pending_drawline = false;
         }
     }
     if (pos == LY) {
@@ -771,9 +487,6 @@ void gpu_write(int pos, byte data){
     }
     if (pos == BGP) {
         BGP_REG = data;
-    }
-    if (pos == WX || pos == WY) {
-        RAM[pos] = data;
     }
     if (data > 0) {
  //       printf("wrote %x to %x\n", data, pos);
@@ -812,9 +525,8 @@ void gpu_render_tile(byte ly, int xprefix, int tile_row, byte tileIndex,
 
     int row = flipy ? (7 - tile_row) : tile_row;
     const int addr = data_base + actual * 16;
-    // PPU has direct VRAM access (bypasses the CPU-facing lock that returns 0xFF).
-    const byte hi = VRAM[(addr + row * 2)     - 0x8000];
-    const byte lo = VRAM[(addr + row * 2 + 1) - 0x8000];
+    const byte hi = mem_read(addr + row * 2);
+    const byte lo = mem_read(addr + row * 2 + 1);
 
     for (int i = 0; i < 8; i++) {
         int x = xprefix + (flipx ? (7 - i) : i);
@@ -836,8 +548,8 @@ void gpu_draw_bg(byte ly){
         for (int tile = 0; tile <= 20; tile++) {
             int map_x = ((SCX_REG / 8) + tile) & 31;
             int map_y = ((ly + SCY_REG) / 8) & 31;
-            int tileIndex = VRAM[(gpu_control.bgtilemap + (map_y * 32) + map_x) - 0x8000];
-            gpu_render_tile(ly, tile * 8 - fine_x, fine_y, tileIndex,
+            int tileIndex = mem_read(gpu_control.bgtilemap + (map_y * 32) + map_x);
+            gpu_render_tile(ly, tile * 8 - fine_x, fine_y, (byte)tileIndex,
                             BGP, false, false, false, false);
         }
     } else {
@@ -853,18 +565,14 @@ void gpu_draw_window(byte ly){
     int wy = RAM[WY];
     int wx = (int)RAM[WX] - 7;  // WX=7 means window starts at x=0
     if (ly < wy) return;
-    // WX >= 167 (wx >= 160) means window is completely off-screen.
-    // On real hardware, window_line only increments when at least one window pixel
-    // is rendered. If WX is off-screen, no pixels draw and window_line must not advance.
-    if (wx >= VIEWPORT_WIDTH) return;
     int fine_y = window_line & 7;
     for (int tile = 0; tile <= 20; tile++) {
         int xpos = wx + tile * 8;
         if (xpos >= VIEWPORT_WIDTH) break;
         int map_x = tile & 31;
         int map_y = (window_line / 8) & 31;
-        int tileIndex = VRAM[(gpu_control.windowtilemap + (map_y * 32) + map_x) - 0x8000];
-        gpu_render_tile(ly, xpos, fine_y, tileIndex,
+        int tileIndex = mem_read(gpu_control.windowtilemap + (map_y * 32) + map_x);
+        gpu_render_tile(ly, xpos, fine_y, (byte)tileIndex,
                         BGP, false, false, false, false);
     }
     window_line++;
@@ -873,44 +581,16 @@ void gpu_draw_window(byte ly){
 void gpu_draw_sprites(byte ly){
     if (!gpu_control.sprite) return;
     int sprite_height = gpu_control.sprite_tall ? 16 : 8;
-
-    // DMG: at most 10 sprites per scanline (OAM scan selects first 10 visible by Y overlap,
-    // filtering out fully off-screen sprites by X). After selection, DMG renders by
-    // X-coordinate priority: smaller X wins; OAM index breaks ties (lower = higher priority).
-    int visible[10];
-    int n_visible = 0;
-    for (int i = 0; i < 40 && n_visible < 10; i++) {
+    // Render in reverse OAM order so sprite 0 has highest priority (drawn last = on top)
+    for (int i = 39; i >= 0; i--) {
         const int oam = 0xFE00 + (i * 4);
-        const int oam_y = RAM[oam];
-        const int oam_x = RAM[oam + 1];
+        const int oam_y = RAM[oam];        // byte 0 = Y pos (actual_y + 16)
+        const int oam_x = RAM[oam + 1];    // byte 1 = X pos (actual_x + 8)
         const int actual_y = oam_y - 16;
         const int actual_x = oam_x - 8;
+
         if (actual_y > (int)ly || (actual_y + sprite_height) <= (int)ly) continue;
         if (actual_x <= -8 || actual_x >= VIEWPORT_WIDTH) continue;
-        visible[n_visible++] = i;
-    }
-
-    // Sort visible[] by X descending (largest X rendered first = lowest priority);
-    // tiebreak: OAM index descending. This ensures smallest-X / lowest-OAM index
-    // sprites are drawn last (on top), matching DMG hardware priority.
-    for (int a = 0; a < n_visible - 1; a++) {
-        for (int b = a + 1; b < n_visible; b++) {
-            int xa = RAM[0xFE00 + visible[a]*4 + 1];
-            int xb = RAM[0xFE00 + visible[b]*4 + 1];
-            if (xb > xa || (xb == xa && visible[b] > visible[a])) {
-                int tmp = visible[a]; visible[a] = visible[b]; visible[b] = tmp;
-            }
-        }
-    }
-
-    // Render sprites in sorted order (lowest priority first, highest priority last).
-    for (int s = 0; s < n_visible; s++) {
-        const int i = visible[s];
-        const int oam = 0xFE00 + (i * 4);
-        const int oam_y = RAM[oam];
-        const int oam_x = RAM[oam + 1];
-        const int actual_y = oam_y - 16;
-        const int actual_x = oam_x - 8;
 
         byte tileIndex = RAM[oam + 2];
         const byte flags = RAM[oam + 3];
@@ -934,8 +614,8 @@ void gpu_draw_sprites(byte ly){
             // Render pixel-by-pixel with priority check
             int row = tile_row;
             const int addr = 0x8000 + tileIndex * 16;
-            const byte hi = VRAM[(addr + row * 2)     - 0x8000];
-            const byte lo = VRAM[(addr + row * 2 + 1) - 0x8000];
+            const byte hi = mem_read(addr + row * 2);
+            const byte lo = mem_read(addr + row * 2 + 1);
             for (int pi = 0; pi < 8; pi++) {
                 int x = actual_x + (flipx ? (7 - pi) : pi);
                 if (x < 0 || x >= VIEWPORT_WIDTH) continue;
@@ -955,7 +635,6 @@ void gpu_draw_sprites(byte ly){
 }
 
 void gpu_drawline(byte ly){
-    memset(bg_scanline, 0, sizeof(bg_scanline));  // reset per-scanline BG color tracker
     gpu_draw_bg(ly);
     gpu_draw_window(ly);
     gpu_draw_sprites(ly);
@@ -964,16 +643,8 @@ void gpu_drawline(byte ly){
 void gpu_step(int _cycles){
     if (!gpu_control.enabled) return;
 
-    stat_halt_delay = false;  // clear one-shot HALT delay from previous STAT mode transition
-
-    // Remember if we started this step in the dead zone (gc=0..3).
-    // Used with stat_written_in_dead_zone to suppress spurious OAM interrupt when
-    // STAT is written in the dead zone and the same gpu_step crosses into OAM.
-    bool prev_gc_in_dead_zone = (gpu_cycles < 4);
-
     byte prev_mode = gpu_get_mode();
     byte prev_mode_visible = gpu_get_mode_projected(gpu_cycles);
-    byte prev_mode_irq = gpu_get_mode_for_irq(gpu_cycles);
     int prev_ly = LY_REG;
     gpu_cycles += _cycles;
 
@@ -988,74 +659,26 @@ void gpu_step(int _cycles){
         int ly_scanline_len = 456; // startup line fires at same T as normal lines
         gpu_cycles -= ly_scanline_len; // preserve remainder for accurate sub-scanline timing
 
-        if (ly153_vblank_active) {
-            if (LY_REG == 153) {
-                // End of 4T LY=153 stub. Transition to LY=0 VBlank continuation (452T).
-                // Add 4T offset so the next gc>=456 fires after 452T, not 456T.
-                LY_REG = 0;
-                gpu_cycles += 4;
-                lyc_delayed = true; // LYC=0 interrupt fires 8T into the continuation
-            } else {
-                // End of 452T LY=0/VBlank continuation. OAM scan for LY=0 begins.
-                ly153_vblank_active = false;
-                window_line = 0;
-                pending_drawline = true;
-                pending_draw_ly  = 0;
-            }
-        } else {
-            const byte ly = ++LY_REG;
+        const byte ly = ++LY_REG;
 
-            // Clear startup-line flag on first LY increment (LY=0→1)
-            if (ly == 1) lcd_startup_line = false;
+        // Clear startup-line flag on first LY increment (LY=0→1)
+        if (ly == 1) lcd_startup_line = false;
 
-            if (ly == 144) {
-                // The VBlank interrupt becomes visible one M-cycle into LY=144.
-                vblank_irq_delayed = true;
-            } else if (ly == 153) {
-                // LY=153 lasts only 4T on real DMG hardware, then LY→0 while
-                // VBlank (mode 1) continues for 452T more. Add 452T so the next
-                // gpu_cycles>=456 fires 4T from now (end of the 4T LY=153 stub).
-                gpu_cycles += 452;
-                if (gpu_cycles >= 456) {
-                    // 4T stub already elapsed within this step; immediately set LY=0.
-                    // Add 4T compensation so the 452T continuation ends at the right time.
-                    gpu_cycles -= 456;
-                    LY_REG = 0;
-                    gpu_cycles += 4;
-                }
-                ly153_vblank_active = true;
-                lyc_delayed = true; // LYC interrupt fires 8T after LY=153/0 boundary
-            } else if (ly > 153) {
-                // Fallback (shouldn't normally reach here with ly153 logic above)
-                LY_REG = 0;
-                window_line = 0;
-                pending_drawline = true;
-                pending_draw_ly  = 0;
-            } else if (ly < 144) {
-                // Defer scanline render to T=80 (end of OAM scan) so that raster
-                // effects that poll LY and write SCX/SCY during OAM scan are
-                // reflected in the rendered output, matching real hardware behaviour.
-                pending_drawline = true;
-                pending_draw_ly  = ly;
-            }
+        if (ly == 144) {
+            // VBlank period starts; VBlank interrupt is unconditional
+            request_interrupt(INTERRUPT_VBLANK);
+        } else if (ly > 153) {
+            LY_REG = 0;
+            window_line = 0;
+        } else if (ly < 144) {
+            gpu_drawline(ly);
         }
 
-        // LYC interrupt fires 8T after scanline start (same propagation as mode 2).
-        // Set lyc_delayed before calling stat_check_irq so LYC is suppressed here.
-        if (!lyc_delayed) lyc_delayed = true; // new scanline: delay LYC to T=8
+        // Recompute mode-3 extension for the new scanline (SCX fine-scroll + sprite penalty).
+        compute_mode3_extra();
+
         // Fire STAT for any newly-active condition after LY change
         stat_check_irq();
-    }
-
-
-    // Fire deferred scanline render once OAM scan is complete (T>=80).
-    // Also recompute mode3_extra here so that SCX writes during OAM scan (mode 2)
-    // are captured before mode 3 starts. This handles both mid-scanline SCX changes
-    // and the LCD startup line (where no LY transition fires the recompute).
-    if (pending_drawline && gpu_cycles >= 80) {
-        compute_mode3_extra();
-        gpu_drawline(pending_draw_ly);
-        pending_drawline = false;
     }
 
     // Check for mode transitions (internal: mode 3→0 HBlank, mode 0→2 new scanline)
@@ -1064,59 +687,16 @@ void gpu_step(int _cycles){
         stat_check_irq();
     }
 
-    // Check for STAT-visible mode transitions (4T propagation delay vs internal).
-    // This fires mode-2 STAT interrupt at T=4 (not T=0) when mode-2 becomes visible in STAT.
+    // Check for STAT-visible mode transitions (8T propagation delay vs internal).
+    // This fires mode-2 STAT interrupt at T=8 (not T=0) when mode-2 becomes visible in STAT.
     byte new_mode_visible = gpu_get_mode_projected(gpu_cycles);
-    // Suppress dead-zone→OAM transition when STAT was written in the dead zone of this
-    // same scanline. Hardware does not fire OAM interrupt in this case.
-    bool suppress_dead_zone_oam = stat_written_in_dead_zone && prev_gc_in_dead_zone && (LY_REG == prev_ly);
     if (new_mode_visible != prev_mode_visible) {
-        if (!(suppress_dead_zone_oam && new_mode_visible == 2)) {
-            stat_check_irq();
-        }
-    }
-
-    // Check for STAT-interrupt mode transitions (4T for OAM, 8T for HBlank).
-    // This fires mode-2 STAT interrupt at T=4 and mode-0 STAT interrupt at T=260.
-    byte new_mode_irq = gpu_get_mode_for_irq(gpu_cycles);
-    if (new_mode_irq != prev_mode_irq) {
-        // HBlank (3→0) and OAM (*→2) mode-irq transitions require a 4T HALT wakeup
-        // delay: hardware HALT wakes one M-cycle (4T) after STAT IF rises.
-        // For OAM (gc=4): always apply (4%4==0, exact boundary).
-        // For HBlank: apply only when HBlank fires at or 1T before a 4T boundary
-        //   (260+mode3_extra)%4 ∈ {0,3}.  When extra is 1-2 or 5-6 (startup-line
-        //   sub-4T values), detection already lands at the right 4T boundary — no
-        //   extra delay needed.  On regular lines mode3_extra ∈ {0,4,8} so
-        //   (260+extra)%4==0 always, meaning the delay always applies there.
-        if (new_mode_irq == 2) {
-            stat_halt_delay = true;  // OAM: always exact 4T boundary
-        } else if (new_mode_irq == 0) {
-            int hblank_gc = 260 + mode3_extra;
-            if ((hblank_gc % 4) == 0 || (hblank_gc % 4) == 3) {
-                stat_halt_delay = true;
-            }
-        }
-        if (!(suppress_dead_zone_oam && new_mode_irq == 2)) {
-            stat_check_irq();
-        }
+        stat_check_irq();
     }
 
     // LYC coincidence: check whenever LY changed
     if (LY_REG != prev_ly) {
         stat_check_irq();
-    }
-
-    // Fire delayed LYC interrupt at T>=8 of new scanline (8T propagation).
-    // lyc_delayed is set whenever LY changes; cleared here once gpu_cycles reaches T=8.
-    if (lyc_delayed && gpu_cycles >= 8) {
-        lyc_delayed = false;
-        stat_check_irq();
-    }
-    if (vblank_irq_delayed && LY_REG == 144 && gpu_cycles >= 8) {
-        vblank_irq_delayed = false;
-        if (!(if_cleared_proj_ly == LY_REG && if_cleared_proj_gc == 8)) {
-            request_interrupt(INTERRUPT_VBLANK);
-        }
     }
 }
 
@@ -1152,11 +732,11 @@ static int oam_accessed_row_at(int t_offset) {
 }
 
 static word oam_read_word(byte *oam, int offset) {
-    return (word)oam[offset] | ((word)oam[offset + 1] << 8);
+    return (word)((word)oam[offset] | ((word)oam[offset + 1] << 8));
 }
 static void oam_write_word(byte *oam, int offset, word val) {
-    oam[offset]     = val & 0xFF;
-    oam[offset + 1] = (val >> 8) & 0xFF;
+    oam[offset]     = (byte)(val & 0xFF);
+    oam[offset + 1] = (byte)((val >> 8) & 0xFF);
 }
 
 // Write corruption: triggered by INC/DEC rr, PUSH, CALL, RST with reg in OAM range.
@@ -1359,12 +939,12 @@ void cart_load(char *path) {
     fseek(fileptr, 0, SEEK_END);
     filelen = ftell(fileptr);
     rewind(fileptr);
-    cart_data = (byte *)malloc(filelen * sizeof(byte));
+    cart_data = (byte *)malloc((size_t)filelen * sizeof(byte));
     if (cart_data == NULL) {
         perror("malloc");
         exit(1);
     }
-    fread(cart_data, filelen, 1, fileptr);
+    fread(cart_data, (size_t)filelen, 1, fileptr);
     fclose(fileptr);
 
     int i = 0;
@@ -1374,7 +954,7 @@ void cart_load(char *path) {
         if (c == 0 || (char) c == ' ') {
             break;
         }
-        cart_name[i] = c;
+        cart_name[i] = (char)c;
     }
     cart_name[i+1] = '\0';
     cart_type = cart_data[0x147];
@@ -1481,11 +1061,6 @@ int timer_tima_cycles = 0;
 static uint16_t timer_internal = 0;
 static int timer_overflow_pending = 0;  // cycles until TMA reload (0=none)
 static bool timer_just_reloaded = false; // true during the M-cycle that TMA reloaded TIMA
-// On TIMA overflow the IF bit fires immediately (for non-HALT dispatch), but HALT should
-// not wake until the TMA reload 4T later.  This flag is set at overflow and cleared at the
-// start of the very next timer_tick4 so that one full 4T slot passes before HALT sees the
-// timer interrupt.
-static bool timer_halt_delay = false;
 
 // Bit in timer_internal that drives TIMA for each TAC mode (bits 1-0)
 static const int timer_tac_bit[4] = { 9, 3, 5, 7 };
@@ -1493,7 +1068,6 @@ static const int timer_tac_bit[4] = { 9, 3, 5, 7 };
 // Advance timer by exactly 4 T-cycles; called in a loop from timer_step.
 static void timer_tick4(void) {
     timer_just_reloaded = false;  // reset at start of each tick
-    timer_halt_delay = false;     // clear one-shot HALT delay from previous overflow
 
     // Handle TMA reload delay
     if (timer_overflow_pending > 0) {
@@ -1501,7 +1075,7 @@ static void timer_tick4(void) {
         if (timer_overflow_pending <= 0) {
             timer_overflow_pending = 0;
             RAM[REG_TIMA] = RAM[REG_TMA];
-            // Interrupt already fired at overflow time; just reload TMA.
+            request_interrupt(INTERRUPT_TIMER);
             timer_just_reloaded = true;
         }
     }
@@ -1518,12 +1092,8 @@ static void timer_tick4(void) {
         bool new_bit = (timer_internal >> bit) & 1;
         if (old_bit && !new_bit) {
             if (++RAM[REG_TIMA] == 0) {
-                // TIMA overflow: interrupt fires immediately for non-HALT dispatch.
-                // HALT wakeup is deferred one timer tick (4T) to match hardware behavior
-                // where HALT sees the interrupt only after TMA reload (+4T).
-                request_interrupt(INTERRUPT_TIMER);
+                // TIMA overflow: 4-cycle delay before TMA reload
                 timer_overflow_pending = 4;
-                timer_halt_delay = true;
             }
         }
     }
@@ -1539,7 +1109,7 @@ static void timer_tick4(void) {
         // before the next instruction executes (matching DMG hardware timing).
         if (old_bit8 && ((timer_internal & 0x1FF) == 0x1FC)) {
             // Shift SB left, shift in 1 from unconnected external pin
-            serial_sb = (serial_sb << 1) | 1;
+            serial_sb = (byte)((serial_sb << 1) | 1);
             RAM[0xFF01] = serial_sb;
             if (--serial_bits_remaining <= 0) {
                 // Transfer complete: buffer original transmit byte, clear SC, fire interrupt
@@ -1549,7 +1119,7 @@ static void timer_tick4(void) {
                 }
                 fputc(serial_out_byte, stdout);
                 fflush(stdout);
-                RAM[0xFF02] &= ~0x80;  // clear transfer-in-progress
+                RAM[0xFF02] &= (byte)~0x80u;  // clear transfer-in-progress
                 RAM[INTERRUPT_FLAGS] |= 0x08;  // serial interrupt
                 serial_active = false;
                 serial_bits_remaining = 0;
@@ -1559,7 +1129,6 @@ static void timer_tick4(void) {
 }
 
 
-static const int timer_clocks[4] = { 1024, 16, 64, 256 };
 
 void timer_step(int cpu_cycles) {
     for (int i = 0; i < cpu_cycles; i += 4) {
@@ -1640,45 +1209,20 @@ byte mem_read(int pos) {
         // Echo RAM: $E000-$FDFF mirrors WRAM $C000-$DDFF
         return RAM[pos - 0x2000];
     } else if (pos >= 0xFE00 && pos <= 0xFE9F) {
-        // OAM read lock: 0xFF when DMA active or PPU owns the OAM bus.
-        // Lock window on normal lines: T=0..259 (modes 2+3).
-        // Accessible: T=260..455 (mode 0 HBlank).
-        // Overflow (projected>=456): 4T dead zone at start of next scanline
-        // (T=0..3 accessible, T=4..259 locked) — EXCEPT after the startup line
-        // where the first real mode-2 OAM scan starts with no dead zone.
-        // Startup line lock: T=88..259 only (mode 2 skipped on startup).
+        // OAM: returns 0xFF when DMA is active (after startup grace) or during GPU modes 2/3.
+        // Lock window per scanline: T=0..259 (mode2 OAM scan T=0..79, mode3 T=80..259+8T early mode0).
+        // On the startup line (lcd_startup_mode0), the mode2 OAM scan is skipped so OAM is
+        // accessible for T<88, then locked from T=88 onward (startup STAT-visible mode3 boundary).
         if (dma_active && dma_oam_locked) return 0xFF;
         if (gpu_control.enabled && LY_REG < 144) {
             int projected = gpu_cycles + instr_timer_cycles - 4;
             if (projected < 0) projected = 0;
+            if (projected >= 456) projected = 455;
             bool locked;
-            if (ly153_vblank_active) {
-                if (projected >= 456) {
-                    // Reads spilling out of the LY=153/0 VBlank continuation land in the
-                    // first real LY=0 scanline, where the normal OAM lock resumes.
-                    projected -= 456;
-                    locked = (projected >= 4 && projected < 260 + mode3_extra);
-                } else {
-                    locked = false;  // VBlank continuation: OAM accessible
-                }
-            } else if (lcd_startup_line) {
-                if (projected >= 456) {
-                    // Overflowing into LY=1: first real mode-2 scan, no dead zone.
-                    projected -= 456;
-                    locked = (projected < 260 + mode3_extra);
-                } else {
-                    // On the startup line itself: only mode-3 window is locked.
-                    locked = (projected >= 88 && projected < 260 + mode3_extra);
-                }
+            if (lcd_startup_mode0) {
+                locked = (projected >= 88);
             } else {
-                // Normal visible scanline (LY=1..143).
-                if (projected >= 456) {
-                    // Overflow into next scanline: 4T propagation dead zone.
-                    projected -= 456;
-                    locked = (projected >= 4 && projected < 260 + mode3_extra);
-                } else {
-                    locked = (projected < 260 + mode3_extra);
-                }
+                locked = (projected < 260 + mode3_extra);
             }
             if (locked) return 0xFF;
         }
@@ -1713,49 +1257,9 @@ byte mem_read(int pos) {
                        (apu_ch1_active ? 0x01 : 0x00) |
                        (apu_ch2_active ? 0x02 : 0x00) |
                        0x70; // unused bits read as 1
-            case INTERRUPT_FLAGS: {
+            case INTERRUPT_FLAGS:
                 // DMG: upper 3 bits of IF are always 1
-                byte result = RAM[pos] | 0xE0;
-                if (vblank_irq_delayed && LY_REG == 144 && instr_timer_cycles >= 12) {
-                    result |= INTERRUPT_VBLANK;
-                }
-                if (gpu_control.enabled && !lcd_startup_mode0 && !stat_irq_line) {
-                    int proj = gpu_cycles + instr_timer_cycles - 4;
-                    if (LY_REG < 144) {
-                        // HBlank STAT projection: mode_irq 3→0 transition at gc=260
-                        if ((RAM[STAT] & 0x08) &&
-                                gpu_get_mode_for_irq(gpu_cycles) == 3 &&
-                                gpu_get_mode_for_irq(proj) == 0) {
-                            result |= 0x02;
-                        }
-                        // OAM STAT projection: mode_irq 0→2 transition at gc=4 (4T propagation)
-                        if ((RAM[STAT] & 0x20) &&
-                                gpu_get_mode_for_irq(gpu_cycles) == 0 &&
-                                gpu_get_mode_for_irq(proj) == 2) {
-                            result |= 0x02;
-                        }
-                        // LYC STAT projection: lyc_delayed clears at gc=8 (8T propagation)
-                        // When we're in the dead zone (gc=0..7) and proj crosses gc=8, LYC fires.
-                        if ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC] && lyc_delayed) {
-                            if (gpu_cycles < 8 && proj >= 8) {
-                                result |= 0x02;
-                            }
-                        }
-                    } else if (LY_REG == 144) {
-                        // LY=144 keeps the internal OAM STAT source for one M-cycle; reads that
-                        // land on the gc=4 boundary should observe the pending edge.
-                        if ((RAM[STAT] & 0x20) && gpu_cycles == 0 && instr_timer_cycles >= 8) {
-                            result |= 0x02;
-                        }
-                        // Mode-1 STAT becomes visible one M-cycle into LY=144, so reads whose
-                        // access phase lands there should observe the pending STAT IF bit.
-                        if ((RAM[STAT] & 0x10) && instr_timer_cycles >= 12) {
-                            result |= 0x02;
-                        }
-                    }
-                }
-                return result;
-            }
+                return RAM[pos] | 0xE0;
             case 0xFF01:
                 return serial_sb;
             case 0xFF02: // SC: bits 6-1 always 1
@@ -1858,18 +1362,6 @@ void mem_write(int pos, byte data) {
                 serial_bits_remaining = 0;
             }
             break;
-        case INTERRUPT_FLAGS: {
-            // Track projected T-cycle of IF write for OAM/LYC suppression (CPU write wins
-            // when simultaneous with interrupt fire at same T-cycle).
-            int proj = gpu_cycles + instr_timer_cycles - 4;
-            int proj_ly = LY_REG;
-            if (proj >= 456) { proj -= 456; proj_ly++; }
-            if (proj < 0) proj = 0;
-            if_cleared_proj_gc = proj;
-            if_cleared_proj_ly = proj_ly;
-            RAM[pos] = data;
-            break;
-        }
         case REG_DIV: {
             // Writing DIV resets internal counter; may cause TIMA falling edge
             int bit = timer_tac_bit[RAM[REG_TAC] & 0x03];
@@ -1879,10 +1371,8 @@ void mem_write(int pos, byte data) {
             RAM[REG_DIV] = 0;
             // Falling edge: if timer enabled and selected bit was 1
             if ((RAM[REG_TAC] & 0x04) && was_set) {
-                if (++RAM[REG_TIMA] == 0) {
-                    request_interrupt(INTERRUPT_TIMER);
+                if (++RAM[REG_TIMA] == 0)
                     timer_overflow_pending = 4;
-                }
             }
             break;
         }
@@ -2009,7 +1499,6 @@ char *serial_get_output(void) {
 void mem_init(void){
     memset(RAM, 0, 0xffff + 1);
     memset(ext_ram, 0, sizeof(ext_ram));
-    RAM[DMA] = 0xFF;
     serial_buf_len = 0;
     serial_buf[0] = '\0';
     serial_sb = 0;
@@ -2061,9 +1550,6 @@ void cpu_init(void){
     H = 0;
     cycles = 0;
     instr_timer_cycles = 0;
-    if_cleared_proj_gc = -100;
-    if_cleared_proj_ly = -100;
-    total_cpu_cycles = 0;
     PC = 0;
     SP = 0;
     interrupts = false;
@@ -2083,35 +1569,12 @@ void cpu_init_debug_file(void){
 void cpu_close_debug_file(void){
   if (debug_logfile != NULL) {
     fclose(debug_logfile);
-    debug_logfile = NULL;
   }
-}
-
-void cpu_update_debug_window(long long current_total_cycles) {
-    if (!cpu_debug_range_enabled) {
-        if (debug_logfile != NULL) {
-            cpu_close_debug_file();
-        }
-        return;
-    }
-
-    bool should_log = current_total_cycles >= cpu_debug_start_cycle &&
-                      current_total_cycles < cpu_debug_end_cycle;
-    if (should_log) {
-        if (debug_logfile == NULL) {
-            cpu_init_debug_file();
-        }
-    } else if (debug_logfile != NULL) {
-        cpu_close_debug_file();
-    }
 }
 
 void cpu_fake_init(void){
     cycles = 0;
     instr_timer_cycles = 0;
-    if_cleared_proj_gc = -100;
-    if_cleared_proj_ly = -100;
-    total_cpu_cycles = 0;
     PC = 0x0100;
     SP = 0xFFFE;
     interrupts = false;
@@ -2168,28 +1631,16 @@ void cpu_fake_init(void){
     }
     RAM[REG_DIV] = (uint8_t)(timer_internal >> 8);
 
-    // DMG power-on GPU state (at PC=0x0100): 56T before the end of the LY=153 short-scanline
-    // VBlank continuation. LY=0, gpu_cycles=400, ly153_vblank_active=true (VBlank mode 1).
-    // Derived from poweron_stat gbmicrotest: N=5 NOPs give mode 1 (projected=452 < 456),
-    // N=6 NOPs give mode 0/dead-zone (projected=456 overflows into LY=0 scanline).
-    // With preamble=20T (NOP+JP) and gc0=400: gc0+preamble=420; transition fires at NOP 9.
-    LY_REG = 0;
-    gpu_cycles = 404;
-    ly153_vblank_active = true;
-
     // DMG0 boot ROM leaves the LCD at LY=145, gpu_cycles=250 when PC=$0100 is reached.
     // Calibrated so boot_hwio-dmg0 sees LY=1, STAT=$83 (mode 3) after the test's setup loop.
     // (K≈4460 cycles to reach $FF41 check; 145*456+250+4460 mod 70224 = LY=1, gc=150, mode 3.)
     if (gb_model == MODEL_DMG0) {
         LY_REG = 145;
         gpu_cycles = 250;
-        ly153_vblank_active = false;
     }
 
     // IF: at post-boot, VBlank (bit 0) is pending — the LCD ran during the boot ROM
     RAM[INTERRUPT_FLAGS] = 0x01;  // bits 7-5 always read as 1 via mem_read mask + 0xE0
-    RAM[OBP0] = 0xFF;   // OBP0: all pixels transparent/white (DMG boot ROM sets 0xFF)
-    RAM[OBP1] = 0xFF;   // OBP1: same
     RAM[0xFF11] = 0x80;   // NR11: wave duty=2 (50%) in bits 7:6
     RAM[0xFF12] = 0xF3;   // NR12: volume=15, decreasing, shift=3
     RAM[0xFF24] = 0x77;   // NR50: SO2/SO1 volume both at max (7)
@@ -2210,8 +1661,8 @@ void cpu_debug_log(void) {
 }
 
 void push_stack(word data) {
-    const byte f1 = data & 0x00ff;
-    const byte f2 = (data & 0xff00) >> 8;
+    const byte f1 = (byte)(data & 0x00ff);
+    const byte f2 = (byte)((data & 0xff00) >> 8);
 
     SP -= 2;
     mem_write(SP, f1);
@@ -2232,19 +1683,19 @@ word peek_stack(void) {
 }
 
 word AF(void) {
-    return F | (A << 8);
+    return (word)(F | (A << 8));
 }
 
 word HL(void) {
-    return L | (H << 8);
+    return (word)(L | (H << 8));
 }
 
 word DE(void) {
-    return E | (D << 8);
+    return (word)(E | (D << 8));
 }
 
 word BC(void) {
-    return C | (B << 8);
+    return (word)(C | (B << 8));
 }
 
 void dump_regs(void) {
@@ -2260,8 +1711,8 @@ void dump_regs(void) {
 
 
 void setAF(word data) {
-    F = (data & 0x00ff) & 0xf0;
-    A = (data & 0xff00) >> 8;
+    F = (byte)((data & 0x00ff) & 0xf0);
+    A = (byte)((data & 0xff00) >> 8);
 }
 
 void setBC(word data) {
@@ -2330,24 +1781,15 @@ word cpu_read16(void) {
 }
 
 void do_interrupts(void){
-  // Any pending interrupt wakes CPU from HALT regardless of IME.
-  // Exception: when a TIMA overflow just fired IF this tick, HALT waits one more
-  // 4T slot (until TMA reload) before seeing the timer interrupt — matching hardware
-  // where HALT wakes at TMA reload time, not at overflow time.
+  // Any pending interrupt wakes CPU from HALT regardless of IME
+  // Mask to bits 0-4 only; IF bits 5-7 are always 1 (hardware artifact)
   byte enabled_bits = mem_read(INTERRUPT_ENABLE) & 0x1F;
   byte flag_bits = mem_read(INTERRUPT_FLAGS) & 0x1F;
-  byte halt_check_flags = flag_bits;
-  if (halted && timer_halt_delay)
-      halt_check_flags &= ~INTERRUPT_TIMER;
-  if (halted && stat_halt_delay)
-      halt_check_flags &= ~INTERRUPT_STAT;
-  if ((halt_check_flags & enabled_bits) > 0) {
+  if ((flag_bits & enabled_bits) > 0) {
       halted = false;
   }
 
-  // ISR dispatch: only when CPU is not halted (either was already running,
-  // or the HALT check above just cleared it).
-  if (!halted && interrupts) {
+  if (interrupts) {
     if(enabled_bits > 0){
       byte enabled = flag_bits & enabled_bits;
 
@@ -2356,7 +1798,7 @@ void do_interrupts(void){
         interrupts = false;
 
         for (int i = 0; i<5; i++) {
-          byte interrupt = INTERRUPT_PRIORITY[i];
+          byte interrupt = (byte)INTERRUPT_PRIORITY[i];
           if ((enabled & interrupt) != 0) {
             //printf("Doing interrupt %s (%x)\n", INTERRUPT_NAMES[i], INTERRUPT_OFFSETS[i]);
             // Interrupt dispatch takes 5 M-cycles (20 cycles):
@@ -2365,12 +1807,12 @@ void do_interrupts(void){
             // Push PC hi byte first; push_hi may write to $FFFF (IE), changing which
             // interrupts remain enabled.  We must NOT consume the interrupt from IF
             // until after we re-evaluate against the post-push IE.
-            mem_write(--SP, (PC >> 8) & 0xFF);
+            mem_write(--SP, (byte)((PC >> 8) & 0xFF));
             // Re-read IE after push_hi (it may have been overwritten)
             byte post_hi_ie = mem_read(INTERRUPT_ENABLE) & 0x1F;
             // Re-evaluate all pending interrupts against the updated IE
             byte post_hi_pending = flag_bits & post_hi_ie;
-            mem_write(--SP, PC & 0xFF);
+            mem_write(--SP, (byte)(PC & 0xFF));
             if (post_hi_pending == 0) {
                 // No interrupt remains enabled — dispatch cancelled; jump to $0000,
                 // IF is not consumed (nothing gets cleared)
@@ -2379,7 +1821,7 @@ void do_interrupts(void){
                 // Find the highest-priority interrupt still pending and dispatch to it
                 for (int j = 0; j < 5; j++) {
                     if ((post_hi_pending & INTERRUPT_PRIORITY[j]) != 0) {
-                        flag_bits &= ~INTERRUPT_PRIORITY[j];
+                        flag_bits &= (byte)~(byte)INTERRUPT_PRIORITY[j];
                         PC = INTERRUPT_OFFSETS[j];
                         break;
                     }
@@ -2399,7 +1841,7 @@ void do_interrupts(void){
 // ALGS
 //
 void setFlag(byte flag, bool value) {
-    F = value ? bit_set(F, flag) : bit_clear(F, flag);
+    F = (byte)(value ? bit_set(F, flag) : bit_clear(F, flag));
 }
 
 bool CheckFlag(byte flag) {
@@ -2432,7 +1874,7 @@ byte Sub(byte arg) {
     setFlag(FLAG_N, true);
     setFlag(FLAG_C, (result & 0xFF00)!=0);
     setFlag(FLAG_H,  (A & 0x0F) < (arg & 0x0F));
-    return  result&0x0ff;
+    return  (byte)(result&0x0ff);
 }
 
 byte Add(byte arg) {
@@ -2487,7 +1929,7 @@ byte Xor(byte arg) {
 }
 
 byte Swap(byte arg) {
-    const byte v = ((arg & 0x0F)<<4 | (arg & 0xF0)>>4);
+    const byte v = (byte)((arg & 0x0F)<<4 | (arg & 0xF0)>>4);
     clearFlags();
     setFlag(FLAG_Z, v == 0);
     return v;
@@ -2496,7 +1938,7 @@ byte Swap(byte arg) {
 byte RL(byte arg) {
     // XXX: may be correct per https://github.com/daveallie/rustyboy/blob/master/src/register/alu.rs
     bool oldC = (arg & 0x80) == 0x80;
-    arg <<= 1;
+    arg = (byte)(arg << 1);
     if (CheckFlag(FLAG_C)) {
         arg |= 1;
     }
@@ -2507,6 +1949,7 @@ byte RL(byte arg) {
 }
 
 byte Rr(byte arg, bool isA) {
+    (void)isA;
     bool lsb = (arg & 1) > 0;
     byte result;
     if (CheckFlag(FLAG_C)){
@@ -2525,7 +1968,7 @@ byte Rr(byte arg, bool isA) {
 byte Rlc(byte arg) {
     // XXX: may be correct per https://github.com/daveallie/rustyboy/blob/master/src/register/alu.rs
     bool oldC = (arg & 0x80) == 0x80;
-    arg <<= 1;
+    arg = (byte)(arg << 1);
     if(oldC){
         arg |= 0x01;
     }
@@ -2538,7 +1981,7 @@ byte Rlc(byte arg) {
 byte Sla(byte arg) {
     // XXX: may be correct per https://github.com/daveallie/rustyboy/blob/master/src/register/alu.rs
     clearFlags();
-    const byte v = arg << 1;
+    const byte v = (byte)(arg << 1);
     setFlag(FLAG_C, (arg & 0x80) == 0x80);
     setFlag(FLAG_Z, v == 0);
     return v;
@@ -2615,7 +2058,7 @@ void exec_ext_op(byte opcode);
 
 void exec_op(byte opcode){
     byte offset;
-    int pos;
+    word pos;
     switch (opcode){
         // NOP
         case 0:
@@ -2668,8 +2111,8 @@ void exec_op(byte opcode){
     // LD (a16) <- SP
     case 0x08:
       pos = cpu_read16();
-      cpu_write(pos, SP&0x00ff);
-      cpu_write(pos+1, (SP&0xff00)>>8);
+      cpu_write(pos, (byte)(SP&0x00ff));
+      cpu_write(pos+1, (byte)((SP&0xff00)>>8));
       break;
 
     // ADD HL += BC
@@ -2775,7 +2218,7 @@ void exec_op(byte opcode){
     // JR r8
     case 0x18:
       offset = cpu_read_next();
-      PC += (int8_t) offset;
+      PC = (word)(PC + (int8_t) offset);
       cycles += 4;
       break;
 
@@ -2830,7 +2273,7 @@ void exec_op(byte opcode){
       offset = cpu_read_next();
       if (!CheckFlag(FLAG_Z)) {
           cycles += 4;
-          PC += (int8_t) offset;
+          PC = (word)(PC + (int8_t) offset);
       }
       break;
 
@@ -2875,7 +2318,7 @@ void exec_op(byte opcode){
       offset = cpu_read_next();
       if (CheckFlag(FLAG_Z)) {
           cycles += 4;
-          PC += (int8_t) offset;
+          PC = (word)(PC + (int8_t) offset);
       }
       break;
 
@@ -2936,7 +2379,7 @@ void exec_op(byte opcode){
       offset = cpu_read_next();
       if (!CheckFlag(FLAG_C)) {
           cycles += 4;
-          PC += (int8_t) offset;
+          PC = (word)(PC + (int8_t) offset);
       }
       break;
 
@@ -2991,7 +2434,7 @@ void exec_op(byte opcode){
       offset = cpu_read_next();
       if (CheckFlag(FLAG_C)) {
           cycles += 4;
-          PC += (int8_t) offset;
+          PC = (word)(PC + (int8_t) offset);
       }
       break;
 
@@ -3720,7 +3163,7 @@ void exec_op(byte opcode){
     case 0xc0:
       cpu_internal();       // M2: condition check
       if (!CheckFlag(FLAG_Z)) {
-          { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = ((word)hi << 8) | lo; }
+          { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = (word)(((word)hi << 8) | lo); }
           cpu_internal();   // M5: internal
       }
       break;
@@ -3729,7 +3172,7 @@ void exec_op(byte opcode){
     case 0xc1:
       oam_read_corrupt_at(SP, 0);
       oam_read_corrupt_at(SP + 1, 4);
-      { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); setBC(((word)hi << 8) | lo); }
+      { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); setBC((word)(((word)hi << 8) | lo)); }
       break;
 
     // JP NZ
@@ -3752,8 +3195,8 @@ void exec_op(byte opcode){
       pos = cpu_read16();
       if (!CheckFlag(FLAG_Z)) {
           cpu_internal();   // M4: internal delay
-          cpu_write(--SP, (PC >> 8) & 0xFF);
-          cpu_write(--SP, PC & 0xFF);
+          cpu_write(--SP, (byte)((PC >> 8) & 0xFF));
+          cpu_write(--SP, (byte)(PC & 0xFF));
           PC = pos;
       }
       break;
@@ -3776,8 +3219,8 @@ void exec_op(byte opcode){
     // RST 00H
     case 0xc7:
       cpu_internal();   // M2: internal
-      cpu_write(--SP, (PC >> 8) & 0xFF);
-      cpu_write(--SP, PC & 0xFF);
+      cpu_write(--SP, (byte)((PC >> 8) & 0xFF));
+      cpu_write(--SP, (byte)(PC & 0xFF));
       PC = 0x00;
       break;
 
@@ -3785,14 +3228,14 @@ void exec_op(byte opcode){
     case 0xc8:
       cpu_internal();       // M2: condition check
       if (CheckFlag(FLAG_Z)) {
-          { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = ((word)hi << 8) | lo; }
+          { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = (word)(((word)hi << 8) | lo); }
           cpu_internal();   // M5: internal
       }
       break;
 
     // RET
     case 0xc9:
-      { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = ((word)hi << 8) | lo; }
+      { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = (word)(((word)hi << 8) | lo); }
       cpu_internal();   // M4: internal
       break;
 
@@ -3810,8 +3253,8 @@ void exec_op(byte opcode){
       pos = cpu_read16();
       if (CheckFlag(FLAG_Z)) {
           cpu_internal();   // M4: internal delay
-          cpu_write(--SP, (PC >> 8) & 0xFF);
-          cpu_write(--SP, PC & 0xFF);
+          cpu_write(--SP, (byte)((PC >> 8) & 0xFF));
+          cpu_write(--SP, (byte)(PC & 0xFF));
           PC = pos;
       }
       break;
@@ -3820,8 +3263,8 @@ void exec_op(byte opcode){
     case 0xcd:
       pos = cpu_read16();
       cpu_internal();   // M4: internal delay
-      cpu_write(--SP, (PC >> 8) & 0xFF);
-      cpu_write(--SP, PC & 0xFF);
+      cpu_write(--SP, (byte)((PC >> 8) & 0xFF));
+      cpu_write(--SP, (byte)(PC & 0xFF));
       PC = pos;
       break;
 
@@ -3833,8 +3276,8 @@ void exec_op(byte opcode){
     // RST 08H
     case 0xcf:
       cpu_internal();   // M2: internal
-      cpu_write(--SP, (PC >> 8) & 0xFF);
-      cpu_write(--SP, PC & 0xFF);
+      cpu_write(--SP, (byte)((PC >> 8) & 0xFF));
+      cpu_write(--SP, (byte)(PC & 0xFF));
       PC = 0x08;
       break;
 
@@ -3842,7 +3285,7 @@ void exec_op(byte opcode){
     case 0xd0:
       cpu_internal();       // M2: condition check
       if (!CheckFlag(FLAG_C)) {
-          { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = ((word)hi << 8) | lo; }
+          { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = (word)(((word)hi << 8) | lo); }
           cpu_internal();   // M5: internal
       }
       break;
@@ -3851,7 +3294,7 @@ void exec_op(byte opcode){
     case 0xd1:
       oam_read_corrupt_at(SP, 0);
       oam_read_corrupt_at(SP + 1, 4);
-      { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); setDE(((word)hi << 8) | lo); }
+      { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); setDE((word)(((word)hi << 8) | lo)); }
       break;
 
     // JP NC
@@ -3868,8 +3311,8 @@ void exec_op(byte opcode){
       pos = cpu_read16();
       if (!CheckFlag(FLAG_C)) {
           cpu_internal();   // M4: internal delay
-          cpu_write(--SP, (PC >> 8) & 0xFF);
-          cpu_write(--SP, PC & 0xFF);
+          cpu_write(--SP, (byte)((PC >> 8) & 0xFF));
+          cpu_write(--SP, (byte)(PC & 0xFF));
           PC = pos;
       }
       break;
@@ -3892,8 +3335,8 @@ void exec_op(byte opcode){
     // RST 10H
     case 0xd7:
       cpu_internal();   // M2: internal
-      cpu_write(--SP, (PC >> 8) & 0xFF);
-      cpu_write(--SP, PC & 0xFF);
+      cpu_write(--SP, (byte)((PC >> 8) & 0xFF));
+      cpu_write(--SP, (byte)(PC & 0xFF));
       PC = 0x10;
       break;
 
@@ -3901,14 +3344,14 @@ void exec_op(byte opcode){
     case 0xd8:
       cpu_internal();       // M2: condition check
       if (CheckFlag(FLAG_C)) {
-          { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = ((word)hi << 8) | lo; }
+          { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = (word)(((word)hi << 8) | lo); }
           cpu_internal();   // M5: internal
       }
       break;
 
     // RETI
     case 0xd9:
-      { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = ((word)hi << 8) | lo; }
+      { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); PC = (word)(((word)hi << 8) | lo); }
       cpu_internal();   // M4: internal
       interrupts = true;
       break;
@@ -3927,8 +3370,8 @@ void exec_op(byte opcode){
       pos = cpu_read16();
       if (CheckFlag(FLAG_C)) {
           cpu_internal();   // M4: internal delay
-          cpu_write(--SP, (PC >> 8) & 0xFF);
-          cpu_write(--SP, PC & 0xFF);
+          cpu_write(--SP, (byte)((PC >> 8) & 0xFF));
+          cpu_write(--SP, (byte)(PC & 0xFF));
           PC = pos;
       }
       break;
@@ -3936,8 +3379,8 @@ void exec_op(byte opcode){
     // RST 18H
     case 0xdf:
       cpu_internal();   // M2: internal
-      cpu_write(--SP, (PC >> 8) & 0xFF);
-      cpu_write(--SP, PC & 0xFF);
+      cpu_write(--SP, (byte)((PC >> 8) & 0xFF));
+      cpu_write(--SP, (byte)(PC & 0xFF));
       PC = 0x18;
       break;
 
@@ -3959,7 +3402,7 @@ void exec_op(byte opcode){
     case 0xe1:
       oam_read_corrupt_at(SP, 0);
       oam_read_corrupt_at(SP + 1, 4);
-      { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); setHL(((word)hi << 8) | lo); }
+      { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); setHL((word)(((word)hi << 8) | lo)); }
       break;
 
     // LD (C) <- A
@@ -4003,8 +3446,8 @@ void exec_op(byte opcode){
     // RST 20H
     case 0xe7:
       cpu_internal();   // M2: internal
-      cpu_write(--SP, (PC >> 8) & 0xFF);
-      cpu_write(--SP, PC & 0xFF);
+      cpu_write(--SP, (byte)((PC >> 8) & 0xFF));
+      cpu_write(--SP, (byte)(PC & 0xFF));
       PC = 0x20;
       break;
 
@@ -4026,8 +3469,8 @@ void exec_op(byte opcode){
     // RST 28H
     case 0xef:
       cpu_internal();   // M2: internal
-      cpu_write(--SP, (PC >> 8) & 0xFF);
-      cpu_write(--SP, PC & 0xFF);
+      cpu_write(--SP, (byte)((PC >> 8) & 0xFF));
+      cpu_write(--SP, (byte)(PC & 0xFF));
       PC = 0x28;
       break;
 
@@ -4044,7 +3487,7 @@ void exec_op(byte opcode){
     case 0xf1:
       oam_read_corrupt_at(SP, 0);
       oam_read_corrupt_at(SP + 1, 4);
-      { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); setAF(((word)hi << 8) | lo); }
+      { byte lo = cpu_read(SP++); byte hi = cpu_read(SP++); setAF((word)(((word)hi << 8) | lo)); }
       break;
 
     // LD A <- (C)
@@ -4079,8 +3522,8 @@ void exec_op(byte opcode){
     // RST 30H
     case 0xf7:
       cpu_internal();   // M2: internal
-      cpu_write(--SP, (PC >> 8) & 0xFF);
-      cpu_write(--SP, PC & 0xFF);
+      cpu_write(--SP, (byte)((PC >> 8) & 0xFF));
+      cpu_write(--SP, (byte)(PC & 0xFF));
       PC = 0x30;
       break;
 
@@ -4122,8 +3565,8 @@ void exec_op(byte opcode){
     // RST 38H
     case 0xff:
       cpu_internal();   // M2: internal
-      cpu_write(--SP, (PC >> 8) & 0xFF);
-      cpu_write(--SP, PC & 0xFF);
+      cpu_write(--SP, (byte)((PC >> 8) & 0xFF));
+      cpu_write(--SP, (byte)(PC & 0xFF));
       PC = 0x38;
       break;
 
@@ -5465,47 +4908,6 @@ void sdl_display(void){
 }
 
 
-void dump_screenshot_ppm(const char *filename) {
-    FILE *fp = fopen(filename, "wb");
-    if (fp == NULL) {
-        fprintf(stderr, "Failed to open screenshot file %s: ", filename);
-        perror(NULL);
-        exit(1);
-    }
-
-    fprintf(fp, "P6\n%d %d\n255\n", VIEWPORT_WIDTH, VIEWPORT_HEIGHT);
-    for (int y = 0; y < VIEWPORT_HEIGHT; y++) {
-        for (int x = 0; x < VIEWPORT_WIDTH; x++) {
-            const uint32_t pixel = pixels[y * VIEWPORT_WIDTH + x];
-            const byte rgb[3] = {
-                (byte)((pixel >> 16) & 0xFF),
-                (byte)((pixel >> 8) & 0xFF),
-                (byte)(pixel & 0xFF),
-            };
-            fwrite(rgb, 1, sizeof(rgb), fp);
-        }
-    }
-
-    fclose(fp);
-}
-
-void maybe_dump_screenshot(int completed_frame) {
-    for (int i = 0; i < screenshot_request_count; i++) {
-        ScreenshotRequest *req = &screenshot_requests[i];
-        if (!req->done && req->frame == completed_frame) {
-            dump_screenshot_ppm(req->filename);
-            req->done = true;
-            fprintf(stderr, "[screenshot] frame %d -> %s\n", completed_frame, req->filename);
-        }
-    }
-}
-
-void maybe_dump_completed_frames(int previous_frame, int new_frame) {
-    for (int completed_frame = previous_frame; completed_frame < new_frame; completed_frame++) {
-        maybe_dump_screenshot(completed_frame);
-    }
-}
-
 bool frame_headless(void){
     static int frame_count = 0;
     frame_count++;
@@ -5521,10 +4923,7 @@ bool frame_headless(void){
                 break;
         //        return false;
             }
-            cpu_update_debug_window(total_cpu_cycles);
             instr_timer_cycles = 0;
-            if_cleared_proj_gc = -100;
-            if_cleared_proj_ly = -100;
             int prevcycles = cycles;
             do_interrupts();
             int dispatch_cycles = cycles - prevcycles;
@@ -5533,8 +4932,6 @@ bool frame_headless(void){
                 timer_step(dispatch_cycles - instr_timer_cycles);
                 dma_step(dispatch_cycles);
                 instr_timer_cycles = 0;
-                if_cleared_proj_gc = -100;
-                if_cleared_proj_ly = -100;
             }
             exec_next_start_cycles = cycles;
             exec_next();
@@ -5543,7 +4940,6 @@ bool frame_headless(void){
             gpu_step(cpu_cycles);
             timer_step(cpu_cycles - instr_timer_cycles);
             dma_step(cpu_cycles - instr_timer_cycles);
-            total_cpu_cycles += dispatch_cycles + cpu_cycles;
             instruction_count++;
 
             // Safety check for infinite loops
@@ -5560,11 +4956,9 @@ bool frame_headless(void){
 }
 
 bool frame(void){
-    static int completed_frame = 0;
     const uint32_t start_ticks = SDL_GetTicks();
 
     frame_headless();
-    maybe_dump_screenshot(completed_frame++);
     sdl_display();
 
     const uint32_t diff = SDL_GetTicks() - start_ticks;
@@ -5657,23 +5051,9 @@ void headless_print_blargg_a000(void) {
 
 void headless_main_impl(void) {
     long long total_cycles = 0;
-    int current_frame = 0;
-    // Hang detection: ring buffer of last 64 PCs, and consecutive-same-range counter.
-    #define HANG_RANGE 256
-    #define HANG_THRESH 2000000
-    #define PC_RING 64
-    word pc_ring[PC_RING];
-    int pc_ring_idx = 0;
-    int hang_count = 0;
-    word hang_range_min = 0;
-    memset(pc_ring, 0, sizeof(pc_ring));
-    // Instruction counting for periodic PC reports (stderr when --cycles set)
-    long long instr_count = 0;
-
     while (1) {
         if (max_cycles > 0 && total_cycles >= max_cycles) {
-            printf("\n[headless] cycle limit %lld reached (frame %d), stopping\n",
-                   max_cycles, current_frame);
+            printf("\n[headless] cycle limit %lld reached, stopping\n", max_cycles);
             break;
         }
         if (blargg_done) {
@@ -5681,73 +5061,20 @@ void headless_main_impl(void) {
             break;
         }
         // Drain blargg A004 text buffer before it overflows into WRAM ($C000+).
+        // Monitor the blargg write pointer at $D883/$D884: when it reaches $BF00
+        // (near the end of the 8KB ext_ram bank), reset it to $A004 and clear the
+        // buffer. This is safe to check after each instruction since the pointer
+        // only advances during blargg text writes (very infrequent).
         if (headless && !blargg_done &&
             ext_ram[1] == 0xDE && ext_ram[2] == 0xB0 && ext_ram[3] == 0x61) {
-            uint16_t txt_ptr = ((uint16_t)RAM[0xD884] << 8) | RAM[0xD883];
+            uint16_t txt_ptr = (uint16_t)(((uint16_t)RAM[0xD884] << 8) | RAM[0xD883]);
             if (txt_ptr >= 0xBF00) {
-                RAM[0xD883] = 0x04;
-                RAM[0xD884] = 0xA0;
+                RAM[0xD883] = 0x04;  // reset write pointer low byte → $A004
+                RAM[0xD884] = 0xA0;  // reset write pointer high byte
                 memset(&ext_ram[4], 0, 0x2000 - 4);
             }
         }
-
-        // Update frame counter and apply joypad injection events.
-        int new_frame = (int)(total_cycles / 70224);
-        if (new_frame != current_frame) {
-            maybe_dump_completed_frames(current_frame, new_frame);
-            current_frame = new_frame;
-            // Release all buttons first, then re-apply active events.
-            joypad_buttons.A = joypad_buttons.B = false;
-            joypad_buttons.START = joypad_buttons.SELECT = false;
-            joypad_buttons.UP = joypad_buttons.DOWN = false;
-            joypad_buttons.LEFT = joypad_buttons.RIGHT = false;
-            for (int j = 0; j < joypad_event_count; j++) {
-                if (current_frame >= joypad_events[j].frame &&
-                    current_frame < joypad_events[j].frame + joypad_events[j].duration) {
-                    if (joypad_events[j].A)      joypad_buttons.A      = true;
-                    if (joypad_events[j].B)      joypad_buttons.B      = true;
-                    if (joypad_events[j].START)  joypad_buttons.START  = true;
-                    if (joypad_events[j].SELECT) joypad_buttons.SELECT = true;
-                    if (joypad_events[j].UP)     joypad_buttons.UP     = true;
-                    if (joypad_events[j].DOWN)   joypad_buttons.DOWN   = true;
-                    if (joypad_events[j].LEFT)   joypad_buttons.LEFT   = true;
-                    if (joypad_events[j].RIGHT)  joypad_buttons.RIGHT  = true;
-                }
-            }
-        }
-
-        // Hang detection: if PC stays within a HANG_RANGE-byte window for HANG_THRESH
-        // consecutive instructions, we're stuck in a tight loop.
-        word cur_pc = PC;
-        pc_ring[pc_ring_idx++ & (PC_RING - 1)] = cur_pc;
-        if (cur_pc >= hang_range_min && cur_pc < hang_range_min + HANG_RANGE) {
-            if (++hang_count >= HANG_THRESH) {
-                fprintf(stderr, "\n[headless] HANG DETECTED at frame %d (total cycles %lld)\n",
-                        current_frame, total_cycles);
-                fprintf(stderr, "[headless] PC window: $%04X-$%04X\n",
-                        hang_range_min, (word)(hang_range_min + HANG_RANGE - 1));
-                fprintf(stderr, "[headless] Last PCs: ");
-                for (int j = 0; j < PC_RING; j++) {
-                    int idx = (pc_ring_idx - PC_RING + j) & (PC_RING - 1);
-                    fprintf(stderr, "$%04X ", pc_ring[idx]);
-                }
-                fprintf(stderr, "\n");
-                fprintf(stderr, "[headless] Regs: A=%02X B=%02X C=%02X D=%02X E=%02X H=%02X L=%02X SP=%04X\n",
-                        A, B, C, D, E, H, L, SP);
-                fprintf(stderr, "[headless] STAT=%02X LY=%02X IE=%02X IF=%02X IME=%d\n",
-                        RAM[STAT], LY_REG, RAM[INTERRUPT_ENABLE], RAM[INTERRUPT_FLAGS], interrupts);
-                break;
-            }
-        } else {
-            hang_range_min = cur_pc & ~(HANG_RANGE - 1);
-            hang_count = 1;
-        }
-
-        cpu_update_debug_window(total_cycles);
         instr_timer_cycles = 0;
-        if_cleared_proj_gc = -100;
-        if_cleared_proj_ly = -100;
-        stat_written_in_dead_zone = false;
         int prevcycles = cycles;
         do_interrupts();
         int dispatch_cycles = cycles - prevcycles;
@@ -5756,8 +5083,6 @@ void headless_main_impl(void) {
             timer_step(dispatch_cycles - instr_timer_cycles);
             dma_step(dispatch_cycles);
             instr_timer_cycles = 0;
-            if_cleared_proj_gc = -100;
-            if_cleared_proj_ly = -100;
         }
         exec_next_start_cycles = cycles;
         exec_next();
@@ -5766,31 +5091,11 @@ void headless_main_impl(void) {
         timer_step(cpu_cycles - instr_timer_cycles);
         apu_step(cpu_cycles);
         dma_step(cpu_cycles - instr_timer_cycles);
-        total_cycles += dispatch_cycles + cpu_cycles;
-        total_cpu_cycles = total_cycles;
-        instr_count++;
-        // Every 5M instructions, emit a progress line to stderr so we can see where game is.
-        if (max_cycles > 0 && (instr_count % 5000000) == 0) {
-            fprintf(stderr, "[trace] frame=%d instr=%lld cycles=%lld PC=$%04X A=%02X B=%02X\n",
-                    current_frame, instr_count, total_cycles, PC, A, B);
-        }
+        total_cycles += cpu_cycles;
     }
     // If cycle limit hit but A000 output present, still print it
     if (!blargg_done) {
         headless_print_blargg_a000();
-    }
-    // GBMicrotest: check 0xFF82 (0x01=pass, 0xFF=fail) after run
-    if (gbmicrotest_mode) {
-        byte result = RAM[0xFF82];
-        if (result == 0x01) {
-            printf("Passed\n");
-        } else if (result == 0xFF) {
-            byte actual   = RAM[0xFF80];
-            byte expected = RAM[0xFF81];
-            printf("Failed (actual=0x%02X expected=0x%02X)\n", actual, expected);
-        } else {
-            printf("Unknown (0xFF82=0x%02X)\n", result);
-        }
     }
 }
 
@@ -5820,78 +5125,6 @@ int main(int argc, char **argv){
       else if (strcmp(m, "sgb2") == 0) gb_model = MODEL_SGB2;
       else if (strcmp(m, "cgb") == 0 || strcmp(m, "gbc") == 0 || strcmp(m, "S") == 0) gb_model = MODEL_GBC;
       else { fprintf(stderr, "Unknown model: %s\n", m); return 1; }
-    } else if (strcmp(argv[i], "--joypad") == 0) {
-      // Format: frame:BUTTONS[:duration] e.g. "120:A" or "200:START:3" or "300:A,B:2"
-      if (i + 1 >= argc) {
-        fprintf(stderr, "Missing value for --joypad\n");
-        return 1;
-      }
-      if (joypad_event_count >= MAX_JOYPAD_EVENTS) {
-        fprintf(stderr, "Too many --joypad events (max %d)\n", MAX_JOYPAD_EVENTS);
-        return 1;
-      }
-      const char *spec = argv[++i];
-      JoypadEvent *ev = &joypad_events[joypad_event_count++];
-      memset(ev, 0, sizeof(*ev));
-      ev->duration = 1;
-      // Parse frame number
-      char *end;
-      ev->frame = (int)strtol(spec, &end, 10);
-      if (*end != ':') { fprintf(stderr, "Bad --joypad format: %s\n", spec); return 1; }
-      // Parse buttons (comma-separated) and optional duration after second colon
-      const char *p = end + 1;
-      while (*p && *p != ':') {
-          if (strncasecmp(p, "START", 5) == 0)   { ev->START  = true; p += 5; }
-          else if (strncasecmp(p, "SELECT", 6) == 0) { ev->SELECT = true; p += 6; }
-          else if (strncasecmp(p, "RIGHT", 5) == 0)  { ev->RIGHT  = true; p += 5; }
-          else if (strncasecmp(p, "LEFT", 4) == 0)   { ev->LEFT   = true; p += 4; }
-          else if (strncasecmp(p, "DOWN", 4) == 0)   { ev->DOWN   = true; p += 4; }
-          else if (strncasecmp(p, "UP", 2) == 0)     { ev->UP     = true; p += 2; }
-          else if (*p == 'A' || *p == 'a')            { ev->A      = true; p++; }
-          else if (*p == 'B' || *p == 'b')            { ev->B      = true; p++; }
-          else if (*p == ',') p++;
-          else { fprintf(stderr, "Unknown button in --joypad: %c\n", *p); return 1; }
-      }
-      if (*p == ':') ev->duration = (int)strtol(p + 1, NULL, 10);
-    } else if (strcmp(argv[i], "--gbmicrotest") == 0) {
-      gbmicrotest_mode = true;
-    } else if (strcmp(argv[i], "--screenshot") == 0) {
-      if (i + 1 >= argc) {
-        fprintf(stderr, "Missing value for --screenshot\n");
-        return 1;
-      }
-      if (screenshot_request_count >= MAX_SCREENSHOT_REQUESTS) {
-        fprintf(stderr, "Too many --screenshot requests (max %d)\n", MAX_SCREENSHOT_REQUESTS);
-        return 1;
-      }
-      const char *spec = argv[++i];
-      char *end;
-      ScreenshotRequest *req = &screenshot_requests[screenshot_request_count++];
-      memset(req, 0, sizeof(*req));
-      req->frame = (int)strtol(spec, &end, 10);
-      if (*end != ':' || end[1] == '\0') {
-        fprintf(stderr, "Bad --screenshot format: %s\n", spec);
-        return 1;
-      }
-      strncpy(req->filename, end + 1, sizeof(req->filename) - 1);
-    } else if (strcmp(argv[i], "--cpu-debug-range") == 0) {
-      if (i + 1 >= argc) {
-        fprintf(stderr, "Missing value for --cpu-debug-range\n");
-        return 1;
-      }
-      const char *spec = argv[++i];
-      char *end;
-      cpu_debug_start_cycle = strtoll(spec, &end, 10);
-      if (*end != ':') {
-        fprintf(stderr, "Bad --cpu-debug-range format: %s\n", spec);
-        return 1;
-      }
-      cpu_debug_end_cycle = strtoll(end + 1, &end, 10);
-      if (*end != '\0' || cpu_debug_end_cycle <= cpu_debug_start_cycle) {
-        fprintf(stderr, "Bad --cpu-debug-range format: %s\n", spec);
-        return 1;
-      }
-      cpu_debug_range_enabled = true;
     } else if (strncmp(argv[i], "--", 2) == 0) {
       fprintf(stderr, "Unknown option: %s\n", argv[i]);
       return 1;
@@ -5899,6 +5132,8 @@ int main(int argc, char **argv){
       rom = argv[i];
     }
   }
+// cpu_init_debug_file(); // Disabled to prevent interference
+
   cart_load(rom);
 
   mem_init();
