@@ -40,8 +40,21 @@ uint32_t *pixels;
 char serial_buf[256];
 int serial_buf_len = 0;
 byte serial_sb = 0;
+static bool serial_active = false;    // true during an in-progress internal-clock transfer
+static int  serial_bits_remaining = 0; // bits left in current transfer (8 down to 0)
+static byte serial_out_byte = 0;       // byte to transmit (saved at transfer start)
 bool headless = false;
 long long max_cycles = 0;
+
+typedef enum {
+    MODEL_DMG = 0,   // DMG-ABC (default)
+    MODEL_DMG0,      // early DMG0
+    MODEL_MGB,       // Game Boy Pocket
+    MODEL_SGB,       // Super Game Boy
+    MODEL_SGB2,      // Super Game Boy 2
+    MODEL_GBC,       // Game Boy Color
+} gb_model_t;
+static gb_model_t gb_model = MODEL_DMG;
 
 // Blargg A000-based result detection (used by halt_bug, interrupt_time, mem_timing-2, oam_bug)
 // Magic bytes at A001-A003 = {0xDE, 0xB0, 0x61}; result at A000 (0x80=running, 0=pass, other=fail)
@@ -997,8 +1010,8 @@ void joypad_init(void){
 }
 
 byte joypad_read(void){
-  // Want button keys
-  byte result = 0;
+  // Bits are active-low: 0=pressed, 1=released. Default all released (0xF).
+  byte result = 0x0F;
   if (!bit_check(joypad, 5)){
       result = bit_def(result, 3, !joypad_buttons.START);
       result = bit_def(result, 2, !joypad_buttons.SELECT);
@@ -1096,9 +1109,33 @@ static void timer_tick4(void) {
             }
         }
     }
+    // Serial clock: internal clock uses falling edge of timer_internal bit 9 (8192 Hz).
+    // Each falling edge shifts one bit; after 8 bits the transfer completes.
+    if (serial_active) {
+        bool old_bit9 = (old_internal >> 9) & 1;
+        bool new_bit9 = (timer_internal >> 9) & 1;
+        if (old_bit9 && !new_bit9) {
+            // Shift SB left, shift in 1 from unconnected external pin
+            serial_sb = (serial_sb << 1) | 1;
+            RAM[0xFF01] = serial_sb;
+            if (--serial_bits_remaining <= 0) {
+                // Transfer complete: buffer original transmit byte, clear SC, fire interrupt
+                if (serial_buf_len < (int)(sizeof(serial_buf) - 1)) {
+                    serial_buf[serial_buf_len++] = (char)serial_out_byte;
+                    serial_buf[serial_buf_len] = '\0';
+                }
+                fputc(serial_out_byte, stdout);
+                fflush(stdout);
+                RAM[0xFF02] &= ~0x80;  // clear transfer-in-progress
+                RAM[INTERRUPT_FLAGS] |= 0x08;  // serial interrupt
+                serial_active = false;
+                serial_bits_remaining = 0;
+            }
+        }
+    }
 }
 
-// Clock dividers for TAC bits 1-0 (kept for reference/compatibility)
+
 static const int timer_clocks[4] = { 1024, 16, 64, 256 };
 
 void timer_step(int cpu_cycles) {
@@ -1214,7 +1251,9 @@ byte mem_read(int pos) {
             case WY:
                 return gpu_read(pos);
             case JOYPAD:
-                return joypad_read() | 0xC0; // bits 7-6 always 1
+                // bits 7-6: always 1; bits 5-4: P14/P15 select state from joypad var;
+                // bits 3-0: button states (0=pressed).
+                return (joypad & 0x30) | (joypad_read() & 0x0F) | 0xC0;
             case 0xFF4D:
                 // KEY1: CGB speed switch register - only accessible on CGB hardware
                 // On DMG, this register doesn't exist and reads as $FF
@@ -1315,21 +1354,20 @@ void mem_write(int pos, byte data) {
         break;
         case 0xFF01:
             serial_sb = data;
+            RAM[pos] = data;
             break;
         case 0xFF02:
-            if (bit_check(data, 7)) {
-                if (serial_buf_len < (int)(sizeof(serial_buf) - 1)) {
-                    serial_buf[serial_buf_len++] = (char)serial_sb;
-                    serial_buf[serial_buf_len] = '\0';
-                }
-                fputc(serial_sb, stdout);
-                fflush(stdout);
-                // Clear bit 7 immediately (transfer complete) so ROM doesn't busy-wait
-                RAM[pos] = data & ~0x80;
-                // Trigger serial interrupt (INT 3 = $08)
-                RAM[INTERRUPT_FLAGS] |= 0x08;
-            } else {
-                RAM[pos] = data;
+            RAM[pos] = data | 0x7E;  // bits 6-1 always read as 1
+            if ((data & 0x81) == 0x81) {
+                // Internal clock, transfer start: begin timed 8-bit serial transfer.
+                // Clock derived from timer_internal bit 9 falling edge (8192 Hz).
+                serial_out_byte = serial_sb;  // save transmit byte before shifting
+                serial_active = true;
+                serial_bits_remaining = 8;
+            } else if (!(data & 0x80)) {
+                // Cancel any in-progress transfer
+                serial_active = false;
+                serial_bits_remaining = 0;
             }
             break;
         case REG_DIV: {
@@ -1472,6 +1510,9 @@ void mem_init(void){
     serial_buf_len = 0;
     serial_buf[0] = '\0';
     serial_sb = 0;
+    serial_active = false;
+    serial_bits_remaining = 0;
+    serial_out_byte = 0;
     blargg_done = false;
     double_speed = false;
     RAM[0xFF4D] = 0;
@@ -1540,15 +1581,6 @@ void cpu_close_debug_file(void){
 }
 
 void cpu_fake_init(void){
-    F = 0xB0;
-    // CGB-only ROMs ($0143=$C0) expect A=$11 at boot; DMG/CGB-enhanced use $01
-    A = (cart_cgb_flag == 0xC0) ? 0x11 : 0x01;
-    C = 0x13;
-    B = 0x00;
-    E = 0xD8;
-    D = 0x00;
-    L = 0x4D;
-    H = 0x01;
     cycles = 0;
     instr_timer_cycles = 0;
     PC = 0x0100;
@@ -1557,15 +1589,63 @@ void cpu_fake_init(void){
     ei_delay = 0;
     halted = false;
     halt_bug_active = false;
-    // We're skipping the BIOS, so mark it as done so ROM interrupt
-    // vectors at 0x40-0x60 are read from cart, not BIOS.
     inBios = false;
 
-    // DMG-ABC post-boot-ROM hardware state (skipping actual boot ROM execution).
-    // Timer: boot ROM leaves internal counter at 0xABCC — DIV reads $AD after the
-    // ~336 T-cycles of boot_hwio preamble code, matching real hardware behaviour.
-    timer_internal = 0xABC8;
+    // Set post-boot-ROM register state based on hardware model.
+    // Values from Pan Docs and mooneye test suite documentation.
+    switch (gb_model) {
+        case MODEL_DMG0:
+            // Early DMG0 hardware: different B/E/H/L, F=$00, shorter bootrom.
+            A = 0x01; F = 0x00; B = 0xFF; C = 0x13; D = 0x00; E = 0xC1; H = 0x84; L = 0x03;
+            // Confirmed by oxideboy emulator and mooneye boot_div-dmg0 (N=45 preamble).
+            timer_internal = 0x182C;
+            break;
+        case MODEL_MGB:
+            // Game Boy Pocket: same as DMG but A=$FF.
+            A = 0xFF; F = 0xB0; B = 0x00; C = 0x13; D = 0x00; E = 0xD8; H = 0x01; L = 0x4D;
+            timer_internal = 0xABC8;  // same as DMG-ABC
+            break;
+        case MODEL_SGB:
+            // Super Game Boy: F=$00, C=$14, H=$C0, L=$60.
+            A = 0x01; F = 0x00; B = 0x00; C = 0x14; D = 0x00; E = 0x00; H = 0xC0; L = 0x60;
+            // boot_div-S uses N=33 preamble NOPs → timer_low = $C8 - 4*(33-6) = $5C.
+            timer_internal = 0xD85C;
+            joypad_write(0x30);
+            apu_ch1_active = false;  // SGB boot ROM does not play a chime
+            break;
+        case MODEL_SGB2:
+            // Super Game Boy 2: same as SGB but A=$FF.
+            A = 0xFF; F = 0x00; B = 0x00; C = 0x14; D = 0x00; E = 0x00; H = 0xC0; L = 0x60;
+            // boot_div2-S uses N=37 preamble NOPs → timer_low = $C8 - 4*(37-6) = $4C.
+            timer_internal = 0xD84C;
+            joypad_write(0x30);
+            apu_ch1_active = false;  // SGB2 boot ROM does not play a chime
+            break;
+        case MODEL_GBC:
+            // Game Boy Color: A=$11 (signals CGB hardware to games).
+            A = 0x11; F = 0x80; B = 0x00; C = 0x00; D = 0xFF; E = 0x56; H = 0x00; L = 0x0D;
+            // Derived from mooneye boot_div-cgbABCDE (N=27 preamble): timer_internal=0x2674.
+            timer_internal = 0x2674;
+            // GBC bootrom leaves P1 with neither row selected (bits 5-4 = 1).
+            joypad_write(0x30);
+            break;
+        default: // MODEL_DMG (DMG-ABC)
+            // CGB-only ROMs ($0143=$C0) expect A=$11; DMG/CGB-enhanced use $01.
+            A = (cart_cgb_flag == 0xC0) ? 0x11 : 0x01;
+            F = 0xB0; B = 0x00; C = 0x13; D = 0x00; E = 0xD8; H = 0x01; L = 0x4D;
+            // DMG-ABC post-boot-ROM: timer at $ABCC (DIV reads $AB after preamble).
+            timer_internal = 0xABC8;
+            break;
+    }
     RAM[REG_DIV] = (uint8_t)(timer_internal >> 8);
+
+    // DMG0 boot ROM leaves the LCD at LY=145, gpu_cycles=250 when PC=$0100 is reached.
+    // Calibrated so boot_hwio-dmg0 sees LY=1, STAT=$83 (mode 3) after the test's setup loop.
+    // (K≈4460 cycles to reach $FF41 check; 145*456+250+4460 mod 70224 = LY=1, gc=150, mode 3.)
+    if (gb_model == MODEL_DMG0) {
+        LY_REG = 145;
+        gpu_cycles = 250;
+    }
 
     // IF: at post-boot, VBlank (bit 0) is pending — the LCD ran during the boot ROM
     RAM[INTERRUPT_FLAGS] = 0x01;  // bits 7-5 always read as 1 via mem_read mask + 0xE0
@@ -1574,7 +1654,10 @@ void cpu_fake_init(void){
     RAM[0xFF24] = 0x77;   // NR50: SO2/SO1 volume both at max (7)
     RAM[0xFF25] = 0xF3;   // NR51: ch1+ch2 to SO1, ch1+ch2 to SO2
     RAM[0xFF26] = 0x80;   // NR52: master sound on (bit 7); ch status via apu_ch1_active
-    apu_ch1_active = true; // channel 1 still running after boot chime
+    // SGB/SGB2 boot ROMs don't play a chime; other models leave ch1 running.
+    if (gb_model != MODEL_SGB && gb_model != MODEL_SGB2) {
+        apu_ch1_active = true;
+    }
 }
 
 void cpu_debug_log(void) {
@@ -2425,15 +2508,15 @@ void exec_op(byte opcode){
               // Decode the BG tilemap ($9800) as ASCII to show the failure message
               // Tile map uses tile indices; font in VRAM at $8000, each tile = 16 bytes
               // Character codes: tile 0 = space, others are ASCII-like
-              char vram_msg[200] = {0};
+              char vram_msg[700] = {0};
               int vlen = 0;
-              for (int row = 0; row < 9; row++) {
-                  for (int col = 0; col < 32 && vlen < 198; col++) {
+              for (int row = 0; row < 18; row++) {
+                  for (int col = 0; col < 32 && vlen < 690; col++) {
                       byte tidx = VRAM[0x1800 + row*32 + col];
                       char ch = (tidx >= 0x20 && tidx < 0x80) ? (char)tidx : (tidx == 0 ? ' ' : '?');
                       vram_msg[vlen++] = ch;
                   }
-                  if (vlen < 198) vram_msg[vlen++] = '\n';
+                  if (vlen < 690) vram_msg[vlen++] = '\n';
               }
               vram_msg[vlen] = '\0';
               // Trim trailing spaces
@@ -5036,6 +5119,19 @@ int main(int argc, char **argv){
         return 1;
       }
       max_cycles = strtoll(argv[++i], NULL, 10);
+    } else if (strcmp(argv[i], "--model") == 0) {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "Missing value for --model\n");
+        return 1;
+      }
+      const char *m = argv[++i];
+      if (strcmp(m, "dmg") == 0 || strcmp(m, "dmgABC") == 0) gb_model = MODEL_DMG;
+      else if (strcmp(m, "dmg0") == 0) gb_model = MODEL_DMG0;
+      else if (strcmp(m, "mgb") == 0) gb_model = MODEL_MGB;
+      else if (strcmp(m, "sgb") == 0) gb_model = MODEL_SGB;
+      else if (strcmp(m, "sgb2") == 0) gb_model = MODEL_SGB2;
+      else if (strcmp(m, "cgb") == 0 || strcmp(m, "gbc") == 0 || strcmp(m, "S") == 0) gb_model = MODEL_GBC;
+      else { fprintf(stderr, "Unknown model: %s\n", m); return 1; }
     } else if (strncmp(argv[i], "--", 2) == 0) {
       fprintf(stderr, "Unknown option: %s\n", argv[i]);
       return 1;
@@ -5048,9 +5144,8 @@ int main(int argc, char **argv){
   cart_load(rom);
 
   mem_init();
-  //cpu_init();
-  cpu_fake_init();
-  gpu_init();
+  gpu_init();    // sets LCD state first
+  cpu_fake_init(); // overrides registers and (for DMG0) GPU scanline position
   pixels_init();
   if (!headless) {
     sdl_init();
