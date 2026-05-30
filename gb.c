@@ -479,15 +479,14 @@ static void stat_check_irq(void) {
     if ((RAM[STAT] & 0x20) && (mode_irq == 2 || (LY_REG == 144 && gpu_cycles < 80))) line = true;
     if ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC] && !lyc_delayed) line = true; // LYC=LY
     if (line && !stat_irq_line) {
-        // DMG: when a CPU write to IF (clearing the STAT bit) is projected to the same
-        // T-cycle as OAM fires (gc=4 of the new scanline), the CPU write wins.
-        // Check mode_irq==2 (OAM mode) rather than gpu_cycles==4 because gpu_step
-        // processes whole instructions at once; by the time stat_check_irq is called,
-        // gpu_cycles may already be past gc=4 (e.g. at gc=8), but mode_irq is still
-        // 2 throughout the OAM scan (gc=4..87). VBlank fires at mode_irq==1, so this
-        // check correctly excludes VBlank.
-        bool oam_firing = (mode_irq == 2);
-        bool suppressed = oam_firing && (if_cleared_proj_ly == LY_REG && if_cleared_proj_gc == 4);
+        bool suppressed = false;
+        if (if_cleared_proj_ly == LY_REG) {
+            bool oam_firing = (mode_irq == 2);
+            bool vblank_firing = ((RAM[STAT] & 0x10) && mode_irq == 1 && LY_REG == 144);
+            bool lyc_firing = ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC] && !lyc_delayed && gpu_cycles < 88);
+            if (oam_firing && if_cleared_proj_gc == 4) suppressed = true;
+            if ((vblank_firing || lyc_firing) && if_cleared_proj_gc == 8) suppressed = true;
+        }
         if (!suppressed) {
             request_interrupt(INTERRUPT_STAT);
         }
@@ -587,11 +586,13 @@ void gpu_write(int pos, byte data){
     if (pos == STAT) {
         // DMG STAT write glitch: writing to STAT during mode 0 (HBlank) or mode 1 (VBlank)
         // causes a momentary 1-cycle pulse on the STAT IRQ line, firing an interrupt
-        // regardless of which enable bits are set. Only fires when LCD is on and NOT
-        // in the startup line (lcd_startup_mode0), since many tests write STAT shortly
-        // after enabling the LCD when it's still in startup mode.
-        if (gpu_control.enabled && !lcd_startup_mode0) {
-            byte mode_v = gpu_get_mode_projected(gpu_cycles + instr_timer_cycles - 4);
+        // regardless of which enable bits are set. On the LCD startup line, the initial
+        // ~36 T-cycles behave like mode 0 for this glitch before normal OAM timing takes over.
+        if (gpu_control.enabled) {
+            int proj_tc = gpu_cycles + instr_timer_cycles - 4;
+            byte mode_v;
+            if (lcd_startup_mode0) mode_v = (proj_tc < 36) ? 0 : 2;
+            else mode_v = gpu_get_mode_projected(proj_tc);
             if (mode_v == 0 || mode_v == 1) {
                 request_interrupt(INTERRUPT_STAT);
             }
