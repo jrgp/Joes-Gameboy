@@ -169,9 +169,14 @@ static bool lcd_startup_mode0 = false;
 // Used to apply a later LY projection threshold on the startup line (+12T vs normal).
 static bool lcd_startup_line = false;
 
-// LYC=LY STAT interrupt fires 8T after the LY change (same propagation delay as mode-2).
+// LYC=LY STAT interrupt fires 8T after the LY change.
 // When set, the LYC check in stat_check_irq is suppressed; it fires in gpu_step at T>=8.
 static bool lyc_delayed = false;
+
+// Projected T-cycle of last CPU write to IF (0xFF0F) — used to suppress OAM/LYC
+// STAT interrupt when CPU write and interrupt fire in the same T-cycle (CPU wins).
+static int if_cleared_proj_gc = -100;
+static int if_cleared_proj_ly = -100;
 
 // Per-scanline mode-3 extension (T-cycles beyond 172).
 // Accounts for fine-scroll penalty (SCX & 7) and sprite-fetch stall (6T per sprite, max 10).
@@ -295,6 +300,8 @@ void gpu_init(void){
     LY_REG = 0;
     pending_drawline = false;
     ly153_vblank_active = false;
+    if_cleared_proj_gc = -100;
+    if_cleared_proj_ly = -100;
 
     // Initialize GPU control with default values
     gpu_control.enabled = false;
@@ -380,13 +387,13 @@ byte gpu_get_mode_projected(int projected_cycles) {
 }
 
 // Returns the GPU mode at a projected cycle for STAT INTERRUPT firing.
-// STAT interrupts fire with 8T propagation delay (vs 4T for STAT register reads).
-// Boundaries: dead zone T=0..7, mode 2 T=8..87, mode 3 T=88..259, mode 0 T=260..455.
+// STAT interrupts fire with 4T propagation delay for OAM/LYC, 8T for HBlank.
+// Boundaries: dead zone T=0..3, mode 2 T=4..87, mode 3 T=88..259, mode 0 T=260..455.
 static byte gpu_irq_mode_from_cycles(int pc) {
     if (lcd_startup_mode0) return 0;
     if (pc < 0) pc = 0;
-    if (pc < 8)   return 0;  // dead zone: T=0..7 (8T propagation)
-    if (pc < 88)  return 2;  // OAM scan: T=8..87
+    if (pc < 4)   return 0;  // dead zone: T=0..3 (4T propagation)
+    if (pc < 88)  return 2;  // OAM scan: T=4..87
     if (pc < 260 + mode3_extra) return 3;  // LCD transfer: T=88..259
     return 0;                 // HBlank: T=260..455
 }
@@ -456,7 +463,7 @@ static void stat_check_irq(void) {
         stat_irq_line = false;
         return;
     }
-    // STAT interrupts use 8T propagation delay (different from STAT register reads at 4T).
+    // STAT interrupts use 4T propagation delay for OAM and 8T for HBlank/VBlank/LYC.
     // This preserves hblank_int and int_vblank1 timing with mode 0 interrupt at T=260.
     byte mode = gpu_get_mode();
     byte mode_irq = gpu_get_mode_for_irq(gpu_cycles);
@@ -467,12 +474,17 @@ static void stat_check_irq(void) {
     if ((RAM[STAT] & 0x08) && mode == 0 && mode_irq == 0 && LY_REG < 144) line = true;
     // Mode 1 VBlank: fires at T=8 of LY=144 (8T propagation).
     if ((RAM[STAT] & 0x10) && mode_irq == 1)                  line = true;
-    // Mode 2 OAM: fires at T=8 (8T after hardware mode 2 start).
+    // Mode 2 OAM: fires at T=4 (4T after hardware mode 2 start).
     // Special LY=144 case: fires simultaneously with VBlank for STAT purposes.
     if ((RAM[STAT] & 0x20) && (mode_irq == 2 || (LY_REG == 144 && gpu_cycles < 80))) line = true;
     if ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC] && !lyc_delayed) line = true; // LYC=LY
     if (line && !stat_irq_line) {
-        request_interrupt(INTERRUPT_STAT);
+        // DMG: when a CPU write to IF (clearing the STAT bit) is projected to the same
+        // T-cycle as OAM or LYC fires (gc=4 of the new scanline), the CPU write wins.
+        bool suppressed = (if_cleared_proj_ly == LY_REG && if_cleared_proj_gc == 4);
+        if (!suppressed) {
+            request_interrupt(INTERRUPT_STAT);
+        }
     }
     stat_irq_line = line;
 }
@@ -567,6 +579,15 @@ void gpu_write(int pos, byte data){
         VRAM[pos - 0x8000] = data;
     }
     if (pos == STAT) {
+        // DMG STAT write glitch: writing to STAT during mode 0 (HBlank) or mode 1 (VBlank)
+        // causes a momentary 1-cycle pulse on the STAT IRQ line, firing an interrupt
+        // regardless of which enable bits are set. This is a DMG-only hardware quirk.
+        {
+            byte mode_v = gpu_get_mode_projected(gpu_cycles + instr_timer_cycles - 4);
+            if (mode_v == 0 || mode_v == 1) {
+                request_interrupt(INTERRUPT_STAT);
+            }
+        }
         // Bits 3-6 are writable; bits 0-2 are read-only
         RAM[STAT] = (RAM[STAT] & 0x87) | (data & 0x78);
         // When STAT is written: update stat_irq_line to reflect the new condition WITHOUT
@@ -923,15 +944,15 @@ void gpu_step(int _cycles){
         stat_check_irq();
     }
 
-    // Check for STAT-visible mode transitions (8T propagation delay vs internal).
-    // This fires mode-2 STAT interrupt at T=8 (not T=0) when mode-2 becomes visible in STAT.
+    // Check for STAT-visible mode transitions (4T propagation delay vs internal).
+    // This fires mode-2 STAT interrupt at T=4 (not T=0) when mode-2 becomes visible in STAT.
     byte new_mode_visible = gpu_get_mode_projected(gpu_cycles);
     if (new_mode_visible != prev_mode_visible) {
         stat_check_irq();
     }
 
-    // Check for STAT-interrupt mode transitions (8T propagation delay).
-    // This fires mode-2 STAT interrupt at T=8 and mode-0 STAT interrupt at T=260.
+    // Check for STAT-interrupt mode transitions (4T for OAM, 8T for HBlank).
+    // This fires mode-2 STAT interrupt at T=4 and mode-0 STAT interrupt at T=260.
     byte new_mode_irq = gpu_get_mode_for_irq(gpu_cycles);
     if (new_mode_irq != prev_mode_irq) {
         stat_check_irq();
@@ -942,7 +963,7 @@ void gpu_step(int _cycles){
         stat_check_irq();
     }
 
-    // Fire delayed LYC interrupt at T>=8 of new scanline (8T propagation, same as mode-2).
+    // Fire delayed LYC interrupt at T>=8 of new scanline (8T propagation).
     // lyc_delayed is set whenever LY changes; cleared here once gpu_cycles reaches T=8.
     if (lyc_delayed && gpu_cycles >= 8) {
         lyc_delayed = false;
@@ -1516,19 +1537,31 @@ byte mem_read(int pos) {
             case INTERRUPT_FLAGS: {
                 // DMG: upper 3 bits of IF are always 1
                 byte result = RAM[pos] | 0xE0;
-                // Project HBlank STAT interrupt: on hardware the GPU fires the IF bit
-                // concurrently with the M-cycle that reads it.  Our emulator runs
-                // exec_next fully then calls gpu_step, so multi-M-cycle instructions
-                // (LD A,(HL) = 8T, LDH A,(n) = 12T) read IF before gpu_step fires.
-                // Fix: if the mode_irq 3→0 transition occurs between the instruction
-                // start (gpu_cycles) and the projected read T-cycle
-                // (gpu_cycles + instr_timer_cycles - 4), include the STAT bit now.
-                if (gpu_control.enabled && LY_REG < 144 && (RAM[STAT] & 0x08) &&
-                        !lcd_startup_mode0 && !stat_irq_line) {
+                if (gpu_control.enabled && LY_REG < 144 && !lcd_startup_mode0 && !stat_irq_line) {
                     int proj = gpu_cycles + instr_timer_cycles - 4;
-                    if (gpu_get_mode_for_irq(gpu_cycles) == 3 &&
+                    // HBlank STAT projection: mode_irq 3→0 transition at gc=260
+                    if ((RAM[STAT] & 0x08) &&
+                            gpu_get_mode_for_irq(gpu_cycles) == 3 &&
                             gpu_get_mode_for_irq(proj) == 0) {
                         result |= 0x02;
+                    }
+                    // OAM STAT projection: mode_irq 0→2 transition at gc=4 (4T propagation)
+                    if ((RAM[STAT] & 0x20) &&
+                            gpu_get_mode_for_irq(gpu_cycles) == 0 &&
+                            gpu_get_mode_for_irq(proj) == 2) {
+                        result |= 0x02;
+                    }
+                    // LYC STAT projection: lyc_delayed clears at gc=8 (8T propagation)
+                    // When we're in the dead zone (gc=0..7) and proj crosses gc=8, LYC fires.
+                    if ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC] && lyc_delayed) {
+                        // Within current scanline: gc < 8 and proj >= 8
+                        if (gpu_cycles < 8 && proj >= 8) {
+                            result |= 0x02;
+                        }
+                        // Cross-scanline: proj wraps into gc=4+ of next scanline
+                        // (instruction starts near end of previous scanline, reads at start of this one)
+                        // This is already handled by the within-scanline check when instructions
+                        // span the scanline boundary, because gpu_get_mode_for_irq handles overflow.
                     }
                 }
                 return result;
@@ -1635,6 +1668,18 @@ void mem_write(int pos, byte data) {
                 serial_bits_remaining = 0;
             }
             break;
+        case INTERRUPT_FLAGS: {
+            // Track projected T-cycle of IF write for OAM/LYC suppression (CPU write wins
+            // when simultaneous with interrupt fire at same T-cycle).
+            int proj = gpu_cycles + instr_timer_cycles - 4;
+            int proj_ly = LY_REG;
+            if (proj >= 456) { proj -= 456; proj_ly++; }
+            if (proj < 0) proj = 0;
+            if_cleared_proj_gc = proj;
+            if_cleared_proj_ly = proj_ly;
+            RAM[pos] = data;
+            break;
+        }
         case REG_DIV: {
             // Writing DIV resets internal counter; may cause TIMA falling edge
             int bit = timer_tac_bit[RAM[REG_TAC] & 0x03];
@@ -1823,6 +1868,8 @@ void cpu_init(void){
     H = 0;
     cycles = 0;
     instr_timer_cycles = 0;
+    if_cleared_proj_gc = -100;
+    if_cleared_proj_ly = -100;
     total_cpu_cycles = 0;
     PC = 0;
     SP = 0;
@@ -1869,6 +1916,8 @@ void cpu_update_debug_window(long long current_total_cycles) {
 void cpu_fake_init(void){
     cycles = 0;
     instr_timer_cycles = 0;
+    if_cleared_proj_gc = -100;
+    if_cleared_proj_ly = -100;
     total_cpu_cycles = 0;
     PC = 0x0100;
     SP = 0xFFFE;
@@ -5272,6 +5321,8 @@ bool frame_headless(void){
             }
             cpu_update_debug_window(total_cpu_cycles);
             instr_timer_cycles = 0;
+            if_cleared_proj_gc = -100;
+            if_cleared_proj_ly = -100;
             int prevcycles = cycles;
             do_interrupts();
             int dispatch_cycles = cycles - prevcycles;
@@ -5280,6 +5331,8 @@ bool frame_headless(void){
                 timer_step(dispatch_cycles - instr_timer_cycles);
                 dma_step(dispatch_cycles);
                 instr_timer_cycles = 0;
+                if_cleared_proj_gc = -100;
+                if_cleared_proj_ly = -100;
             }
             exec_next_start_cycles = cycles;
             exec_next();
@@ -5490,6 +5543,8 @@ void headless_main_impl(void) {
 
         cpu_update_debug_window(total_cycles);
         instr_timer_cycles = 0;
+        if_cleared_proj_gc = -100;
+        if_cleared_proj_ly = -100;
         int prevcycles = cycles;
         do_interrupts();
         int dispatch_cycles = cycles - prevcycles;
@@ -5498,6 +5553,8 @@ void headless_main_impl(void) {
             timer_step(dispatch_cycles - instr_timer_cycles);
             dma_step(dispatch_cycles);
             instr_timer_cycles = 0;
+            if_cleared_proj_gc = -100;
+            if_cleared_proj_ly = -100;
         }
         exec_next_start_cycles = cycles;
         exec_next();
