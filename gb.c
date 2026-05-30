@@ -1421,6 +1421,11 @@ int timer_tima_cycles = 0;
 static uint16_t timer_internal = 0;
 static int timer_overflow_pending = 0;  // cycles until TMA reload (0=none)
 static bool timer_just_reloaded = false; // true during the M-cycle that TMA reloaded TIMA
+// On TIMA overflow the IF bit fires immediately (for non-HALT dispatch), but HALT should
+// not wake until the TMA reload 4T later.  This flag is set at overflow and cleared at the
+// start of the very next timer_tick4 so that one full 4T slot passes before HALT sees the
+// timer interrupt.
+static bool timer_halt_delay = false;
 
 // Bit in timer_internal that drives TIMA for each TAC mode (bits 1-0)
 static const int timer_tac_bit[4] = { 9, 3, 5, 7 };
@@ -1428,6 +1433,7 @@ static const int timer_tac_bit[4] = { 9, 3, 5, 7 };
 // Advance timer by exactly 4 T-cycles; called in a loop from timer_step.
 static void timer_tick4(void) {
     timer_just_reloaded = false;  // reset at start of each tick
+    timer_halt_delay = false;     // clear one-shot HALT delay from previous overflow
 
     // Handle TMA reload delay
     if (timer_overflow_pending > 0) {
@@ -1452,9 +1458,12 @@ static void timer_tick4(void) {
         bool new_bit = (timer_internal >> bit) & 1;
         if (old_bit && !new_bit) {
             if (++RAM[REG_TIMA] == 0) {
-                // TIMA overflow: interrupt fires immediately; TMA reload after 4 T-cycles.
+                // TIMA overflow: interrupt fires immediately for non-HALT dispatch.
+                // HALT wakeup is deferred one timer tick (4T) to match hardware behavior
+                // where HALT sees the interrupt only after TMA reload (+4T).
                 request_interrupt(INTERRUPT_TIMER);
                 timer_overflow_pending = 4;
+                timer_halt_delay = true;
             }
         }
     }
@@ -2240,15 +2249,22 @@ word cpu_read16(void) {
 }
 
 void do_interrupts(void){
-  // Any pending interrupt wakes CPU from HALT regardless of IME
-  // Mask to bits 0-4 only; IF bits 5-7 are always 1 (hardware artifact)
+  // Any pending interrupt wakes CPU from HALT regardless of IME.
+  // Exception: when a TIMA overflow just fired IF this tick, HALT waits one more
+  // 4T slot (until TMA reload) before seeing the timer interrupt — matching hardware
+  // where HALT wakes at TMA reload time, not at overflow time.
   byte enabled_bits = mem_read(INTERRUPT_ENABLE) & 0x1F;
   byte flag_bits = mem_read(INTERRUPT_FLAGS) & 0x1F;
-  if ((flag_bits & enabled_bits) > 0) {
+  byte halt_check_flags = flag_bits;
+  if (halted && timer_halt_delay)
+      halt_check_flags &= ~INTERRUPT_TIMER;
+  if ((halt_check_flags & enabled_bits) > 0) {
       halted = false;
   }
 
-  if (interrupts) {
+  // ISR dispatch: only when CPU is not halted (either was already running,
+  // or the HALT check above just cleared it).
+  if (!halted && interrupts) {
     if(enabled_bits > 0){
       byte enabled = flag_bits & enabled_bits;
 
