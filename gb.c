@@ -1688,6 +1688,17 @@ byte mem_read(int pos) {
                                 result |= 0x02;
                             }
                         }
+                    } else if (LY_REG == 144) {
+                        // LY=144 keeps the internal OAM STAT source for one M-cycle; reads that
+                        // land on the gc=4 boundary should observe the pending edge.
+                        if ((RAM[STAT] & 0x20) && gpu_cycles == 0 && instr_timer_cycles >= 8) {
+                            result |= 0x02;
+                        }
+                        // Mode-1 STAT becomes visible one M-cycle into LY=144, so reads whose
+                        // access phase lands there should observe the pending STAT IF bit.
+                        if ((RAM[STAT] & 0x10) && instr_timer_cycles >= 12) {
+                            result |= 0x02;
+                        }
                     }
                 }
                 return result;
