@@ -480,8 +480,14 @@ static void stat_check_irq(void) {
     if ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC] && !lyc_delayed) line = true; // LYC=LY
     if (line && !stat_irq_line) {
         // DMG: when a CPU write to IF (clearing the STAT bit) is projected to the same
-        // T-cycle as OAM or LYC fires (gc=4 of the new scanline), the CPU write wins.
-        bool suppressed = (if_cleared_proj_ly == LY_REG && if_cleared_proj_gc == 4);
+        // T-cycle as OAM fires (gc=4 of the new scanline), the CPU write wins.
+        // Check mode_irq==2 (OAM mode) rather than gpu_cycles==4 because gpu_step
+        // processes whole instructions at once; by the time stat_check_irq is called,
+        // gpu_cycles may already be past gc=4 (e.g. at gc=8), but mode_irq is still
+        // 2 throughout the OAM scan (gc=4..87). VBlank fires at mode_irq==1, so this
+        // check correctly excludes VBlank.
+        bool oam_firing = (mode_irq == 2);
+        bool suppressed = oam_firing && (if_cleared_proj_ly == LY_REG && if_cleared_proj_gc == 4);
         if (!suppressed) {
             request_interrupt(INTERRUPT_STAT);
         }
@@ -581,8 +587,10 @@ void gpu_write(int pos, byte data){
     if (pos == STAT) {
         // DMG STAT write glitch: writing to STAT during mode 0 (HBlank) or mode 1 (VBlank)
         // causes a momentary 1-cycle pulse on the STAT IRQ line, firing an interrupt
-        // regardless of which enable bits are set. This is a DMG-only hardware quirk.
-        {
+        // regardless of which enable bits are set. Only fires when LCD is on and NOT
+        // in the startup line (lcd_startup_mode0), since many tests write STAT shortly
+        // after enabling the LCD when it's still in startup mode.
+        if (gpu_control.enabled && !lcd_startup_mode0) {
             byte mode_v = gpu_get_mode_projected(gpu_cycles + instr_timer_cycles - 4);
             if (mode_v == 0 || mode_v == 1) {
                 request_interrupt(INTERRUPT_STAT);
