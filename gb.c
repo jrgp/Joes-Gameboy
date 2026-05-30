@@ -179,6 +179,12 @@ static bool vblank_irq_delayed = false;
 // cleared at the start of the next gpu_step so that HALT wakes one M-cycle after STAT rises.
 static bool stat_halt_delay = false;
 
+// Set when STAT is written while gpu_cycles is in the dead zone (gc<4).
+// Cleared before each instruction. Suppresses the dead-zone→OAM interrupt that would
+// otherwise fire at gc=4 within the same scanline (hardware does not fire OAM interrupt
+// when STAT is written during the dead zone of the current scanline).
+static bool stat_written_in_dead_zone = false;
+
 // Projected T-cycle of last CPU write to IF (0xFF0F) — used to suppress OAM/LYC
 // STAT interrupt when CPU write and interrupt fire in the same T-cycle (CPU wins).
 static int if_cleared_proj_gc = -100;
@@ -656,18 +662,22 @@ void gpu_write(int pos, byte data){
         VRAM[pos - 0x8000] = data;
     }
     if (pos == STAT) {
-        // DMG STAT write glitch: writing to STAT during mode 0 (HBlank) or mode 1 (VBlank)
-        // causes a momentary 1-cycle pulse on the STAT IRQ line, firing an interrupt
-        // regardless of which enable bits are set.
+        // Track dead-zone STAT writes to suppress spurious dead-zone→OAM transitions.
+        if (gpu_cycles < 4) stat_written_in_dead_zone = true;
+        // DMG STAT write glitch: writing STAT with all interrupt-enable bits cleared
+        // (data & 0x78 == 0) while in modes 0, 1, or 2 (not pixel mode 3) causes a
+        // momentary STAT IRQ pulse on hardware, firing a spurious interrupt.
         //
-        // The glitch fires if the instruction's execution window intersects the HBlank/VBlank
-        // region: specifically if M1 (gc) or M3 (proj_tc) falls in HBlank [260..455], or we're
-        // in VBlank (LY=144..153). This handles:
-        //   - Write starts in HBlank but proj wraps past scanline boundary (gc>=260 fires)
-        //   - Write starts in mode 3 but M3 lands in HBlank (proj_tc in [260..455] fires)
-        //   - Dead zone gc=0..3 at start of scanline does NOT trigger the glitch
+        // The glitch fires if:
+        //   - data & 0x78 == 0 (all enable bits being cleared — writing non-zero enable
+        //     bits to STAT during HBlank does NOT trigger the glitch on hardware)
+        //   - AND the current PPU mode is not pixel-render (mode 3):
+        //     - HBlank (mode 0): gc >= 260, projected gc also in HBlank range
+        //     - OAM scan (mode 2): gc in [4..87], LY < 144
+        //     - VBlank (mode 1): LY 144..153
+        //   - Dead zone gc=0..3 at scanline start does NOT trigger the glitch
         // On the LCD startup line, the initial ~36 T-cycles behave like mode 0.
-        if (gpu_control.enabled) {
+        if (gpu_control.enabled && (data & 0x78) == 0) {
             bool glitch;
             if (lcd_startup_mode0) {
                 glitch = (gpu_cycles < 36);
@@ -675,8 +685,9 @@ void gpu_write(int pos, byte data){
                 int proj_tc = gpu_cycles + instr_timer_cycles - 4;
                 bool hblank_at_m1 = (gpu_cycles >= 260 && LY_REG < 144);
                 bool hblank_at_m3 = (proj_tc >= 260 && proj_tc < 456 && LY_REG < 144);
+                bool in_oam       = (gpu_cycles >= 4 && gpu_cycles < 88 && LY_REG < 144);
                 bool in_vblank    = (LY_REG >= 144 && LY_REG <= 153);
-                glitch = hblank_at_m1 || hblank_at_m3 || in_vblank;
+                glitch = hblank_at_m1 || hblank_at_m3 || in_oam || in_vblank;
             }
             if (glitch) {
                 request_interrupt(INTERRUPT_STAT);
@@ -687,16 +698,23 @@ void gpu_write(int pos, byte data){
         // When STAT is written: update stat_irq_line to reflect the new condition WITHOUT
         // firing an interrupt. This avoids false rising-edge triggers when STAT interrupt
         // bits are set while a condition (e.g. mode-2 OAM) is already active.
-        // The correct interrupt fires on the next natural rising edge (e.g. T=8 of next
-        // scanline). The DMG write-glitch (fires during mode-0/mode-1) is handled
-        // separately by the stat_write_glitch logic (currently not implemented).
+        // For the OAM condition: use the INTERNAL mode (gpu_get_mode()) in addition to the
+        // propagation-delayed mode_irq. At gc=0..3 (dead zone), the internal mode is already
+        // OAM (mode 2) while mode_irq is still 0. If STAT is written with OAM enable during
+        // the dead zone, stat_irq_line should reflect the internal OAM state (true), so that
+        // the rising edge does NOT re-fire when mode_irq transitions to 2 at gc=4.
+        // Without this, the lyc_delayed and mode-transition stat_check_irq calls at gc=4..8
+        // would see a 0→1 transition and fire a spurious OAM interrupt.
         {
             byte mode_i = gpu_get_mode_for_irq(gpu_cycles);
             byte mode_v = gpu_get_mode_projected(gpu_cycles);
+            byte mode_int = gpu_get_mode();  // internal mode without propagation delay
             bool new_line = false;
             if ((RAM[STAT] & 0x08) && mode_v == 0 && mode_i == 0 && LY_REG < 144) new_line = true;
             if ((RAM[STAT] & 0x10) && mode_i == 1) new_line = true;
-            if ((RAM[STAT] & 0x20) && ((!lcd_startup_line && mode_i == 2) || (LY_REG == 144 && gpu_cycles >= 4 && gpu_cycles < 84))) new_line = true;
+            // OAM: use internal mode so that dead-zone writes (gc=0..3, internal mode=2)
+            // set stat_irq_line=true, preventing a spurious interrupt at gc=4.
+            if ((RAM[STAT] & 0x20) && ((!lcd_startup_line && (mode_i == 2 || mode_int == 2)) || (LY_REG == 144 && gpu_cycles >= 4 && gpu_cycles < 84))) new_line = true;
             if ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC] && !lyc_delayed) new_line = true;
             stat_irq_line = new_line;
         }
@@ -948,6 +966,11 @@ void gpu_step(int _cycles){
 
     stat_halt_delay = false;  // clear one-shot HALT delay from previous STAT mode transition
 
+    // Remember if we started this step in the dead zone (gc=0..3).
+    // Used with stat_written_in_dead_zone to suppress spurious OAM interrupt when
+    // STAT is written in the dead zone and the same gpu_step crosses into OAM.
+    bool prev_gc_in_dead_zone = (gpu_cycles < 4);
+
     byte prev_mode = gpu_get_mode();
     byte prev_mode_visible = gpu_get_mode_projected(gpu_cycles);
     byte prev_mode_irq = gpu_get_mode_for_irq(gpu_cycles);
@@ -1044,8 +1067,13 @@ void gpu_step(int _cycles){
     // Check for STAT-visible mode transitions (4T propagation delay vs internal).
     // This fires mode-2 STAT interrupt at T=4 (not T=0) when mode-2 becomes visible in STAT.
     byte new_mode_visible = gpu_get_mode_projected(gpu_cycles);
+    // Suppress dead-zone→OAM transition when STAT was written in the dead zone of this
+    // same scanline. Hardware does not fire OAM interrupt in this case.
+    bool suppress_dead_zone_oam = stat_written_in_dead_zone && prev_gc_in_dead_zone && (LY_REG == prev_ly);
     if (new_mode_visible != prev_mode_visible) {
-        stat_check_irq();
+        if (!(suppress_dead_zone_oam && new_mode_visible == 2)) {
+            stat_check_irq();
+        }
     }
 
     // Check for STAT-interrupt mode transitions (4T for OAM, 8T for HBlank).
@@ -1068,7 +1096,9 @@ void gpu_step(int _cycles){
                 stat_halt_delay = true;
             }
         }
-        stat_check_irq();
+        if (!(suppress_dead_zone_oam && new_mode_irq == 2)) {
+            stat_check_irq();
+        }
     }
 
     // LYC coincidence: check whenever LY changed
@@ -5717,6 +5747,7 @@ void headless_main_impl(void) {
         instr_timer_cycles = 0;
         if_cleared_proj_gc = -100;
         if_cleared_proj_ly = -100;
+        stat_written_in_dead_zone = false;
         int prevcycles = cycles;
         do_interrupts();
         int dispatch_cycles = cycles - prevcycles;
