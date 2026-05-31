@@ -634,7 +634,9 @@ void gpu_write(int pos, byte data){
         // non-zero values that enable interrupt sources.
         if (data == 0) {
             byte cur_mode = gpu_get_mode();
-            if (gpu_control.enabled && (cur_mode == 0 || cur_mode == 1) && !stat_irq_line) {
+            bool in_oam = !lcd_startup_mode0 && !lcd_startup_line && real_ly < 144 &&
+                          gpu_cycles >= 4 && cur_mode == 2;
+            if (gpu_control.enabled && (cur_mode == 0 || cur_mode == 1 || in_oam) && !stat_irq_line) {
                 request_interrupt(INTERRUPT_STAT);
                 stat_irq_line = true;  // mark line high to prevent double-fire below
             }
