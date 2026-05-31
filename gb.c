@@ -145,18 +145,36 @@ static bool lcd_startup_line = false;
 // Accounts for fine-scroll penalty (SCX & 7) and sprite-fetch stall (6T per sprite, max 10).
 // Recomputed at the start of each new scanline; used by all mode-boundary queries.
 static int mode3_extra = 0;
+// SCX value used in the most recent compute_mode3_extra() call (at scanline wrap or lcd-on).
+// Compared at mode 2→3 entry to detect mid-OAM-scan SCX writes.
+static byte scx_at_last_compute = 0;
 
 // Recompute mode3_extra for the current LY_REG.
 // Must be called right after LY_REG is updated so OAM is scanned for the correct line.
-static void compute_mode3_extra(void) {
+// at_mode3_start: true when called at the mode-2→3 boundary (gc=80) due to a
+// mid-OAM-scan SCX write.  Uses the "new" formula that matches hardware-measured
+// STAT HBlank interrupt timing for each distinct SCX value:
+//   at_mode3_start=false (wrap / lcd-on):
+//     SCX&7 = 0:   0 T  |  1-4: 4 T  |  5-7: 8 T
+//   at_mode3_start=true (SCX written during OAM scan, gc=0..80):
+//     SCX&7 = 0-3: 0 T  |  4-6: 4 T  |  7:   8 T
+static void compute_mode3_extra_impl(bool at_mode3_start) {
     // Window active on this scanline? Triggers a fetcher-restart penalty.
     bool window_active = gpu_control.window &&
                          (int)RAM[WY] <= (int)real_ly && RAM[WX] <= 166;
 
-    // SCX fine-scroll penalty is quantized: the background fetcher stalls in
-    // 4T groups: 0 for SCX&7=0, 4T for SCX&7=1-4, 8T for SCX&7=5-7.
+    // SCX fine-scroll penalty
     int scx_fine = SCX_REG & 7;
-    int extra = (scx_fine == 0) ? 0 : (scx_fine <= 4 ? 4 : 8);
+    int extra;
+    if (at_mode3_start) {
+        // SCX was changed during OAM scan; hardware latches the new value at mode-3
+        // entry with a slightly different rounding boundary.
+        extra = (scx_fine <= 3) ? 0 : (scx_fine <= 6 ? 4 : 8);
+    } else {
+        // SCX sampled at scanline wrap (start of OAM scan) or lcd-on.
+        extra = (scx_fine == 0) ? 0 : (scx_fine <= 4 ? 4 : 8);
+    }
+    scx_at_last_compute = SCX_REG;
     if (gpu_control.sprite) {
         int height = gpu_control.sprite_tall ? 16 : 8;
         // Track background fetcher phase (0-7) and current pixel position
@@ -249,6 +267,17 @@ static void compute_mode3_extra(void) {
     // extending mode 3 by 4T.
     if (window_active) {
         mode3_extra += 4;
+    }
+}
+
+// Wrappers for the two call sites.
+static void compute_mode3_extra(void) {
+    compute_mode3_extra_impl(false);
+}
+// Called at the mode 2→3 boundary: only recomputes if SCX changed since the wrap.
+static void recompute_mode3_extra_at_mode3(void) {
+    if (SCX_REG != scx_at_last_compute) {
+        compute_mode3_extra_impl(true);
     }
 }
 
@@ -727,6 +756,12 @@ void gpu_step(int _cycles){
     // Check for mode transitions (internal: mode 3→0 HBlank, mode 0→2 new scanline)
     byte new_mode = gpu_get_mode();
     if (new_mode != prev_mode) {
+        // When entering mode 3, recompute mode3_extra with the current SCX/OAM values.
+        // SCX may have been written between gc=0 and gc=80 (before mode 3 begins),
+        // so the scanline-wrap value would be stale.  OAM scan is also complete by gc=80.
+        if (new_mode == 3) {
+            recompute_mode3_extra_at_mode3();
+        }
         stat_check_irq();
     }
 
