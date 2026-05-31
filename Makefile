@@ -2,17 +2,19 @@ CFLAGS       := $(shell pkg-config --cflags sdl2)
 LDFLAGS      := $(shell pkg-config --libs sdl2)
 CBOR_CFLAGS  := $(shell pkg-config --cflags libcbor)
 CBOR_LDFLAGS := $(shell pkg-config --libs libcbor)
+LWS_CFLAGS   := $(shell pkg-config --cflags libwebsockets)
+LWS_LDFLAGS  := $(shell pkg-config --libs libwebsockets)
 CC      := gcc
 STRICT  := -Wall -Wextra -Wconversion -Wsign-conversion -Wshadow -Wundef -Werror
 
-SRCS    := gb.c savestate.c
-HDRS    := bios.h bits.h constants.h opnames.h savestate.h
+SRCS    := gb.c savestate.c ws_server.c
+HDRS    := bios.h bits.h constants.h opnames.h savestate.h ws_server.h
 
 gb: $(SRCS) $(HDRS)
-	$(CC) $(CFLAGS) $(CBOR_CFLAGS) $(STRICT) -g $(SRCS) -o $@ $(LDFLAGS) $(CBOR_LDFLAGS)
+	$(CC) $(CFLAGS) $(CBOR_CFLAGS) $(LWS_CFLAGS) $(STRICT) -g $(SRCS) -o $@ $(LDFLAGS) $(CBOR_LDFLAGS) $(LWS_LDFLAGS)
 
 asan: $(SRCS) $(HDRS)
-	$(CC) $(CFLAGS) $(CBOR_CFLAGS) $(STRICT) -g -fsanitize=undefined,address $(SRCS) -o gb_asan $(LDFLAGS) $(CBOR_LDFLAGS)
+	$(CC) $(CFLAGS) $(CBOR_CFLAGS) $(LWS_CFLAGS) $(STRICT) -g -fsanitize=undefined,address $(SRCS) -o gb_asan $(LDFLAGS) $(CBOR_LDFLAGS) $(LWS_LDFLAGS)
 
 test_savestate: tests/test_savestate.c savestate.c savestate.h $(HDRS)
 	$(CC) $(CFLAGS) $(CBOR_CFLAGS) $(STRICT) -g -DGAMEBOY_LIB_MODE \

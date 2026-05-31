@@ -5659,14 +5659,92 @@ void ss_post_load(void) {
      */
 }
 
+/* ---- Public APIs for the WebSocket server layer ---- */
+
+/*
+ * Set or clear a joypad button and fire the joypad interrupt if state changed.
+ * bit: 0=RIGHT, 1=LEFT, 2=UP, 3=DOWN, 4=A, 5=B, 6=SELECT, 7=START
+ */
+void gb_set_button(int bit, bool pressed) {
+    bool *btns[] = {
+        &joypad_buttons.RIGHT,   /* 0 */
+        &joypad_buttons.LEFT,    /* 1 */
+        &joypad_buttons.UP,      /* 2 */
+        &joypad_buttons.DOWN,    /* 3 */
+        &joypad_buttons.A,       /* 4 */
+        &joypad_buttons.B,       /* 5 */
+        &joypad_buttons.SELECT,  /* 6 */
+        &joypad_buttons.START,   /* 7 */
+    };
+    if (bit < 0 || bit >= 8) return;
+    bool prev = *btns[bit];
+    *btns[bit] = pressed;
+    if (prev != pressed)
+        request_interrupt(INTERRUPT_JOYPAD);
+}
+
+/*
+ * Soft-reset: save battery RAM, reinitialise all subsystems, reload battery RAM.
+ */
+void gb_reset(void) {
+    sav_save(savestate_rom_path);
+    mem_init();
+    gpu_init();
+    cpu_fake_init();
+    joypad_init();
+    sav_load(savestate_rom_path);
+}
+
 #ifndef GAMEBOY_LIB_MODE
+
+/* ---- Server mode (WebSocket remote frontend) ---- */
+
+#include "ws_server.h"
+#include <time.h>
+
+static void server_main_impl(void) {
+    while (1) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+
+        frame_headless();
+        ws_server_notify_frame(pixels, VIEWPORT_WIDTH, VIEWPORT_HEIGHT);
+        ws_server_service();
+
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long elapsed_us = (t1.tv_sec  - t0.tv_sec)  * 1000000L
+                        + (t1.tv_nsec - t0.tv_nsec) / 1000L;
+        long target_us  = 16667L; /* ~60 fps */
+        if (elapsed_us < target_us)
+            usleep((unsigned int)(target_us - elapsed_us));
+    }
+}
+
 int main(int argc, char **argv){
   char *rom = "tetris.gb";
   bool load_from_state = false;
+  bool server_mode = false;
+  int  server_port = 8080;
+  const char *server_bind = NULL;
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--headless") == 0) {
       headless = true;
+    } else if (strcmp(argv[i], "--server") == 0) {
+      server_mode = true;
+      headless = true;  /* server mode is also headless (no SDL window) */
+    } else if (strcmp(argv[i], "--port") == 0) {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "Missing value for --port\n");
+        return 1;
+      }
+      server_port = atoi(argv[++i]);
+    } else if (strcmp(argv[i], "--bind") == 0) {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "Missing value for --bind\n");
+        return 1;
+      }
+      server_bind = argv[++i];
     } else if (strcmp(argv[i], "--gbmicrotest") == 0) {
       gbmicrotest_mode = true;
     } else if (strcmp(argv[i], "--cycles") == 0) {
@@ -5723,7 +5801,14 @@ int main(int argc, char **argv){
     joypad_init();
   }
 
-  if (headless) {
+  if (server_mode) {
+    if (!ws_server_init(server_bind, server_port)) {
+      fprintf(stderr, "Failed to start WebSocket server\n");
+      return 1;
+    }
+    server_main_impl();
+    ws_server_destroy();
+  } else if (headless) {
     headless_main_impl();
   } else {
     sdl_main_impl();

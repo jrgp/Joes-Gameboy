@@ -80,25 +80,30 @@ and reads `0xFF82` for the pass/fail result after the cycle limit.
 
 ## Build targets
 
-| Target      | Command       | Output    | Purpose                        |
-|-------------|---------------|-----------|--------------------------------|
-| Default     | `make`        | `./gb`    | Normal build, strict warnings  |
-| ASan/UBSan  | `make asan`   | `./gb_asan` | Sanitizer build              |
-| Clean       | `make clean`  | —         | Remove both binaries           |
+| Target           | Command              | Output              | Purpose                       |
+|------------------|----------------------|---------------------|-------------------------------|
+| Default          | `make`               | `./gb`              | Normal build (with ws server) |
+| ASan/UBSan       | `make asan`          | `./gb_asan`         | Sanitizer build               |
+| Save-state tests | `make test_savestate`| `tests/test_savestate_bin` | 38-test round-trip suite |
+| Clean            | `make clean`         | —                   | Remove all build artifacts    |
+
+Dependencies: `libsdl2-dev`, `libcbor-dev`, `libwebsockets-dev`
 
 ---
 
 ## Key source files
 
-| File           | Purpose                                      |
-|----------------|----------------------------------------------|
-| `gb.c`         | Single-file emulator (~5100 lines)           |
-| `bits.h`       | Bit-manipulation macros (`bit_set`, etc.)    |
-| `constants.h`  | Interrupt constants and priority table       |
-| `Makefile`     | Build rules with strict flags                |
-| `tests/`       | Test scripts and ROM directories             |
-| `roms/blargg/` | Blargg test ROMs                             |
-| `roms/mooneye/`| Mooneye test ROMs                            |
+| File            | Purpose                                      |
+|-----------------|----------------------------------------------|
+| `gb.c`          | Single-file emulator (~5700 lines)           |
+| `savestate.h/c` | CBOR save-state serialization (76-field map) |
+| `ws_server.h/c` | WebSocket/HTTP remote browser frontend       |
+| `bits.h`        | Bit-manipulation macros (`bit_set`, etc.)    |
+| `constants.h`   | Interrupt constants and priority table       |
+| `Makefile`      | Build rules with strict flags                |
+| `tests/`        | Test scripts and ROM directories             |
+| `roms/blargg/`  | Blargg test ROMs                             |
+| `roms/mooneye/` | Mooneye test ROMs                            |
 | `roms/gbmicrotest/` | GBMicro test ROMs (513 ROMs)           |
 
 ---
@@ -112,3 +117,35 @@ and reads `0xFF82` for the pass/fail result after the cycle limit.
 # GBMicrotest-style (0xFF82 pass/fail register):
 ./gb --headless --gbmicrotest --cycles 500000 roms/gbmicrotest/add_hl_timing.gb
 ```
+
+---
+
+## Browser-based remote frontend
+
+Serves a web page over HTTP and streams the framebuffer to all connected browsers
+over WebSocket. The emulator runs on the server; the browser is a thin remote UI.
+
+```bash
+# Start server (listens on all interfaces, port 8080 by default):
+./gb --server game.gb
+
+# Custom port / bind address:
+./gb --server --port 9000 --bind 127.0.0.1 game.gb
+```
+
+Open `http://localhost:8080` in a browser. Controls:
+- **Keyboard**: Arrow keys = D-Pad, A = A button, S = B button, Enter = Start,
+  Shift = Select, F5 = Save State, F8 = Load State
+- **Touch**: on-screen D-pad (bottom-left), A/B buttons (bottom-right),
+  Select/Start (center-bottom)
+- **Toolbar**: Save State, Load State, Reset buttons
+
+Wire protocol (binary WebSocket):
+- Server→client: `[0x01]` + 160×144×4 RGBA bytes (frame update)
+- Client→server: `[0x02, bitmask]` joypad, `[0x03]` save, `[0x04]` load, `[0x05]` reset
+
+Dependencies: `libwebsockets-dev` (pkg-config: `libwebsockets`)
+
+All persistent state (ROMs, save states, battery saves) is stored on the server.
+Save states use the existing CBOR format adjacent to the ROM.
+
