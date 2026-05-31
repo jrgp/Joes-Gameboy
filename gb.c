@@ -391,11 +391,12 @@ static void stat_check_irq_impl(bool allow_interrupt) {
         stat_irq_line = false;
         return;
     }
-    byte mode = gpu_get_mode();
     // STAT-visible mode uses 8T propagation delay (same as STAT register reads).
     byte mode_visible = gpu_get_mode_projected(gpu_cycles);
-    // Mode 0: fire when both internal mode and STAT-visible mode are 0 (gc>=260).
-    bool mode0_cond = (RAM[STAT] & 0x08) && mode == 0 && mode_visible == 0 && real_ly < 144;
+    // Mode 0: fires when STAT-visible mode is 0 (gc=0..7 dead zone + gc=260..455 HBlank).
+    // Using mode_visible==0 (not internal mode==0) keeps the STAT line high during the
+    // 8T dead zone at the start of each scanline, preventing spurious mode-2 interrupts.
+    bool mode0_cond = (RAM[STAT] & 0x08) && mode_visible == 0 && real_ly < 144;
     // Mode 1: use STAT-visible mode-1 (fires at gc=8 of LY=144, same 8T delay as mode-2).
     bool mode1_cond = (RAM[STAT] & 0x10) && mode_visible == 1;
     // Mode 2 OAM: fires when mode-2 becomes STAT-visible (gc=8..87).
@@ -404,7 +405,14 @@ static void stat_check_irq_impl(bool allow_interrupt) {
     bool mode2_cond = (RAM[STAT] & 0x20) && !lcd_startup_line &&
             ((!lcd_startup_mode0 && real_ly < 144 && mode_visible == 2) ||
              (real_ly == 144 && gpu_cycles < 80));
-    bool lyc_cond = (RAM[STAT] & 0x40) && LY_REG == RAM[LYC];
+    // LYC dead zone: on real hardware the LYC comparator output has an 8T propagation
+    // delay after LY changes. The LYC STAT line contribution goes active at gc=8, not gc=0.
+    // Without the dead zone, LYC fires the interrupt 8T early (sum off by 2 in int_lyc_nops).
+    // The mode0_cond change above keeps stat_irq_line HIGH at gc=0..7 when mode-0 source is
+    // enabled, so stat_irq_blocking still passes (no spurious rising edge at gc=8).
+    // VBlank period (real_ly>=144) and LCD startup are exempt — no 8T delay there.
+    bool lyc_dead_zone = !lcd_startup_mode0 && gpu_cycles < 8 && real_ly < 144;
+    bool lyc_cond = (RAM[STAT] & 0x40) && LY_REG == RAM[LYC] && !lyc_dead_zone;
     bool line = mode0_cond || mode1_cond || mode2_cond || lyc_cond;
     if (line && !stat_irq_line) {
         // For STAT register writes (allow_interrupt=false): mode-2 and mode-0 are
@@ -472,6 +480,15 @@ byte gpu_read(int pos){
         return 0x80 | (RAM[STAT] & 0x78) | lyc_flag | mode;
     }
     if (pos == LY) {
+        // Line 153 quirk: LY_REG shows 153 for only 4 T-cycles, then drops to 0.
+        // gpu_step updates LY_REG=0 after instruction completes, but the read
+        // M-cycle may straddle the 4T boundary.  Use projected cycle to return 0
+        // when the read is after the 4T transition (projected >= 4), even before
+        // gpu_step has run.
+        if (real_ly == 153 && LY_REG == 153) {
+            int proj153 = gpu_cycles + instr_timer_cycles - 4;
+            if (proj153 >= 4) return 0;
+        }
         // Project LY forward to account for the hardware read-latch delay.
         // LY physically increments in gpu_step when gpu_cycles reaches 456 (same for
         // startup and normal lines), but the LY register read reflects the new value
@@ -758,7 +775,10 @@ void gpu_step(int _cycles){
             if (real_ly == 1) lcd_startup_line = false;
 
             if (real_ly == 144) {
-                // VBlank period starts; VBlank interrupt is unconditional
+                // VBlank period starts; VBlank interrupt is unconditional.
+                // Note: hardware fires VBlank at gc=8 (same 8T delay as mode-1 STAT),
+                // but our timer_internal starting value is calibrated for gc=0 behavior.
+                // TODO: fix timer_internal offset in cpu_fake_init and move to gc=8.
                 request_interrupt(INTERRUPT_VBLANK);
             } else if (real_ly < 144) {
                 gpu_drawline(real_ly);
