@@ -565,18 +565,54 @@ byte gpu_read(int pos){
             byte lyc_flag = lcd_off_lyc_flag ? 0x04 : 0x00;
             return 0x80 | (RAM[STAT] & 0x78) | lyc_flag;
         }
-        // Use projected mode: STAT samples the mode at end of M2 of the read instruction.
-        // projected = gpu_cycles + (instr_timer_cycles - 4) gives the T-cycle of the read.
+        // Use projected mode: STAT samples the mode at the T-cycle of the bus read.
+        // projected = gpu_cycles + (instr_timer_cycles - 4) gives the effective T-cycle.
         int projected = gpu_cycles + instr_timer_cycles - 4;
-        byte mode = gpu_get_mode_projected(projected);
-        // LYC comparison: during the first 8T of a new scanline (projected < 8, outside
-        // the startup mode0 window), the hardware comparison circuit is in a reset/dead
-        // zone — the flag reads as 0 regardless of LYC. After 8T, normal comparison resumes.
-        byte lyc_flag;
-        if (!lcd_startup_mode0 && projected < 8) {
-            lyc_flag = 0x00; // dead zone: LYC comparison cleared at line start
+
+        // Mid-instruction scanline wrap: when the effective T-cycle of the read crosses
+        // the 456T scanline boundary, the hardware PPU has already incremented LY and
+        // reset the scanline counter.  Use the next-scanline state instead of clamping.
+        int stat_real_ly = real_ly;
+        int stat_ly_reg = LY_REG;
+        bool from_line153 = false;
+        if (projected >= 456) {
+            projected -= 456;
+            stat_real_ly = real_ly + 1;
+            if (stat_real_ly > 153) {
+                stat_real_ly = 0;
+                from_line153 = true;
+            }
+            // LY_REG for the next line:
+            // For line 153→0, LY_REG was already 0 (the 4T quirk), stays 0.
+            // For all other wraps, LY_REG = stat_real_ly.
+            stat_ly_reg = stat_real_ly;
+        }
+
+        // Compute mode for stat_real_ly at the new projected offset.
+        byte mode;
+        if (stat_real_ly > 144) {
+            mode = 1; // VBlank
+        } else if (stat_real_ly == 144) {
+            mode = (projected < 8) ? 0 : 1; // 8T propagation delay on VBlank start
         } else {
-            lyc_flag = (LY_REG == RAM[LYC]) ? 0x04 : 0x00;
+            // For active display lines, use the standard projected-mode formula.
+            // Temporarily swap real_ly so gpu_get_mode_projected uses the right line.
+            int saved_real_ly = real_ly;
+            real_ly = (byte)stat_real_ly;
+            mode = gpu_get_mode_projected(projected);
+            real_ly = (byte)saved_real_ly;
+        }
+
+        // LYC comparison: during the first 8T of a new scanline the hardware comparison
+        // circuit is in a reset/dead zone — the flag reads 0.  Exception: the line 153→0
+        // transition leaves LY_REG=0 since gc=4 of line 153 (the LY quirk), so LYC=0
+        // was already established before line 0 starts — no dead zone for that wrap.
+        byte lyc_flag;
+        bool in_dead_zone = !lcd_startup_mode0 && projected < 8 && !from_line153;
+        if (in_dead_zone) {
+            lyc_flag = 0x00;
+        } else {
+            lyc_flag = (stat_ly_reg == RAM[LYC]) ? 0x04 : 0x00;
         }
         return 0x80 | (RAM[STAT] & 0x78) | lyc_flag | mode;
     }
