@@ -436,7 +436,10 @@ static void stat_check_irq_impl(bool allow_interrupt) {
     // The mode0_cond change above keeps stat_irq_line HIGH at gc=0..7 when mode-0 source is
     // enabled, so stat_irq_blocking still passes (no spurious rising edge at gc=8).
     // VBlank period (real_ly>=144) and LCD startup are exempt — no 8T delay there.
-    bool lyc_dead_zone = !lcd_startup_mode0 && gpu_cycles < 8 && real_ly < 144;
+    // Exception: LY=153 LYC=0 case uses a 16T dead zone (not 8T) because LY_REG drops from
+    // 153 to 0 at gc=4, and the LYC=0 match doesn't become visible in STAT until gc=16.
+    bool lyc_dead_zone = (!lcd_startup_mode0 && gpu_cycles < 8 && real_ly < 144) ||
+                         (real_ly == 153 && LY_REG == 0 && gpu_cycles < 16);
     bool lyc_cond = (RAM[STAT] & 0x40) && LY_REG == RAM[LYC] && !lyc_dead_zone;
 
     // VBlank interrupt (unconditional): fires when mode-1 becomes visible (gc=8 on LY=144).
@@ -515,8 +518,12 @@ static void stat_check_irq_midinstruction(void) {
                               proj_gc >= 460 && proj_gc < 464;
 
     // LYC: dead zone ends between curr_gc and proj_gc (crossing gc=8).
-    bool lyc_dead_curr = !lcd_startup_mode0 && curr_gc < 8 && real_ly < 144;
-    bool lyc_dead_proj = !lcd_startup_mode0 && proj_gc < 8 && real_ly < 144;
+    // Extended: on line 153 with LY_REG=0 (after the LY_REG drop), the dead zone
+    // extends to gc=16 (same threshold used in stat_check_irq_impl and STAT reads).
+    bool lyc_dead_curr = (!lcd_startup_mode0 && curr_gc < 8 && real_ly < 144) ||
+                         (real_ly == 153 && LY_REG == 0 && curr_gc < 16);
+    bool lyc_dead_proj = (!lcd_startup_mode0 && proj_gc < 8 && real_ly < 144) ||
+                         (real_ly == 153 && LY_REG == 0 && proj_gc < 16);
     bool lyc_fires = (RAM[STAT] & 0x40) && LY_REG == RAM[LYC] &&
                      lyc_dead_curr && !lyc_dead_proj;
 
@@ -937,6 +944,7 @@ void gpu_step(int _cycles){
     byte prev_mode = gpu_get_mode();
     byte prev_mode_visible = gpu_get_mode_projected(gpu_cycles);
     int prev_ly = LY_REG;
+    int pre_gc = gpu_cycles;
     gpu_cycles += _cycles;
 
     // Clear startup mode-0 override once gpu_cycles advances into OAM scan range.
@@ -984,7 +992,13 @@ void gpu_step(int _cycles){
     // This causes LYC=0 to match twice per frame: once here and once at line 0 start.
     if (real_ly == 153 && LY_REG == 153 && gpu_cycles >= 4) {
         LY_REG = 0;
-        stat_check_irq();  // check LYC=0 match now that LY_REG=0
+        stat_check_irq();  // check LYC=0 match now that LY_REG=0 (dead zone gc<16 suppresses)
+    }
+
+    // LY=153 LYC=0 dead zone exit: the LYC=0 match becomes visible at gc=16 (not gc=4).
+    // Fire stat_check_irq when gpu_cycles first crosses 16 while still on line 153 with LY_REG=0.
+    if (real_ly == 153 && LY_REG == 0 && pre_gc < 16 && gpu_cycles >= 16) {
+        stat_check_irq();
     }
 
     // Check for mode transitions (internal: mode 3→0 HBlank, mode 0→2 new scanline)
