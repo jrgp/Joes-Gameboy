@@ -520,6 +520,14 @@ static void stat_check_irq_midinstruction(void) {
     bool lyc_fires = (RAM[STAT] & 0x40) && LY_REG == RAM[LYC] &&
                      lyc_dead_curr && !lyc_dead_proj;
 
+    // LYC-at-boundary: proj_gc == 456 means the M-cycle lands exactly at the last
+    // T-cycle of the current scanline. The line hasn't wrapped yet so LY_REG still
+    // reflects the current line. If LYC matches LY_REG at this moment, the hardware
+    // fires the LYC interrupt before the scanline counter increments.
+    // This covers LYC writes (and IF reads) where gc+instr_timer-4 == 456.
+    bool lyc_scanline_end_fires = (RAM[STAT] & 0x40) && LY_REG == RAM[LYC] &&
+                                  proj_gc == 456 && !lyc_dead_curr;
+
     // Mode-1 (VBlank STAT): dead zone → mode-1 transition on LY=144.
     // Same 8T propagation delay as mode-2: fires at gc=8 on LY=144.
     bool mode1_fires = (RAM[STAT] & 0x10) && real_ly == 144 &&
@@ -535,12 +543,12 @@ static void stat_check_irq_midinstruction(void) {
         }
     }
 
-    if (mode0_fires || mode1_fires || mode2_fires || mode2_xline_fires || lyc_fires) {
+    if (mode0_fires || mode1_fires || mode2_fires || mode2_xline_fires || lyc_fires || lyc_scanline_end_fires) {
         int next_ly = LY_REG + 1;
         if (next_ly > 153) next_ly = 0;
         bool suppressed = false;
         if (if_cleared_proj_ly == LY_REG) {
-            if ((mode2_fires || mode1_fires || lyc_fires) && if_cleared_proj_gc == 8)
+            if ((mode2_fires || mode1_fires || lyc_fires || lyc_scanline_end_fires) && if_cleared_proj_gc == 8)
                 suppressed = true;
             if (mode0_fires && if_cleared_proj_gc == 260 + mode3_extra)
                 suppressed = true;
@@ -623,14 +631,17 @@ byte gpu_read(int pos){
 
         // LYC comparison: during the first 8T of a new scanline the hardware comparison
         // circuit is in a reset/dead zone — the flag reads 0.
-        // Exception 1: the line 153→0 transition leaves LY_REG=0 since gc=4 of line 153
-        //   (the LY quirk), so LYC=0 was already established — no dead zone for that wrap.
-        // Exception 2: while still on line 153 but LY_REG has already dropped to 0
-        //   (gc=4..7), LYC=0 is already matching — skip the dead zone.
+        // Special case: on line 153, LY_REG drops from 153 to 0 at gc=4 (DMG quirk).
+        // After this drop, the LYC comparison circuit needs until gc=16 before LYC=LY
+        // match is visible in STAT (extended dead zone gc=4..15, i.e. projected < 16).
         byte lyc_flag;
-        bool in_dead_zone = !lcd_startup_mode0 && projected < 8
-                            && !from_line153
-                            && !(stat_real_ly == 153 && stat_ly_reg == 0);
+        bool in_dead_zone;
+        if (stat_real_ly == 153 && stat_ly_reg == 0) {
+            // LY_REG=0 from the line-153 quirk: extended dead zone until projected=16.
+            in_dead_zone = !lcd_startup_mode0 && projected < 16;
+        } else {
+            in_dead_zone = !lcd_startup_mode0 && projected < 8 && !from_line153;
+        }
         if (in_dead_zone) {
             lyc_flag = 0x00;
         } else {
@@ -753,6 +764,11 @@ void gpu_write(int pos, byte data){
     }
     if (pos == LYC) {
         RAM[LYC] = data;
+        // Re-evaluate LYC=LY match using projected timing to handle the dead-zone-crossing
+        // case (when gc < 8 but projected gc ≥ 8 at the M-cycle of the write), and also
+        // the scanline-boundary case (projected == 456) where the interrupt fires before wrap.
+        // Using only midinstruction avoids disturbing stat_irq_line when no condition fires.
+        stat_check_irq_midinstruction();
     }
     if (pos == SCX) {
         SCX_REG = data;
