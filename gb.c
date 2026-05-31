@@ -464,13 +464,21 @@ static void stat_check_irq_midinstruction(void) {
                        !lcd_startup_mode0 && real_ly < 144 &&
                        mode_proj == 2 && mode_curr != 2;
 
+    // Cross-line mode-2: the M-cycle straddles the scanline boundary and its
+    // [proj_gc-456, proj_gc-456+4) window spans gc=8 on the next line.
+    // proj_gc in [460, 463] ↔ wrapped start in [4,7], wrapped end in [8,11].
+    // Only applies on visible lines (real_ly < 143) since line 144 is VBlank.
+    bool mode2_xline_fires = (RAM[STAT] & 0x20) && !lcd_startup_mode0 &&
+                              real_ly < 143 &&
+                              proj_gc >= 460 && proj_gc < 464;
+
     // LYC: dead zone ends between curr_gc and proj_gc (crossing gc=8).
     bool lyc_dead_curr = !lcd_startup_mode0 && curr_gc < 8 && real_ly < 144;
     bool lyc_dead_proj = !lcd_startup_mode0 && proj_gc < 8 && real_ly < 144;
     bool lyc_fires = (RAM[STAT] & 0x40) && LY_REG == RAM[LYC] &&
                      lyc_dead_curr && !lyc_dead_proj;
 
-    if (mode0_fires || mode2_fires || lyc_fires) {
+    if (mode0_fires || mode2_fires || mode2_xline_fires || lyc_fires) {
         request_interrupt(INTERRUPT_STAT);
         stat_irq_line = true;  // prevent double-fire in post-instruction stat_check_irq
     }
