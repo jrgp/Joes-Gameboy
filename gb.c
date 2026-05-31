@@ -3191,9 +3191,9 @@ void exec_op(byte opcode){
         byte ie_reg = mem_read(INTERRUPT_ENABLE);
         byte if_reg = mem_read(INTERRUPT_FLAGS);
         if (!interrupts && (ie_reg & if_reg & 0x1F) != 0) {
-            // HALT bug: IME=0 and pending interrupt — CPU skips HALT but
-            // the next instruction's opcode byte is read without PC advancing.
-            halt_bug_active = true;
+        // HALT bug: IME=0 and pending interrupt — CPU skips HALT but
+        // the next instruction's opcode byte is read without PC advancing.
+        halt_bug_active = true;
         } else {
             halted = true;
         }
