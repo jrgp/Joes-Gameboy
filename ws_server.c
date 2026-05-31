@@ -341,7 +341,7 @@ bool ws_server_init(const char *bind_addr, int port)
     info.port       = port;
     info.iface      = bind_addr;   /* NULL = all interfaces */
     info.protocols  = protocols;
-    info.options    = LWS_SERVER_OPTION_HTTP_HEADERS_SECURITY_BEST_PRACTICES_ENFORCE;
+    info.options    = 0;
 
     g_context = lws_create_context(&info);
     if (!g_context) {
