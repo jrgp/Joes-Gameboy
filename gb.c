@@ -616,7 +616,16 @@ void gpu_write(int pos, byte data){
         // Update stat_irq_line state to reflect new STAT bits, but do NOT fire a new
         // interrupt: on real hardware, enabling an interrupt bit after the mode's
         // rising edge has already passed does not retroactively fire the interrupt.
-        stat_check_irq_on_stat_write();
+        // During the line-start dead zone the internal OAM source is already active even
+        // though STAT still reports mode 0. Reflect that internal OAM-high state so a
+        // STAT write in gc=0..7 does not spuriously create a later 0→1 edge at gc=8.
+        if (gpu_control.enabled && !lcd_startup_mode0 && real_ly < 144 && gpu_cycles < 8) {
+            bool mode0_line = (RAM[STAT] & 0x08) != 0;
+            bool mode2_line = (RAM[STAT] & 0x20) && !lcd_startup_line && gpu_get_mode() == 2;
+            stat_irq_line = mode0_line || mode2_line;
+        } else {
+            stat_check_irq_on_stat_write();
+        }
     }
     if (pos == LCDC) {
         bool was_enabled = bit_check(LCDC_REG, 7);
@@ -1262,6 +1271,7 @@ int timer_tima_cycles = 0;
 static uint16_t timer_internal = 0;
 static int timer_overflow_pending = 0;  // cycles until TMA reload (0=none)
 static bool timer_just_reloaded = false; // true during the M-cycle that TMA reloaded TIMA
+static bool timer_halt_delay = false;    // HALT sees TIMA overflow 4T later (at reload time)
 
 // Bit in timer_internal that drives TIMA for each TAC mode (bits 1-0)
 static const int timer_tac_bit[4] = { 9, 3, 5, 7 };
@@ -1269,6 +1279,7 @@ static const int timer_tac_bit[4] = { 9, 3, 5, 7 };
 // Advance timer by exactly 4 T-cycles; called in a loop from timer_step.
 static void timer_tick4(void) {
     timer_just_reloaded = false;  // reset at start of each tick
+    timer_halt_delay = false;
 
     // Handle TMA reload delay
     if (timer_overflow_pending > 0) {
@@ -1276,7 +1287,6 @@ static void timer_tick4(void) {
         if (timer_overflow_pending <= 0) {
             timer_overflow_pending = 0;
             RAM[REG_TIMA] = RAM[REG_TMA];
-            request_interrupt(INTERRUPT_TIMER);
             timer_just_reloaded = true;
         }
     }
@@ -1293,8 +1303,10 @@ static void timer_tick4(void) {
         bool new_bit = (timer_internal >> bit) & 1;
         if (old_bit && !new_bit) {
             if (++RAM[REG_TIMA] == 0) {
-                // TIMA overflow: 4-cycle delay before TMA reload
+                // TIMA overflow: IF rises immediately; HALT wakes 4T later at reload time.
+                request_interrupt(INTERRUPT_TIMER);
                 timer_overflow_pending = 4;
+                timer_halt_delay = true;
             }
         }
     }
@@ -1470,12 +1482,20 @@ byte mem_read(int pos) {
                        (apu_ch1_active ? 0x01 : 0x00) |
                        (apu_ch2_active ? 0x02 : 0x00) |
                        0x70; // unused bits read as 1
-            case INTERRUPT_FLAGS:
+            case INTERRUPT_FLAGS: {
                 // DMG: upper 3 bits of IF are always 1.
                 // Mid-instruction check: if a STAT source condition rises between
                 // gpu_cycles and the projected T-cycle of this read, set IF immediately.
                 stat_check_irq_midinstruction();
-                return RAM[pos] | 0xE0;
+                byte result = RAM[pos] | 0xE0;
+                if (LY_REG == 144 && gpu_cycles == 0) {
+                    // Reads on the first LY=144 M-cycles can observe the pending OAM/STAT edge
+                    // slightly before the normal post-instruction bookkeeping catches up.
+                    if ((RAM[STAT] & 0x20) && instr_timer_cycles >= 8) result |= INTERRUPT_STAT;
+                    if ((RAM[STAT] & 0x10) && instr_timer_cycles >= 12) result |= INTERRUPT_STAT;
+                }
+                return result;
+            }
             case 0xFF01:
                 return serial_sb;
             case 0xFF02: // SC: bits 6-1 always 1
@@ -1587,8 +1607,10 @@ void mem_write(int pos, byte data) {
             RAM[REG_DIV] = 0;
             // Falling edge: if timer enabled and selected bit was 1
             if ((RAM[REG_TAC] & 0x04) && was_set) {
-                if (++RAM[REG_TIMA] == 0)
+                if (++RAM[REG_TIMA] == 0) {
+                    request_interrupt(INTERRUPT_TIMER);
                     timer_overflow_pending = 4;
+                }
             }
             break;
         }
@@ -2029,11 +2051,14 @@ void do_interrupts(void){
   // Mask to bits 0-4 only; IF bits 5-7 are always 1 (hardware artifact)
   byte enabled_bits = mem_read(INTERRUPT_ENABLE) & 0x1F;
   byte flag_bits = mem_read(INTERRUPT_FLAGS) & 0x1F;
-  if ((flag_bits & enabled_bits) > 0) {
+  byte halt_check_flags = flag_bits;
+  if (halted && timer_halt_delay)
+      halt_check_flags &= (byte)~INTERRUPT_TIMER;
+  if ((halt_check_flags & enabled_bits) > 0) {
       halted = false;
   }
 
-  if (interrupts) {
+  if (!halted && interrupts) {
     if(enabled_bits > 0){
       byte enabled = flag_bits & enabled_bits;
 
