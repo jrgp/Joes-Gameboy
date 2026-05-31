@@ -437,45 +437,6 @@ static void stat_check_irq_on_stat_write(void) {
     stat_check_irq_impl(false);
 }
 
-// Called when IF (0xFF0F) is read mid-instruction. On real hardware the STAT IRQ
-// line — and therefore IF bit 1 — rises as soon as a STAT source condition becomes
-// true, even mid-instruction.  Our post-instruction stat_check_irq() would miss this
-// window, so we speculatively fire here using the projected T-cycle offset.
-// We only set IF (and update stat_irq_line to prevent double-fire); the full
-// stat_irq_line update still happens in the normal post-instruction path.
-static void stat_check_irq_midinstruction(void) {
-    if (!gpu_control.enabled) return;
-    if (stat_irq_line) return;  // line already high — no new rising edge possible
-
-    int curr_gc = gpu_cycles;
-    int proj_gc = gpu_cycles + instr_timer_cycles - 4;
-    if (proj_gc <= curr_gc) return;  // no M-cycle elapsed yet; curr_gc == proj_gc
-
-    byte mode_curr = gpu_get_mode_projected(curr_gc);
-    byte mode_proj = gpu_get_mode_projected(proj_gc);
-
-    // Mode-0 (HBlank): STAT-visible mode transitions from non-0 to 0.
-    bool mode0_fires = (RAM[STAT] & 0x08) && real_ly < 144 &&
-                       mode_proj == 0 && mode_curr != 0;
-
-    // Mode-2 (OAM scan): mode transitions from dead zone (0 at gc<8) to 2.
-    // Suppressed on lcd_startup_line (no OAM STAT on startup scanline).
-    bool mode2_fires = (RAM[STAT] & 0x20) && !lcd_startup_line &&
-                       !lcd_startup_mode0 && real_ly < 144 &&
-                       mode_proj == 2 && mode_curr != 2;
-
-    // LYC: dead zone ends between curr_gc and proj_gc (crossing gc=8).
-    bool lyc_dead_curr = !lcd_startup_mode0 && curr_gc < 8 && real_ly < 144;
-    bool lyc_dead_proj = !lcd_startup_mode0 && proj_gc < 8 && real_ly < 144;
-    bool lyc_fires = (RAM[STAT] & 0x40) && LY_REG == RAM[LYC] &&
-                     lyc_dead_curr && !lyc_dead_proj;
-
-    if (mode0_fires || mode2_fires || lyc_fires) {
-        request_interrupt(INTERRUPT_STAT);
-        stat_irq_line = true;  // prevent double-fire in post-instruction stat_check_irq
-    }
-}
-
 byte gpu_read(int pos){
     //printf("reading from gpu %x\n", pos);
     if (pos >= 0x8000 && pos <= 0x9FFF) {
@@ -814,11 +775,9 @@ void gpu_step(int _cycles){
             if (real_ly == 1) lcd_startup_line = false;
 
             if (real_ly == 144) {
-                // VBlank period starts; VBlank interrupt is unconditional.
-                // Note: hardware fires VBlank at gc=8 (same 8T delay as mode-1 STAT),
-                // but our timer_internal starting value is calibrated for gc=0 behavior.
-                // TODO: fix timer_internal offset in cpu_fake_init and move to gc=8.
-                request_interrupt(INTERRUPT_VBLANK);
+                // VBlank period starts; VBlank interrupt fires at gc=8 (mode_visible
+                // transition to mode-1, same 8T propagation delay as mode-2 STAT).
+                // The actual request_interrupt call is in the mode_visible block below.
             } else if (real_ly < 144) {
                 gpu_drawline(real_ly);
             }
@@ -854,8 +813,13 @@ void gpu_step(int _cycles){
 
     // Check for STAT-visible mode transitions (8T propagation delay vs internal).
     // This fires mode-2 STAT interrupt at T=8 (not T=0) when mode-2 becomes visible in STAT.
+    // Also fires VBlank interrupt here at gc=8 of LY=144 (mode_visible 0→1 transition),
+    // matching the 8T hardware propagation delay for both VBlank and mode-1 STAT.
     byte new_mode_visible = gpu_get_mode_projected(gpu_cycles);
     if (new_mode_visible != prev_mode_visible) {
+        if (real_ly == 144 && new_mode_visible == 1) {
+            request_interrupt(INTERRUPT_VBLANK);
+        }
         stat_check_irq();
     }
 
@@ -1435,10 +1399,7 @@ byte mem_read(int pos) {
                        (apu_ch2_active ? 0x02 : 0x00) |
                        0x70; // unused bits read as 1
             case INTERRUPT_FLAGS:
-                // DMG: upper 3 bits of IF are always 1.
-                // Mid-instruction check: if a STAT source condition rises between
-                // gpu_cycles and the projected T-cycle of this read, set IF immediately.
-                stat_check_irq_midinstruction();
+                // DMG: upper 3 bits of IF are always 1
                 return RAM[pos] | 0xE0;
             case 0xFF01:
                 return serial_sb;
