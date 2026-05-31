@@ -478,7 +478,12 @@ static void stat_check_irq_midinstruction(void) {
     bool lyc_fires = (RAM[STAT] & 0x40) && LY_REG == RAM[LYC] &&
                      lyc_dead_curr && !lyc_dead_proj;
 
-    if (mode0_fires || mode2_fires || mode2_xline_fires || lyc_fires) {
+    // Mode-1 (VBlank STAT): dead zone → mode-1 transition on LY=144.
+    // Same 8T propagation delay as mode-2: fires at gc=8 on LY=144.
+    bool mode1_fires = (RAM[STAT] & 0x10) && real_ly == 144 &&
+                       mode_proj == 1 && mode_curr != 1;
+
+    if (mode0_fires || mode1_fires || mode2_fires || mode2_xline_fires || lyc_fires) {
         request_interrupt(INTERRUPT_STAT);
         stat_irq_line = true;  // prevent double-fire in post-instruction stat_check_irq
     }
