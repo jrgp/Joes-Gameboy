@@ -1186,6 +1186,66 @@ int cart_mbc1_upper = 0; // upper 2 bits written to $4000-$5FFF (ROM bank bits 5
 int cart_mbc1_mode = 0;  // 0=ROM banking mode (default), 1=RAM banking mode
 int cart_ram_bank = 0;   // current RAM bank (MBC3 uses this; MBC1 uses mbc1_upper)
 byte ext_ram[0x8000];    // 32KB external RAM (up to 4 banks × 8KB)
+int  cart_ram_size = 0;  // actual cartridge RAM in bytes (from header byte $0149)
+
+/* Cart types that have a battery-backed RAM chip */
+static bool cart_has_battery(void) {
+    switch (cart_type) {
+        case 0x03: /* MBC1+RAM+BATTERY */
+        case 0x06: /* MBC2+BATTERY */
+        case 0x09: /* ROM+RAM+BATTERY */
+        case 0x0D: /* MMM01+RAM+BATTERY */
+        case 0x0F: /* MBC3+TIMER+BATTERY */
+        case 0x10: /* MBC3+TIMER+RAM+BATTERY */
+        case 0x13: /* MBC3+RAM+BATTERY */
+        case 0x1B: /* MBC5+RAM+BATTERY */
+        case 0x1E: /* MBC5+RUMBLE+RAM+BATTERY */
+        case 0xFF: /* HuC1+RAM+BATTERY */
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Derive the .sav path for a ROM: replace extension with .sav */
+static void sav_path(const char *rom, char *out, size_t out_size) {
+    strncpy(out, rom, out_size - 5);
+    out[out_size - 5] = '\0';
+    char *dot = strrchr(out, '.');
+    char *slash = strrchr(out, '/');
+    if (dot && (!slash || dot > slash)) *dot = '\0';
+    strncat(out, ".sav", out_size - strlen(out) - 1);
+}
+
+/* Load battery-backed RAM from <rom>.sav if it exists */
+static void sav_load(const char *rom_path) {
+    if (!cart_has_battery() || cart_ram_size <= 0) return;
+    char path[4096];
+    sav_path(rom_path, path, sizeof(path));
+    FILE *f = fopen(path, "rb");
+    if (!f) return; /* no .sav yet — that's fine */
+    size_t n = fread(ext_ram, 1, (size_t)cart_ram_size, f);
+    fclose(f);
+    if ((int)n == cart_ram_size)
+        fprintf(stderr, "[sav] loaded %d bytes from %s\n", cart_ram_size, path);
+    else
+        fprintf(stderr, "[sav] warning: read %zu/%d bytes from %s\n", n, cart_ram_size, path);
+}
+
+/* Save battery-backed RAM to <rom>.sav */
+static void sav_save(const char *rom_path) {
+    if (!cart_has_battery() || cart_ram_size <= 0) return;
+    char path[4096];
+    sav_path(rom_path, path, sizeof(path));
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror("[sav] cannot open"); return; }
+    size_t n = fwrite(ext_ram, 1, (size_t)cart_ram_size, f);
+    fclose(f);
+    if ((int)n == cart_ram_size)
+        fprintf(stderr, "[sav] saved %d bytes to %s\n", cart_ram_size, path);
+    else
+        fprintf(stderr, "[sav] warning: wrote %zu/%d bytes to %s\n", n, cart_ram_size, path);
+}
 
 static bool is_mbc3(void) {
     return cart_type >= 0x0F && cart_type <= 0x13;
@@ -1298,6 +1358,13 @@ void cart_load(char *path) {
     cart_mbc1_upper = 0;
     cart_mbc1_mode = 0;
     cart_ram_bank = 0;
+
+    /* Cartridge RAM size from header byte $0149 */
+    static const int ram_size_table[] = { 0, 2048, 8192, 32768, 131072, 65536 };
+    byte ram_size_code = cart_data[0x149];
+    cart_ram_size = (ram_size_code < 6) ? ram_size_table[ram_size_code] : 0;
+    /* MBC2 has 512×4-bit internal RAM, conventionally stored as 512 bytes */
+    if (cart_type == 0x05 || cart_type == 0x06) cart_ram_size = 512;
 
     printf("Loaded %s\n", cart_name);
 
@@ -5646,6 +5713,7 @@ int main(int argc, char **argv){
   } else {
     cart_load(rom);
     mem_init();
+    sav_load(rom);    /* load battery-backed RAM before execution begins */
     gpu_init();    // sets LCD state first
     cpu_fake_init(); // overrides registers and (for DMG0) GPU scanline position
     pixels_init();
@@ -5661,7 +5729,11 @@ int main(int argc, char **argv){
     sdl_main_impl();
   }
 
-  /* Auto-save on clean shutdown (non-headless only to avoid polluting test runs) */
+  /* Save battery-backed cartridge RAM (.sav) on every clean shutdown */
+  if (!load_from_state)
+    sav_save(rom);
+
+  /* Auto-save emulator state (.cbor) on clean non-headless shutdown */
   if (!headless && savestate_rom_path[0] != '\0') {
     char ss_path[4096];
     savestate_default_path(savestate_rom_path, ss_path, sizeof(ss_path));
