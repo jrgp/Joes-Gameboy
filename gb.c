@@ -145,6 +145,11 @@ static bool lcd_startup_line = false;
 // but dispatched 8T later (at gc=8, when mode-1 becomes STAT-visible).
 static bool vblank_pending = false;
 
+// Projected T-cycle of the last CPU write that cleared IF bit 1. If a CPU write and a
+// STAT edge land on the same T-cycle, the CPU write wins and the hardware set is suppressed.
+static int if_cleared_proj_gc = -100;
+static int if_cleared_proj_ly = -100;
+
 // Per-scanline mode-3 extension (T-cycles beyond 172).
 // Accounts for fine-scroll penalty (SCX & 7) and sprite-fetch stall (6T per sprite, max 10).
 // Recomputed at the start of each new scanline; used by all mode-boundary queries.
@@ -433,7 +438,16 @@ static void stat_check_irq_impl(bool allow_interrupt) {
         // has passed does not fire. Mode-1 (VBlank) and LYC are level-triggered and
         // fire immediately when the STAT bit is written while the condition is met.
         bool should_fire = allow_interrupt || mode1_cond || lyc_cond;
-        if (should_fire) {
+        bool suppressed = false;
+        if (if_cleared_proj_ly == LY_REG) {
+            if ((mode2_cond || mode1_cond || lyc_cond) && if_cleared_proj_gc == 8) {
+                suppressed = true;
+            }
+            if (mode0_cond && if_cleared_proj_gc == 260 + mode3_extra) {
+                suppressed = true;
+            }
+        }
+        if (should_fire && !suppressed) {
             request_interrupt(INTERRUPT_STAT);
         }
     }
@@ -507,7 +521,19 @@ static void stat_check_irq_midinstruction(void) {
     }
 
     if (mode0_fires || mode1_fires || mode2_fires || mode2_xline_fires || lyc_fires) {
-        request_interrupt(INTERRUPT_STAT);
+        int next_ly = LY_REG + 1;
+        if (next_ly > 153) next_ly = 0;
+        bool suppressed = false;
+        if (if_cleared_proj_ly == LY_REG) {
+            if ((mode2_fires || mode1_fires || lyc_fires) && if_cleared_proj_gc == 8)
+                suppressed = true;
+            if (mode0_fires && if_cleared_proj_gc == 260 + mode3_extra)
+                suppressed = true;
+        }
+        if (mode2_xline_fires && if_cleared_proj_ly == next_ly && if_cleared_proj_gc == 8)
+            suppressed = true;
+        if (!suppressed)
+            request_interrupt(INTERRUPT_STAT);
         stat_irq_line = true;  // prevent double-fire in post-instruction stat_check_irq
     }
 }
@@ -1702,19 +1728,25 @@ void mem_write(int pos, byte data) {
                 apu_ch2_active = false;
             }
             break;
-        case INTERRUPT_FLAGS:
+        case INTERRUPT_FLAGS: {
             // When vblank_pending and the projected M-cycle straddles gc=8 on LY=144,
-            // VBlank fires simultaneously with this write.  On hardware the write wins:
-            // VBlank sets IF bit-0, then the CPU write overwrites IF.  Fire VBlank first
-            // so vblank_pending is cleared (preventing a double-fire in gpu_step), then
-            // let the write below clobber IF with whatever the CPU wrote.
-            if (vblank_pending && real_ly == 144) {
-                int proj_gc = gpu_cycles + instr_timer_cycles - 4;
-                if (proj_gc >= 8)
-                    vblank_pending = false;  // VBlank consumed; write will overwrite IF
+            // VBlank fires simultaneously with this write. On hardware the CPU write wins.
+            int proj_gc = gpu_cycles + instr_timer_cycles - 4;
+            int proj_ly = real_ly;
+            if (proj_gc >= 456) {
+                proj_gc -= 456;
+                proj_ly++;
+                if (proj_ly > 153) proj_ly = 0;
+            }
+            if (vblank_pending && real_ly == 144 && proj_gc >= 8)
+                vblank_pending = false;
+            if ((data & INTERRUPT_STAT) == 0) {
+                if_cleared_proj_gc = proj_gc;
+                if_cleared_proj_ly = proj_ly;
             }
             RAM[pos] = data;
             break;
+        }
         default:
             if (pos == 0xFF50 && inBios) {
                 inBios = false;
@@ -5193,6 +5225,8 @@ bool frame_headless(void){
         //        return false;
             }
             instr_timer_cycles = 0;
+            if_cleared_proj_gc = -100;
+            if_cleared_proj_ly = -100;
             int prevcycles = cycles;
             do_interrupts();
             int dispatch_cycles = cycles - prevcycles;
@@ -5344,6 +5378,8 @@ void headless_main_impl(void) {
             }
         }
         instr_timer_cycles = 0;
+        if_cleared_proj_gc = -100;
+        if_cleared_proj_ly = -100;
         int prevcycles = cycles;
         do_interrupts();
         int dispatch_cycles = cycles - prevcycles;
