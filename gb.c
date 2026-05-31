@@ -141,6 +141,10 @@ static bool lcd_startup_mode0 = false;
 // Used to apply a later LY projection threshold on the startup line (+12T vs normal).
 static bool lcd_startup_line = false;
 
+// VBlank interrupt pending: fired at the scanline wrap (real_ly becomes 144),
+// but dispatched 8T later (at gc=8, when mode-1 becomes STAT-visible).
+static bool vblank_pending = false;
+
 // Per-scanline mode-3 extension (T-cycles beyond 172).
 // Accounts for fine-scroll penalty (SCX & 7) and sprite-fetch stall (6T per sprite, max 10).
 // Recomputed at the start of each new scanline; used by all mode-boundary queries.
@@ -400,11 +404,12 @@ static void stat_check_irq_impl(bool allow_interrupt) {
     // Mode 1: use STAT-visible mode-1 (fires at gc=8 of LY=144, same 8T delay as mode-2).
     bool mode1_cond = (RAM[STAT] & 0x10) && mode_visible == 1;
     // Mode 2 OAM: fires when mode-2 becomes STAT-visible (gc=8..87).
-    // Special LY=144 case: hardware fires mode-2 STAT at LY=144 simultaneously with VBlank.
+    // Special LY=144 case: hardware fires mode-2 STAT at LY=144 simultaneously with VBlank
+    // at gc=8 (same 8T propagation delay as all other mode transitions).
     // Suppressed on lcd_startup_line: no OAM STAT on the startup scanline after LCD-on.
     bool mode2_cond = (RAM[STAT] & 0x20) && !lcd_startup_line &&
             ((!lcd_startup_mode0 && real_ly < 144 && mode_visible == 2) ||
-             (real_ly == 144 && gpu_cycles < 80));
+             (real_ly == 144 && gpu_cycles >= 8 && gpu_cycles < 80));
     // LYC dead zone: on real hardware the LYC comparator output has an 8T propagation
     // delay after LY changes. The LYC STAT line contribution goes active at gc=8, not gc=0.
     // Without the dead zone, LYC fires the interrupt 8T early (sum off by 2 in int_lyc_nops).
@@ -413,6 +418,14 @@ static void stat_check_irq_impl(bool allow_interrupt) {
     // VBlank period (real_ly>=144) and LCD startup are exempt — no 8T delay there.
     bool lyc_dead_zone = !lcd_startup_mode0 && gpu_cycles < 8 && real_ly < 144;
     bool lyc_cond = (RAM[STAT] & 0x40) && LY_REG == RAM[LYC] && !lyc_dead_zone;
+
+    // VBlank interrupt (unconditional): fires when mode-1 becomes visible (gc=8 on LY=144).
+    // vblank_pending is set at the scanline wrap; cleared here on first mode-1 visibility.
+    if (vblank_pending && mode_visible == 1 && real_ly == 144) {
+        request_interrupt(INTERRUPT_VBLANK);
+        vblank_pending = false;
+    }
+
     bool line = mode0_cond || mode1_cond || mode2_cond || lyc_cond;
     if (line && !stat_irq_line) {
         // For STAT register writes (allow_interrupt=false): mode-2 and mode-0 are
@@ -482,6 +495,16 @@ static void stat_check_irq_midinstruction(void) {
     // Same 8T propagation delay as mode-2: fires at gc=8 on LY=144.
     bool mode1_fires = (RAM[STAT] & 0x10) && real_ly == 144 &&
                        mode_proj == 1 && mode_curr != 1;
+
+    // VBlank interrupt (unconditional) also fires at gc=8 on LY=144.
+    // vblank_pending is set at the scanline wrap; cleared here when mode-1 becomes visible.
+    if (vblank_pending && real_ly == 144) {
+        byte mode_proj_check = gpu_get_mode_projected(proj_gc >= 0 ? proj_gc : curr_gc);
+        if (mode_proj_check == 1) {
+            request_interrupt(INTERRUPT_VBLANK);
+            vblank_pending = false;
+        }
+    }
 
     if (mode0_fires || mode1_fires || mode2_fires || mode2_xline_fires || lyc_fires) {
         request_interrupt(INTERRUPT_STAT);
@@ -616,6 +639,7 @@ void gpu_write(int pos, byte data){
             // rising-edge detection works correctly on re-enable:
             // if LYC=LY was true before disable and is still true now, no new interrupt.
             stat_irq_line = lcd_off_lyc_flag;
+            vblank_pending = false;  // clear any pending VBlank on LCD re-enable
             stat_check_irq();
         }
         if (was_enabled && !now_enabled) {
@@ -821,17 +845,16 @@ void gpu_step(int _cycles){
             real_ly = 0;
             LY_REG = 0;
             window_line = 0;
+            vblank_pending = false;  // safety: clear any stale pending at frame start
         } else {
             LY_REG = real_ly;
             // Clear startup-line flag on first LY increment (LY=0→1)
             if (real_ly == 1) lcd_startup_line = false;
 
             if (real_ly == 144) {
-                // VBlank period starts; VBlank interrupt is unconditional.
-                // Note: hardware fires VBlank at gc=8 (same 8T delay as mode-1 STAT),
-                // but our timer_internal starting value is calibrated for gc=0 behavior.
-                // TODO: fix timer_internal offset in cpu_fake_init and move to gc=8.
-                request_interrupt(INTERRUPT_VBLANK);
+                // VBlank period starts. Hardware fires VBlank at gc=8 (same 8T delay
+                // as mode-1 STAT becoming visible). Mark pending; fire in stat_check_irq.
+                vblank_pending = true;
             } else if (real_ly < 144) {
                 gpu_drawline(real_ly);
             }
@@ -1656,6 +1679,19 @@ void mem_write(int pos, byte data) {
                 apu_ch1_active = false;
                 apu_ch2_active = false;
             }
+            break;
+        case INTERRUPT_FLAGS:
+            // When vblank_pending and the projected M-cycle straddles gc=8 on LY=144,
+            // VBlank fires simultaneously with this write.  On hardware the write wins:
+            // VBlank sets IF bit-0, then the CPU write overwrites IF.  Fire VBlank first
+            // so vblank_pending is cleared (preventing a double-fire in gpu_step), then
+            // let the write below clobber IF with whatever the CPU wrote.
+            if (vblank_pending && real_ly == 144) {
+                int proj_gc = gpu_cycles + instr_timer_cycles - 4;
+                if (proj_gc >= 8)
+                    vblank_pending = false;  // VBlank consumed; write will overwrite IF
+            }
+            RAM[pos] = data;
             break;
         default:
             if (pos == 0xFF50 && inBios) {
