@@ -1917,11 +1917,14 @@ void cpu_fake_init(void){
     RAM[REG_DIV] = (uint8_t)(timer_internal >> 8);
 
     // GBMicro HBlank timing tests rely on the post-BIOS GPU position at PC=$0100.
-    // In gbmicrotest mode, calibrate later DMG-family hardware to gc=404 so the
-    // 123-NOP preamble lands at gc=112 (after two 456T wraps), matching hardware.
+    // The DMG boot ROM exits during VBlank on line 153 at gc≈404 (hardware-measured).
+    // gc=404 determines the scanline-phase (gc mod 456) for NOP-preamble alignment.
+    // real_ly=153 is the actual hardware line at boot exit; tests counting absolute
+    // scanlines (e.g. line_65_ly, poweron_stat/ly) require this VBlank starting line.
+    // Tests using nops-123 preamble are phase-only and are unaffected by which line.
     if (gbmicrotest_mode && gb_model != MODEL_DMG0) {
-        LY_REG = 0;
-        real_ly = 0;
+        real_ly = 153;
+        LY_REG = 0;  // at gc=404 on line 153, LY_REG has already dropped to 0 (after 4T)
         gpu_cycles = 404;
         lcd_startup_mode0 = false;
         lcd_startup_line = false;
