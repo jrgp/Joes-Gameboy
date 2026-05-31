@@ -344,7 +344,9 @@ byte gpu_get_mode_projected(int projected_cycles) {
     // LY=144 (VBlank start): hardware has same 8T propagation delay as mode-2.
     // proj<8 → still shows mode-0 (dead zone), proj>=8 → shows mode-1.
     if (real_ly == 144) return (projected_cycles < 8) ? 0 : 1;
-    if (lcd_startup_mode0) return 0; // Startup: mode 0 visible before mode 2 begins
+    // Startup: mode 0 visible until mode 3 begins at projected=88.
+    // After that, normal STAT-visible mode 3 applies even on the startup scanline.
+    if (lcd_startup_mode0 && projected_cycles < 88) return 0;
     if (projected_cycles < 0) projected_cycles = 0;
     if (projected_cycles >= 456) projected_cycles = 455;
     // STAT-visible mode boundaries include propagation delays vs hardware-internal.
@@ -381,7 +383,17 @@ static bool vram_write_accessible(int proj) {
 // whole mode-2 window is replaced by mode-0 (no lock).
 static bool oam_write_accessible(int proj) {
     if (!gpu_control.enabled) return true;
-    if (real_ly >= 144)       return true;  // VBlank: always accessible
+    if (real_ly >= 144 && real_ly < 153) return true;  // VBlank lines 144-152: always accessible
+    if (real_ly == 153) {
+        // Last VBlank line; after scanline boundary (proj > 456), falls into line 0 (OAM locked)
+        if (proj > 456) {
+            int wrapped = proj - 456;
+            if (wrapped >= 8  && wrapped <= 83)  return false;
+            if (wrapped >= 88 && wrapped <= 259 + mode3_extra) return false;
+            return true;
+        }
+        return true; // still on line 153 = VBlank
+    }
     if (lcd_startup_mode0)   return true;  // startup pseudo-mode 0: no lock
     if (proj < 0) proj = 0;
     if (proj >= 456) proj -= 456;           // wrap into next scanline
@@ -1501,27 +1513,34 @@ byte mem_read(int pos) {
         // On the startup line (lcd_startup_mode0), the mode2 OAM scan is skipped so OAM is
         // accessible for T<88, then locked from T=88 onward (startup STAT-visible mode3 boundary).
         if (dma_active && dma_oam_locked) return 0xFF;
-        if (gpu_control.enabled && real_ly < 144) {
+        if (gpu_control.enabled) {
             int projected = gpu_cycles + instr_timer_cycles - 4;
             if (projected < 0) projected = 0;
-            bool locked;
-            if (projected > 456) {
-                // Instruction spans a scanline boundary; the memory access falls into
-                // the next scanline.  OAM is locked from gc=0 of each visible scanline
-                // (mode-2 starts immediately), so check the wrapped position.
-                // projected == 456 means the read M-cycle is still in the current scanline
-                // (boundary case treated as gc=455, mode-0 → accessible).
-                int next_ly = real_ly + 1;
-                if (next_ly < 144) {
-                    int wrapped_gc = projected - 456;
-                    locked = (wrapped_gc < 260 + mode3_extra);
+            bool locked = false;
+            if (real_ly < 144) {
+                if (projected > 456) {
+                    // Instruction spans a scanline boundary; the memory access falls into
+                    // the next scanline.  OAM is locked from gc=0 of each visible scanline
+                    // (mode-2 starts immediately), so check the wrapped position.
+                    // projected == 456 means the read M-cycle is still in the current scanline
+                    // (boundary case treated as gc=455, mode-0 → accessible).
+                    int next_ly = real_ly + 1;
+                    if (next_ly < 144) {
+                        int wrapped_gc = projected - 456;
+                        locked = (wrapped_gc < 260 + mode3_extra);
+                    } else {
+                        locked = false; // next scanline is VBlank — OAM unlocked
+                    }
+                } else if (lcd_startup_mode0) {
+                    locked = (projected >= 88);
                 } else {
-                    locked = false; // next scanline is VBlank — OAM unlocked
+                    locked = (projected < 260 + mode3_extra);
                 }
-            } else if (lcd_startup_mode0) {
-                locked = (projected >= 88);
-            } else {
-                locked = (projected < 260 + mode3_extra);
+            } else if (real_ly == 153 && projected > 456) {
+                // After line 153 (last VBlank line), next scanline is line 0 (visible).
+                // OAM is locked from gc=0 of line 0 (mode-2 starts immediately).
+                int wrapped_gc = projected - 456;
+                locked = (wrapped_gc < 260 + mode3_extra);
             }
             if (locked) return 0xFF;
         }
