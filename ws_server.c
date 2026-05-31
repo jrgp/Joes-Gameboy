@@ -57,8 +57,8 @@ static const char HTML_PAGE[] =
 ".tb{background:#1e1e38;color:#999;border:1px solid #3a3a5a;border-radius:4px;padding:5px 10px;cursor:pointer;font:12px/1 monospace}\n"
 ".tb:active{background:#3a3a6a}\n"
 "#st{font-size:11px;color:#555;margin-left:4px}\n"
-"#sw{flex:1;display:flex;align-items:center;justify-content:center;min-height:0;padding:8px}\n"
-"canvas{display:block;background:#111;image-rendering:pixelated;image-rendering:crisp-edges}\n"
+"#sw{flex:1;display:flex;align-items:center;justify-content:center;min-height:0;overflow:hidden}\n"
+"canvas{display:block;background:#111;image-rendering:pixelated;image-rendering:crisp-edges;max-width:100%;max-height:100%}\n"
 "#ctl{display:flex;align-items:center;justify-content:space-between;width:100%;max-width:440px;padding:8px 10px 14px;flex-shrink:0}\n"
 "#dp{position:relative;width:108px;height:108px}\n"
 ".d{position:absolute;width:36px;height:36px;background:#1a1a30;border:1px solid #333;border-radius:6px;display:flex;align-items:center;justify-content:center;color:#777;font-size:14px;cursor:pointer;-webkit-user-select:none;user-select:none;touch-action:none}\n"
@@ -113,9 +113,10 @@ static const char HTML_PAGE[] =
 "function resize(){\n"
 "  var sw=document.getElementById('sw');\n"
 "  var aw=sw.clientWidth,ah=sw.clientHeight;\n"
-"  var s=Math.max(1,Math.min(Math.floor(aw/160),Math.floor(ah/144)));\n"
-"  cv.style.width=(160*s)+'px';\n"
-"  cv.style.height=(144*s)+'px';\n"
+"  var s=Math.min(aw/160,ah/144);\n"
+"  if(s<1)s=1;\n"
+"  cv.style.width=Math.floor(160*s)+'px';\n"
+"  cv.style.height=Math.floor(144*s)+'px';\n"
 "}\n"
 "window.addEventListener('resize',resize);\n"
 "resize();\n"
@@ -223,6 +224,12 @@ static int callback_gb(struct lws *wsi, enum lws_callback_reasons reason,
 
         if (pss) { pss->is_ws = false; pss->html_sent = false; }
 
+        /* Access log */
+        char peer[64] = "?";
+        lws_get_peer_simple(wsi, peer, sizeof(peer));
+        fprintf(stderr, "[ws] HTTP GET %s from %s\n",
+                in ? (const char *)in : "/", peer);
+
         if (lws_add_http_common_headers(wsi, HTTP_STATUS_OK,
                 "text/html; charset=utf-8",
                 (lws_filepos_t)(sizeof(HTML_PAGE) - 1),
@@ -253,10 +260,21 @@ static int callback_gb(struct lws *wsi, enum lws_callback_reasons reason,
     }
 
     /* ---- WebSocket: connection established ---- */
-    case LWS_CALLBACK_ESTABLISHED:
+    case LWS_CALLBACK_ESTABLISHED: {
         if (pss) { pss->is_ws = true; }
+        char peer[64] = "?";
+        lws_get_peer_simple(wsi, peer, sizeof(peer));
+        fprintf(stderr, "[ws] WS connected: %s\n", peer);
         return 0;
+    }
 
+    /* ---- WebSocket: connection closed ---- */
+    case LWS_CALLBACK_CLOSED: {
+        char peer[64] = "?";
+        lws_get_peer_simple(wsi, peer, sizeof(peer));
+        fprintf(stderr, "[ws] WS closed:     %s\n", peer);
+        return 0;
+    }
     /* ---- WebSocket: data received from browser ---- */
     case LWS_CALLBACK_RECEIVE: {
         if (len < 1) return 0;

@@ -162,6 +162,12 @@ static int mode3_extra = 0;
 // Compared at mode 2→3 entry to detect mid-OAM-scan SCX writes.
 static byte scx_at_last_compute = 0;
 
+// Deferred drawline: gpu_drawline() is not called at scanline start (gc=0) but deferred
+// to gc>=80 (end of OAM scan / start of mode 3).  This allows the game to update SCX
+// during the OAM-scan window (Pokemon Red raster scroll effects, Nidoran intro, etc.).
+static bool drawline_pending = false;
+static int  drawline_pending_ly = 0;
+
 // Recompute mode3_extra for the current LY_REG.
 // Must be called right after LY_REG is updated so OAM is scanned for the correct line.
 // at_mode3_start: true when called at the mode-2→3 boundary (gc=80) due to a
@@ -951,6 +957,13 @@ void gpu_step(int _cycles){
     int pre_gc = gpu_cycles;
     gpu_cycles += _cycles;
 
+    // Fire deferred drawline once OAM scan is complete (gc>=80).
+    // Deferred at scanline wrap to let the game update SCX during OAM scan.
+    if (drawline_pending && gpu_cycles >= 80) {
+        drawline_pending = false;
+        gpu_drawline((byte)drawline_pending_ly);
+    }
+
     // Clear startup mode-0 override once gpu_cycles advances into OAM scan range.
     // Threshold >=84 matches the hardware mode-2 start time; also ensures the
     // startup line transitions directly to mode 3 (no spurious mode-2 visible).
@@ -979,7 +992,10 @@ void gpu_step(int _cycles){
                 // as mode-1 STAT becoming visible). Mark pending; fire in stat_check_irq.
                 vblank_pending = true;
             } else if (real_ly < 144) {
-                gpu_drawline(real_ly);
+                // Defer drawline to gc>=80 (OAM scan end / mode-3 start).
+                // This lets the game update SCX during OAM scan (raster scroll effects).
+                drawline_pending    = true;
+                drawline_pending_ly = real_ly;
             }
             // real_ly == 153: VBlank continues; LY_REG will drop to 0 after 4 T-cycles
         }
