@@ -174,6 +174,7 @@ static void compute_mode3_extra_impl(bool at_mode3_start) {
 
     // SCX fine-scroll penalty
     int scx_fine = SCX_REG & 7;
+
     int extra;
     if (at_mode3_start) {
         // SCX was changed during OAM scan; hardware latches the new value at mode-3
@@ -181,6 +182,8 @@ static void compute_mode3_extra_impl(bool at_mode3_start) {
         extra = (scx_fine <= 3) ? 0 : (scx_fine <= 6 ? 4 : 8);
     } else {
         // SCX sampled at scanline wrap (start of OAM scan) or lcd-on.
+        // Hardware rounding at dot granularity: fine-scroll 0 = no penalty;
+        // 1..4 = round up to one extra M-cycle (4T); 5..7 = two extra M-cycles (8T).
         extra = (scx_fine == 0) ? 0 : (scx_fine <= 4 ? 4 : 8);
     }
     scx_at_last_compute = SCX_REG;
@@ -572,10 +575,13 @@ byte gpu_read(int pos){
         // Mid-instruction scanline wrap: when the effective T-cycle of the read crosses
         // the 456T scanline boundary, the hardware PPU has already incremented LY and
         // reset the scanline counter.  Use the next-scanline state instead of clamping.
+        // At projected == 456 exactly the read lands at the very last T-cycle of the old
+        // scanline; the hardware latch hasn't fired yet, so the old line's state is used.
+        // Only projected > 456 has definitively crossed into the next scanline.
         int stat_real_ly = real_ly;
         int stat_ly_reg = LY_REG;
         bool from_line153 = false;
-        if (projected >= 456) {
+        if (projected > 456) {
             projected -= 456;
             stat_real_ly = real_ly + 1;
             if (stat_real_ly > 153) {
@@ -604,11 +610,15 @@ byte gpu_read(int pos){
         }
 
         // LYC comparison: during the first 8T of a new scanline the hardware comparison
-        // circuit is in a reset/dead zone — the flag reads 0.  Exception: the line 153→0
-        // transition leaves LY_REG=0 since gc=4 of line 153 (the LY quirk), so LYC=0
-        // was already established before line 0 starts — no dead zone for that wrap.
+        // circuit is in a reset/dead zone — the flag reads 0.
+        // Exception 1: the line 153→0 transition leaves LY_REG=0 since gc=4 of line 153
+        //   (the LY quirk), so LYC=0 was already established — no dead zone for that wrap.
+        // Exception 2: while still on line 153 but LY_REG has already dropped to 0
+        //   (gc=4..7), LYC=0 is already matching — skip the dead zone.
         byte lyc_flag;
-        bool in_dead_zone = !lcd_startup_mode0 && projected < 8 && !from_line153;
+        bool in_dead_zone = !lcd_startup_mode0 && projected < 8
+                            && !from_line153
+                            && !(stat_real_ly == 153 && stat_ly_reg == 0);
         if (in_dead_zone) {
             lyc_flag = 0x00;
         } else {
@@ -1964,6 +1974,10 @@ void cpu_fake_init(void){
         gpu_cycles = 404;
         lcd_startup_mode0 = false;
         lcd_startup_line = false;
+        // At boot exit, LCDC=0x91 (LCD on, BG enable, BG tile data at 0x8000).
+        // Set GPU control without triggering the lcd-on sequence (don't reset gpu_cycles).
+        LCDC_REG = 0x91;
+        gpu_parse_control(0x91);
     }
 
     // DMG0 boot ROM leaves the LCD at LY=145, gpu_cycles=250 when PC=$0100 is reached.
