@@ -10,6 +10,7 @@
 #include"bits.h"
 #include"constants.h"
 #include"opnames.h"
+#include"savestate.h"
 
 typedef uint8_t byte;
 typedef uint16_t word;
@@ -47,6 +48,9 @@ static byte serial_out_byte = 0;       // byte to transmit (saved at transfer st
 bool headless = false;
 long long max_cycles = 0;
 bool gbmicrotest_mode = false; // read 0xFF82 for pass/fail after cycle limit
+
+/* ROM path stored here so savestate.c can read it */
+char savestate_rom_path[4096] = {0};
 
 typedef enum {
     MODEL_DMG = 0,   // DMG-ABC (default)
@@ -1255,6 +1259,10 @@ void cart_write(int pos, byte data) {
 }
 
 void cart_load(char *path) {
+    /* Record the ROM path for save states */
+    strncpy(savestate_rom_path, path, sizeof(savestate_rom_path) - 1);
+    savestate_rom_path[sizeof(savestate_rom_path) - 1] = '\0';
+
     FILE *fileptr;
     long filelen;
     fileptr = fopen(path, "rb");
@@ -5422,6 +5430,15 @@ void sdl_main_impl(void){
                       case SDLK_RETURN: // START
                         joypad_key = &joypad_buttons.START;
                       break;
+                      case SDLK_F5: // Save state
+                        if (event.key.type == SDL_KEYDOWN) {
+                            char ss_path[4096];
+                            savestate_default_path(savestate_rom_path, ss_path, sizeof(ss_path));
+                            if (save_state(ss_path)) {
+                                printf("[savestate] saved to %s\n", ss_path);
+                            }
+                        }
+                      break;
                   }
                   if (joypad_key != NULL) {
                       joypad_last = *joypad_key;
@@ -5521,9 +5538,64 @@ void headless_main_impl(void) {
     }
 }
 
-int main(int argc, char **argv){
+/* ---- Save-state integration ---- */
+#include "savestate.h"
 
+/* Accessors/mutators for static variables needed by savestate.c */
+bool     ss_get_stat_irq_line(void)          { return stat_irq_line; }
+bool     ss_get_lcd_off_lyc_flag(void)       { return lcd_off_lyc_flag; }
+bool     ss_get_lcd_startup_mode0(void)      { return lcd_startup_mode0; }
+bool     ss_get_lcd_startup_line(void)       { return lcd_startup_line; }
+bool     ss_get_vblank_pending(void)         { return vblank_pending; }
+int      ss_get_mode3_extra(void)            { return mode3_extra; }
+byte     ss_get_scx_at_last_compute(void)    { return scx_at_last_compute; }
+int      ss_get_window_line(void)            { return window_line; }
+int      ss_get_if_cleared_proj_gc(void)     { return if_cleared_proj_gc; }
+int      ss_get_if_cleared_proj_ly(void)     { return if_cleared_proj_ly; }
+uint16_t ss_get_timer_internal(void)         { return timer_internal; }
+int      ss_get_timer_overflow_pending(void) { return timer_overflow_pending; }
+bool     ss_get_timer_just_reloaded(void)    { return timer_just_reloaded; }
+bool     ss_get_timer_halt_delay(void)       { return timer_halt_delay; }
+bool     ss_get_serial_active(void)          { return serial_active; }
+int      ss_get_serial_bits_remaining(void)  { return serial_bits_remaining; }
+byte     ss_get_serial_out_byte(void)        { return serial_out_byte; }
+int      ss_get_gb_model(void)               { return (int)gb_model; }
+
+void ss_set_stat_irq_line(bool v)          { stat_irq_line = v; }
+void ss_set_lcd_off_lyc_flag(bool v)       { lcd_off_lyc_flag = v; }
+void ss_set_lcd_startup_mode0(bool v)      { lcd_startup_mode0 = v; }
+void ss_set_lcd_startup_line(bool v)       { lcd_startup_line = v; }
+void ss_set_vblank_pending(bool v)         { vblank_pending = v; }
+void ss_set_mode3_extra(int v)             { mode3_extra = v; }
+void ss_set_scx_at_last_compute(byte v)    { scx_at_last_compute = v; }
+void ss_set_window_line(int v)             { window_line = v; }
+void ss_set_if_cleared_proj_gc(int v)      { if_cleared_proj_gc = v; }
+void ss_set_if_cleared_proj_ly(int v)      { if_cleared_proj_ly = v; }
+void ss_set_timer_internal(uint16_t v)     { timer_internal = v; RAM[REG_DIV] = (byte)(v >> 8); }
+void ss_set_timer_overflow_pending(int v)  { timer_overflow_pending = v; }
+void ss_set_timer_just_reloaded(bool v)    { timer_just_reloaded = v; }
+void ss_set_timer_halt_delay(bool v)       { timer_halt_delay = v; }
+void ss_set_serial_active(bool v)          { serial_active = v; }
+void ss_set_serial_bits_remaining(int v)   { serial_bits_remaining = v; }
+void ss_set_serial_out_byte(byte v)        { serial_out_byte = v; }
+void ss_set_gb_model(int v)                { gb_model = (gb_model_t)v; }
+
+/* Called after all fields are loaded to rebuild any derived state */
+void ss_post_load(void) {
+    /*
+     * Nothing needed here currently:
+     * - RAM[] is fully restored from the CBOR bytestring (which was saved with
+     *   named registers synced into their RAM slots by save_state).
+     * - Named registers (LY_REG, SCX_REG, etc.) are restored from named fields.
+     * - gpu_parse_control is called by load_state after LCDC_REG is set.
+     * - timer_internal is synced to RAM[REG_DIV] by ss_set_timer_internal.
+     */
+}
+
+#ifndef GAMEBOY_LIB_MODE
+int main(int argc, char **argv){
   char *rom = "tetris.gb";
+  bool load_from_state = false;
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--headless") == 0) {
@@ -5554,20 +5626,34 @@ int main(int argc, char **argv){
       return 1;
     } else {
       rom = argv[i];
+      if (savestate_is_cbor_path(rom)) {
+        load_from_state = true;
+      }
     }
   }
 // cpu_init_debug_file(); // Disabled to prevent interference
 
-  cart_load(rom);
-
-  mem_init();
-  gpu_init();    // sets LCD state first
-  cpu_fake_init(); // overrides registers and (for DMG0) GPU scanline position
-  pixels_init();
-  if (!headless) {
-    sdl_init();
+  if (load_from_state) {
+    /* Bootstrap enough to satisfy SDL/pixels before load_state overwrites state */
+    pixels_init();
+    if (!headless) {
+      sdl_init();
+    }
+    if (!load_state(rom)) {
+      fprintf(stderr, "Failed to load save state: %s\n", rom);
+      return 1;
+    }
+  } else {
+    cart_load(rom);
+    mem_init();
+    gpu_init();    // sets LCD state first
+    cpu_fake_init(); // overrides registers and (for DMG0) GPU scanline position
+    pixels_init();
+    if (!headless) {
+      sdl_init();
+    }
+    joypad_init();
   }
-  joypad_init();
 
   if (headless) {
     headless_main_impl();
@@ -5575,7 +5661,15 @@ int main(int argc, char **argv){
     sdl_main_impl();
   }
 
+  /* Auto-save on clean shutdown (non-headless only to avoid polluting test runs) */
+  if (!headless && savestate_rom_path[0] != '\0') {
+    char ss_path[4096];
+    savestate_default_path(savestate_rom_path, ss_path, sizeof(ss_path));
+    save_state(ss_path);
+  }
+
 cpu_close_debug_file();
 
   return 0;
 }
+#endif /* GAMEBOY_LIB_MODE */
