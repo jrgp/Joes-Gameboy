@@ -380,7 +380,13 @@ static bool oam_write_accessible(int proj) {
 
 // Compute the STAT interrupt line and fire an interrupt on 0→1 transition.
 // Must be called after any GPU state change that might affect the conditions.
-static void stat_check_irq(void) {
+// stat_check_irq_impl: evaluate STAT IRQ line and conditionally fire interrupt.
+// allow_interrupt=true: fire interrupt on rising edge (used for hardware transitions).
+// allow_interrupt=false: mode-2 and mode-0 do NOT fire (pulse-triggered at mode
+//   transition only); mode-1 (VBlank) and LYC fire immediately (level-triggered).
+//   Used for STAT register writes: enabling a mode-2/mode-0 bit after the transition
+//   pulse has passed does not retroactively fire; VBlank/LYC fire immediately.
+static void stat_check_irq_impl(bool allow_interrupt) {
     if (!gpu_control.enabled) {
         stat_irq_line = false;
         return;
@@ -388,20 +394,39 @@ static void stat_check_irq(void) {
     byte mode = gpu_get_mode();
     // STAT-visible mode uses 8T propagation delay (same as STAT register reads).
     byte mode_visible = gpu_get_mode_projected(gpu_cycles);
-    bool line = false;
     // Mode 0: fire when both internal mode and STAT-visible mode are 0 (gc>=260).
-    if ((RAM[STAT] & 0x08) && mode == 0 && mode_visible == 0 && real_ly < 144) line = true;
+    bool mode0_cond = (RAM[STAT] & 0x08) && mode == 0 && mode_visible == 0 && real_ly < 144;
     // Mode 1: use STAT-visible mode-1 (fires at gc=8 of LY=144, same 8T delay as mode-2).
-    if ((RAM[STAT] & 0x10) && mode_visible == 1)           line = true; // Mode 1 VBlank
-    // Mode 2 OAM: use STAT-visible boundary (T=8, after 8T propagation) so the interrupt
-    // fires when mode-2 actually appears in STAT, not at the hardware-internal T=0.
+    bool mode1_cond = (RAM[STAT] & 0x10) && mode_visible == 1;
+    // Mode 2 OAM: fires when mode-2 becomes STAT-visible (gc=8..87).
     // Special LY=144 case: hardware fires mode-2 STAT at LY=144 simultaneously with VBlank.
-    if ((RAM[STAT] & 0x20) && (mode_visible == 2 || (real_ly == 144 && gpu_cycles < 80))) line = true;
-    if ((RAM[STAT] & 0x40) && LY_REG == RAM[LYC])         line = true; // LYC=LY
+    // Suppressed on lcd_startup_line: no OAM STAT on the startup scanline after LCD-on.
+    bool mode2_cond = (RAM[STAT] & 0x20) && !lcd_startup_line &&
+            ((!lcd_startup_mode0 && real_ly < 144 && mode_visible == 2) ||
+             (real_ly == 144 && gpu_cycles < 80));
+    bool lyc_cond = (RAM[STAT] & 0x40) && LY_REG == RAM[LYC];
+    bool line = mode0_cond || mode1_cond || mode2_cond || lyc_cond;
     if (line && !stat_irq_line) {
-        request_interrupt(INTERRUPT_STAT);
+        // For STAT register writes (allow_interrupt=false): mode-2 and mode-0 are
+        // pulse-triggered at the mode transition — enabling the bit after the pulse
+        // has passed does not fire. Mode-1 (VBlank) and LYC are level-triggered and
+        // fire immediately when the STAT bit is written while the condition is met.
+        bool should_fire = allow_interrupt || mode1_cond || lyc_cond;
+        if (should_fire) {
+            request_interrupt(INTERRUPT_STAT);
+        }
     }
     stat_irq_line = line;
+}
+
+static void stat_check_irq(void) {
+    stat_check_irq_impl(true);
+}
+
+// Called after STAT register write: mode-2 and mode-0 are pulse-triggered (no
+// retroactive fire); mode-1 and LYC are level-triggered (fire immediately).
+static void stat_check_irq_on_stat_write(void) {
+    stat_check_irq_impl(false);
 }
 
 byte gpu_read(int pos){
@@ -496,8 +521,10 @@ void gpu_write(int pos, byte data){
                 stat_irq_line = true;  // mark line high to prevent double-fire below
             }
         }
-        // Writing STAT may activate a new interrupt condition immediately (DMG behaviour)
-        stat_check_irq();
+        // Update stat_irq_line state to reflect new STAT bits, but do NOT fire a new
+        // interrupt: on real hardware, enabling an interrupt bit after the mode's
+        // rising edge has already passed does not retroactively fire the interrupt.
+        stat_check_irq_on_stat_write();
     }
     if (pos == LCDC) {
         bool was_enabled = bit_check(LCDC_REG, 7);
@@ -742,7 +769,8 @@ void gpu_step(int _cycles){
         // Recompute mode-3 extension for the new scanline (SCX fine-scroll + sprite penalty).
         compute_mode3_extra();
 
-        // Fire STAT for any newly-active condition after LY change
+        // Fire STAT for any newly-active condition after LY change.
+        // Mode-2 STAT fires at gc=8 when mode-2 becomes STAT-visible (detected below).
         stat_check_irq();
     }
 
@@ -1295,9 +1323,21 @@ byte mem_read(int pos) {
         if (gpu_control.enabled && real_ly < 144) {
             int projected = gpu_cycles + instr_timer_cycles - 4;
             if (projected < 0) projected = 0;
-            if (projected >= 456) projected = 455;
             bool locked;
-            if (lcd_startup_mode0) {
+            if (projected > 456) {
+                // Instruction spans a scanline boundary; the memory access falls into
+                // the next scanline.  OAM is locked from gc=0 of each visible scanline
+                // (mode-2 starts immediately), so check the wrapped position.
+                // projected == 456 means the read M-cycle is still in the current scanline
+                // (boundary case treated as gc=455, mode-0 → accessible).
+                int next_ly = real_ly + 1;
+                if (next_ly < 144) {
+                    int wrapped_gc = projected - 456;
+                    locked = (wrapped_gc < 260 + mode3_extra);
+                } else {
+                    locked = false; // next scanline is VBlank — OAM unlocked
+                }
+            } else if (lcd_startup_mode0) {
                 locked = (projected >= 88);
             } else {
                 locked = (projected < 260 + mode3_extra);
@@ -1731,6 +1771,9 @@ void cpu_fake_init(void){
 
     // IF: at post-boot, VBlank (bit 0) is pending — the LCD ran during the boot ROM
     RAM[INTERRUPT_FLAGS] = 0x01;  // bits 7-5 always read as 1 via mem_read mask + 0xE0
+    RAM[DMA]  = 0xFF;  // DMA register reads back 0xFF after boot ROM ($FF46)
+    RAM[OBP0] = 0xFF;  // OBP0: uninitialized by boot ROM — reads as 0xFF ($FF48)
+    RAM[OBP1] = 0xFF;  // OBP1: uninitialized by boot ROM — reads as 0xFF ($FF49)
     RAM[0xFF11] = 0x80;   // NR11: wave duty=2 (50%) in bits 7:6
     RAM[0xFF12] = 0xF3;   // NR12: volume=15, decreasing, shift=3
     RAM[0xFF24] = 0x77;   // NR50: SO2/SO1 volume both at max (7)
