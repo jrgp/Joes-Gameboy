@@ -5772,6 +5772,7 @@ void gb_reset(void) {
 #include <time.h>
 
 static void server_main_impl(void) {
+    int frame_num = 0;
     while (1) {
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -5779,6 +5780,11 @@ static void server_main_impl(void) {
         frame_headless();
         ws_server_notify_frame(pixels, VIEWPORT_WIDTH, VIEWPORT_HEIGHT);
         ws_server_service();  /* non-blocking: send frame, process any input */
+
+        /* Flush battery-backed RAM to disk every ~5 seconds so in-game saves
+         * (e.g. Pokemon) are not lost if the server is killed uncleanly. */
+        if (++frame_num % 300 == 0 && savestate_rom_path[0] != '\0')
+            sav_save(savestate_rom_path);
 
         clock_gettime(CLOCK_MONOTONIC, &t1);
         long elapsed_us = (t1.tv_sec  - t0.tv_sec)  * 1000000L
@@ -5865,16 +5871,44 @@ int main(int argc, char **argv){
       return 1;
     }
   } else {
-    cart_load(rom);
-    mem_init();
-    sav_load(rom);    /* load battery-backed RAM before execution begins */
-    gpu_init();    // sets LCD state first
-    cpu_fake_init(); // overrides registers and (for DMG0) GPU scanline position
-    pixels_init();
-    if (!headless) {
-      sdl_init();
+    /* In server mode, auto-load the .cbor savestate if one exists for this ROM
+     * so the session resumes exactly where it left off. */
+    char auto_ss[4096] = {0};
+    if (server_mode) {
+      savestate_default_path(rom, auto_ss, sizeof(auto_ss));
+      FILE *probe = fopen(auto_ss, "rb");
+      if (probe) { fclose(probe); load_from_state = true; }
     }
-    joypad_init();
+
+    if (load_from_state) {
+      /* auto-load path: cart_load is skipped; load_state restores everything */
+      pixels_init();
+      if (!load_state(auto_ss)) {
+        fprintf(stderr, "[server] auto-load of %s failed, booting fresh\n", auto_ss);
+        load_from_state = false;
+        /* fall through to fresh boot below */
+        cart_load(rom);
+        mem_init();
+        sav_load(rom);
+        gpu_init();
+        cpu_fake_init();
+        pixels_init();
+        joypad_init();
+      } else {
+        fprintf(stderr, "[server] auto-loaded savestate %s\n", auto_ss);
+      }
+    } else {
+      cart_load(rom);
+      mem_init();
+      sav_load(rom);    /* load battery-backed RAM before execution begins */
+      gpu_init();    // sets LCD state first
+      cpu_fake_init(); // overrides registers and (for DMG0) GPU scanline position
+      pixels_init();
+      if (!headless) {
+        sdl_init();
+      }
+      joypad_init();
+    }
   }
 
   if (server_mode) {
@@ -5911,8 +5945,8 @@ int main(int argc, char **argv){
   if (!load_from_state)
     sav_save(rom);
 
-  /* Auto-save emulator state (.cbor) on clean non-headless shutdown */
-  if (!headless && savestate_rom_path[0] != '\0') {
+  /* Auto-save emulator state (.cbor) on clean shutdown (SDL or server mode) */
+  if (savestate_rom_path[0] != '\0') {
     char ss_path[4096];
     savestate_default_path(savestate_rom_path, ss_path, sizeof(ss_path));
     save_state(ss_path);
