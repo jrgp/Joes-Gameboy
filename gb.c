@@ -162,11 +162,21 @@ static int mode3_extra = 0;
 // Compared at mode 2→3 entry to detect mid-OAM-scan SCX writes.
 static byte scx_at_last_compute = 0;
 
-// Deferred drawline: gpu_drawline() is not called at scanline start (gc=0) but deferred
-// to gc>=80 (end of OAM scan / start of mode 3).  This allows the game to update SCX
-// during the OAM-scan window (Pokemon Red raster scroll effects, Nidoran intro, etc.).
+// Per-scanline raster-scroll invalidation:
+// Strategy: draw the scanline IMMEDIATELY at LY-transition (gc=0) so that VRAM
+// data, BGP, SCY and other registers are captured before any ISR can modify them.
+// If the game writes SCX during OAM scan (gc 0-79), mark the scanline for a
+// redraw at gc>=80 with the updated SCX value.  This handles both the common case
+// (no SCX change → one draw, correct everything) and the Nidoran raster-scroll
+// case (SCX changes → redraw once with new SCX, correct horizontal scroll).
+static bool   scx_oam_redraw_pending = false;  // SCX was written during OAM scan
+static int    scx_oam_redraw_ly      = 0;      // LY of the scanline to redraw
+
+// Keep for gpu_init/gpu_write LCD-off cleanup path.
 static bool drawline_pending = false;
-static int  drawline_pending_ly = 0;
+
+// Forward declaration: gpu_write (LCD-on path) calls gpu_drawline before its definition.
+static void gpu_drawline(byte ly);
 
 // Recompute mode3_extra for the current LY_REG.
 // Must be called right after LY_REG is updated so OAM is scanned for the correct line.
@@ -309,6 +319,7 @@ void gpu_init(void){
     LY_REG = 0;
     real_ly = 0;
     drawline_pending = false;
+    scx_oam_redraw_pending = false;
 
     // Initialize GPU control with default values
     gpu_control.enabled = false;
@@ -756,9 +767,14 @@ void gpu_write(int pos, byte data){
             // The comparison clock restarts immediately, so LYC=LY is re-evaluated.
             lcd_startup_mode0 = true;
             lcd_startup_line = true;
-            // Queue LY=0 for rendering (fires at T=80 of the first scanline).
-            drawline_pending    = true;
-            drawline_pending_ly = 0;
+            // On LCD enable: draw LY=0 immediately before any ISR can change state.
+            // SCX-change redraw handles raster-scroll if SCX is written during OAM.
+            // Guard against gpu_init() calling this before pixels is allocated.
+            scx_oam_redraw_pending = false;
+            if (pixels) {
+                gpu_drawline(0);
+            }
+            scx_oam_redraw_ly = 0;
             // Recompute mode3_extra for the new scanline immediately, so the
             // first scanline after lcd_on uses the correct SCX-based extension.
             compute_mode3_extra();
@@ -777,6 +793,7 @@ void gpu_write(int pos, byte data){
             gpu_cycles = 0;
             window_line = 0;
             drawline_pending = false;
+            scx_oam_redraw_pending = false;
             stat_irq_line = false;
         }
     }
@@ -793,7 +810,19 @@ void gpu_write(int pos, byte data){
         stat_check_irq_midinstruction();
     }
     if (pos == SCX) {
+        byte old_scx = SCX_REG;
         SCX_REG = data;
+        // If SCX changes during OAM scan (gc 0-79) of a visible scanline, schedule
+        // a redraw at gc>=80 (mode-3 start) so the new horizontal scroll takes effect.
+        // This implements per-line raster-scroll effects (e.g. Pokemon Red Nidoran intro).
+        if (old_scx != SCX_REG && gpu_cycles < 80 && real_ly < 144) {
+            scx_oam_redraw_pending = true;
+            // scx_oam_redraw_ly is already set to real_ly when the initial draw fired
+        }
+        // Also recompute mode3_extra timing with the new SCX for accurate HBLANK timing.
+        if (gpu_cycles < 80 && real_ly < 144) {
+            recompute_mode3_extra_at_mode3();
+        }
     }
     if (pos == SCY) {
         SCY_REG = data;
@@ -950,7 +979,7 @@ void gpu_draw_sprites(byte ly){
     }
 }
 
-void gpu_drawline(byte ly){
+static void gpu_drawline(byte ly){
     gpu_draw_bg(ly);
     gpu_draw_window(ly);
     gpu_draw_sprites(ly);
@@ -967,9 +996,12 @@ void gpu_step(int _cycles){
 
     // Fire deferred drawline once OAM scan is complete (gc>=80).
     // Deferred at scanline wrap to let the game update SCX during OAM scan.
-    if (drawline_pending && gpu_cycles >= 80) {
-        drawline_pending = false;
-        gpu_drawline((byte)drawline_pending_ly);
+    // Render using snapshotted registers from gc=0 (pre-ISR) for everything except SCX.
+    // SCX is intentionally read from its current value so per-line raster scroll works.
+    // If SCX changed during OAM scan, redraw with the new value now (gc>=80 = mode 3 start).
+    if (scx_oam_redraw_pending && gpu_cycles >= 80) {
+        scx_oam_redraw_pending = false;
+        gpu_drawline((byte)scx_oam_redraw_ly);
     }
 
     // Clear startup mode-0 override once gpu_cycles advances into OAM scan range.
@@ -990,9 +1022,11 @@ void gpu_step(int _cycles){
             LY_REG = 0;
             window_line = 0;
             vblank_pending = false;  // safety: clear any stale pending at frame start
-            // Queue LY=0 for rendering; OAM scan starts now, draw fires at gc>=80.
-            drawline_pending    = true;
-            drawline_pending_ly = 0;
+            // Draw LY=0 immediately before any ISR can modify VRAM or registers.
+            // SCX-change redraw will handle raster-scroll if SCX is written during OAM.
+            scx_oam_redraw_pending = false;
+            gpu_drawline(0);
+            scx_oam_redraw_ly = 0;
         } else {
             LY_REG = real_ly;
             // Clear startup-line flag on first LY increment (LY=0→1)
@@ -1003,10 +1037,12 @@ void gpu_step(int _cycles){
                 // as mode-1 STAT becoming visible). Mark pending; fire in stat_check_irq.
                 vblank_pending = true;
             } else if (real_ly < 144) {
-                // Defer drawline to gc>=80 (OAM scan end / mode-3 start).
-                // This lets the game update SCX during OAM scan (raster scroll effects).
-                drawline_pending    = true;
-                drawline_pending_ly = real_ly;
+                // Draw line immediately at LY transition so VRAM/register state is
+                // captured before any ISR can modify it.  SCX-change redraw handles
+                // raster-scroll effects (e.g. Pokemon Red Nidoran intro).
+                scx_oam_redraw_pending = false;
+                gpu_drawline(real_ly);
+                scx_oam_redraw_ly = real_ly;
             }
             // real_ly == 153: VBlank continues; LY_REG will drop to 0 after 4 T-cycles
         }
@@ -5753,6 +5789,7 @@ int main(int argc, char **argv){
   bool server_mode = false;
   int  server_port = 8080;
   const char *server_bind = NULL;
+  const char *ppm_path = NULL;
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--headless") == 0) {
@@ -5793,6 +5830,9 @@ int main(int argc, char **argv){
       else if (strcmp(m, "sgb2") == 0) gb_model = MODEL_SGB2;
       else if (strcmp(m, "cgb") == 0 || strcmp(m, "gbc") == 0 || strcmp(m, "S") == 0) gb_model = MODEL_GBC;
       else { fprintf(stderr, "Unknown model: %s\n", m); return 1; }
+    } else if (strcmp(argv[i], "--ppm") == 0) {
+      if (i + 1 >= argc) { fprintf(stderr, "Missing value for --ppm\n"); return 1; }
+      ppm_path = argv[++i];
     } else if (strncmp(argv[i], "--", 2) == 0) {
       fprintf(stderr, "Unknown option: %s\n", argv[i]);
       return 1;
@@ -5839,6 +5879,23 @@ int main(int argc, char **argv){
     headless_main_impl();
   } else {
     sdl_main_impl();
+  }
+
+  if (ppm_path) {
+    /* Debug: dump GPU register state */
+    fprintf(stderr, "PPU state at dump: LCDC=%02X LY=%02X SCX=%02X SCY=%02X WX=%02X WY=%02X BGP=%02X\n",
+            RAM[LCDC], RAM[LY], RAM[SCX], RAM[SCY], RAM[WX], RAM[WY], RAM[BGP]);
+    FILE *pf = fopen(ppm_path, "wb");
+    if (pf) {
+      fprintf(pf, "P6\n%d %d\n255\n", VIEWPORT_WIDTH, VIEWPORT_HEIGHT);
+      for (int i = 0; i < VIEWPORT_WIDTH * VIEWPORT_HEIGHT; i++) {
+        uint32_t px = pixels[i];
+        uint8_t rgb[3] = { (uint8_t)(px & 0xFF), (uint8_t)((px>>8)&0xFF), (uint8_t)((px>>16)&0xFF) };
+        fwrite(rgb, 1, 3, pf);
+      }
+      fclose(pf);
+      fprintf(stderr, "Frame dumped to %s\n", ppm_path);
+    }
   }
 
   /* Save battery-backed cartridge RAM (.sav) on every clean shutdown */
