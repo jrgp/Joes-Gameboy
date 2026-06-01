@@ -6,7 +6,9 @@
  *
  * Wire protocol (binary WebSocket messages):
  *   Server → Client:
- *     [0x01] + 160*144*4 RGBA bytes  — framebuffer update
+ *     [0x01] + 5760 bytes  — framebuffer update, 2bpp packed
+ *                            4 pixels per byte, MSB-first, palette indices 0-3
+ *                            Palette: 0=white(FF), 1=lt-grey(AA), 2=dk-grey(55), 3=black(00)
  *
  *   Client → Server:
  *     [0x02, bitmask]   — joypad update (bit0=RIGHT,1=LEFT,2=UP,3=DOWN,
@@ -128,6 +130,8 @@ static const char HTML_PAGE[] =
 "var ctx=cv.getContext('2d');\n"
 "var st=document.getElementById('st');\n"
 "var btns=0;\n"
+"var g_px=new Uint8ClampedArray(160*144*4);\n"
+"var PALETTE=new Uint8Array([255,255,255,170,170,170,85,85,85,0,0,0]);\n"
 "function resize(){\n"
 "  var sw=document.getElementById('sw');\n"
 "  var aw=sw.clientWidth||window.innerWidth;\n"
@@ -149,9 +153,16 @@ static const char HTML_PAGE[] =
 "  ws.onerror=function(){};\n"
 "  ws.onmessage=function(e){\n"
 "    var d=new Uint8Array(e.data);\n"
-"    if(d[0]===1&&d.length===92161){\n"
-"      var px=new ImageData(new Uint8ClampedArray(e.data,1,92160),160,144);\n"
-"      ctx.putImageData(px,0,0);\n"
+"    if(d[0]===1&&d.length===5761){\n"
+"      var bi=0;\n"
+"      for(var i=1;i<5761;i++){\n"
+"        var b=d[i],x;\n"
+"        x=((b>>6)&3)*3;g_px[bi++]=PALETTE[x];g_px[bi++]=PALETTE[x+1];g_px[bi++]=PALETTE[x+2];g_px[bi++]=255;\n"
+"        x=((b>>4)&3)*3;g_px[bi++]=PALETTE[x];g_px[bi++]=PALETTE[x+1];g_px[bi++]=PALETTE[x+2];g_px[bi++]=255;\n"
+"        x=((b>>2)&3)*3;g_px[bi++]=PALETTE[x];g_px[bi++]=PALETTE[x+1];g_px[bi++]=PALETTE[x+2];g_px[bi++]=255;\n"
+"        x=(b&3)*3;     g_px[bi++]=PALETTE[x];g_px[bi++]=PALETTE[x+1];g_px[bi++]=PALETTE[x+2];g_px[bi++]=255;\n"
+"      }\n"
+"      ctx.putImageData(new ImageData(g_px,160,144),0,0);\n"
 "    }\n"
 "  };\n"
 "}\n"
@@ -209,10 +220,17 @@ static const char HTML_PAGE[] =
 
 /* ---- Global server state ---- */
 
-#define WS_FRAME_BYTES (1 + 160 * 144 * 4)  /* type byte + RGBA pixels */
+/* 2bpp wire format: type byte + 160*144/4 packed bytes (4 pixels/byte, MSB-first).
+ * DMG has exactly 4 colours so each pixel fits in 2 bits.  Frame is 16x smaller
+ * than raw RGBA (5761 vs 92161 bytes), dramatically reducing send-buffer pressure. */
+#define WS_FRAME_2BPP_PAYLOAD (160 * 144 / 4)          /* 5760 bytes */
+#define WS_FRAME_BYTES        (1 + WS_FRAME_2BPP_PAYLOAD) /* + type byte */
 
-/* RGBA conversion of the latest frame (set by ws_server_notify_frame). */
-static uint8_t g_frame_rgba[160 * 144 * 4];
+/* Latest encoded frame and a monotonically-increasing sequence counter.
+ * Incremented by ws_server_notify_frame(); per-connection last_sent_seq
+ * prevents re-sending the same frame twice (frame-drop guard). */
+static uint8_t   g_frame_2bpp[WS_FRAME_2BPP_PAYLOAD];
+static uint32_t  g_frame_seq = 1;   /* start at 1; per-conn inits to 0 → first frame always sent */
 
 /* Send buffer: LWS_PRE headroom + frame payload (static, single-threaded). */
 static unsigned char g_send_buf[LWS_PRE + WS_FRAME_BYTES];
@@ -222,8 +240,9 @@ static struct lws_context *g_context = NULL;
 /* ---- Per-connection state ---- */
 
 typedef struct {
-    bool is_ws;       /* true after WebSocket upgrade (ESTABLISHED) */
-    bool html_sent;   /* true after HTTP body has been written */
+    bool     is_ws;          /* true after WebSocket upgrade (ESTABLISHED) */
+    bool     html_sent;      /* true after HTTP body has been written */
+    uint32_t last_sent_seq;  /* seq of the last frame sent to this client */
 } per_session_t;
 
 /* ---- LWS callback ---- */
@@ -281,7 +300,11 @@ static int callback_gb(struct lws *wsi, enum lws_callback_reasons reason,
 
     /* ---- WebSocket: connection established ---- */
     case LWS_CALLBACK_ESTABLISHED: {
-        if (pss) { pss->is_ws = true; }
+        if (pss) {
+            pss->is_ws = true;
+            pss->last_sent_seq = 0;  /* ensure first frame is sent immediately */
+            lws_callback_on_writable(wsi);
+        }
         char peer[64] = "?";
         lws_get_peer_simple(wsi, peer, sizeof(peer));
         fprintf(stderr, "[ws] WS connected: %s\n", peer);
@@ -339,10 +362,15 @@ static int callback_gb(struct lws *wsi, enum lws_callback_reasons reason,
     /* ---- WebSocket: socket is ready to send ---- */
     case LWS_CALLBACK_SERVER_WRITEABLE: {
         if (!pss || !pss->is_ws) return 0;
-        /* Send current frame: [0x01] + RGBA data */
+        /* Frame-drop guard: skip if we already sent this frame to this client.
+         * lws_callback_on_writable_all_protocol() is idempotent so multiple
+         * notify_frame() calls between service ticks collapse to one send. */
+        if (pss->last_sent_seq == g_frame_seq) return 0;
+        /* Send current frame: [0x01] + 2bpp payload */
         g_send_buf[LWS_PRE] = 0x01;
-        memcpy(g_send_buf + LWS_PRE + 1, g_frame_rgba, 160 * 144 * 4);
+        memcpy(g_send_buf + LWS_PRE + 1, g_frame_2bpp, WS_FRAME_2BPP_PAYLOAD);
         lws_write(wsi, g_send_buf + LWS_PRE, (size_t)WS_FRAME_BYTES, LWS_WRITE_BINARY);
+        pss->last_sent_seq = g_frame_seq;
         return 0;
     }
 
@@ -393,14 +421,29 @@ bool ws_server_init(const char *bind_addr, int port)
 
 void ws_server_notify_frame(const uint32_t *pixels, int w, int h)
 {
-    /* Convert SDL_PIXELFORMAT_RGBA32 (little-endian: R=bits7-0) to canvas RGBA bytes. */
-    for (int i = 0; i < w * h; i++) {
-        uint32_t px = pixels[i];
-        g_frame_rgba[i * 4 + 0] = (uint8_t)(px & 0xFF);           /* R */
-        g_frame_rgba[i * 4 + 1] = (uint8_t)((px >>  8) & 0xFF);   /* G */
-        g_frame_rgba[i * 4 + 2] = (uint8_t)((px >> 16) & 0xFF);   /* B */
-        g_frame_rgba[i * 4 + 3] = 0xFF;                            /* A = opaque */
+    /* Encode framebuffer as 2bpp (4 pixels per byte, MSB-first).
+     * DMG greyscale palette:
+     *   index 0 = white   (R=0xFF)
+     *   index 1 = lt-grey (R=0xAA)
+     *   index 2 = dk-grey (R=0x55)
+     *   index 3 = black   (R=0x00)
+     * We use the R channel (= G = B for greyscale) to identify the colour. */
+    int n = w * h;
+    for (int i = 0; i < n; i += 4) {
+        uint8_t byte = 0;
+        for (int j = 0; j < 4; j++) {
+            uint8_t r = (uint8_t)(pixels[i + j] & 0xFFu);
+            uint8_t idx;
+            if      (r == 0xFFu) idx = 0;
+            else if (r == 0xAAu) idx = 1;
+            else if (r == 0x55u) idx = 2;
+            else                 idx = 3;
+            byte |= (uint8_t)(idx << (6 - j * 2));
+        }
+        g_frame_2bpp[i / 4] = byte;
     }
+
+    g_frame_seq++;
 
     /* Schedule a write callback for every connected WebSocket client. */
     if (g_context)
@@ -410,7 +453,7 @@ void ws_server_notify_frame(const uint32_t *pixels, int w, int h)
 void ws_server_service(void)
 {
     if (g_context)
-        lws_service(g_context, 0);  /* 0 = non-blocking */
+        lws_service(g_context, 1);  /* 1ms blocking poll — caller loops for full frame interval */
 }
 
 void ws_server_destroy(void)

@@ -5772,14 +5772,18 @@ static void server_main_impl(void) {
 
         frame_headless();
         ws_server_notify_frame(pixels, VIEWPORT_WIDTH, VIEWPORT_HEIGHT);
-        ws_server_service();
 
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        long elapsed_us = (t1.tv_sec  - t0.tv_sec)  * 1000000L
-                        + (t1.tv_nsec - t0.tv_nsec) / 1000L;
-        long target_us  = 16667L; /* ~60 fps */
-        if (elapsed_us < target_us)
-            usleep((unsigned int)(target_us - elapsed_us));
+        /* Service LWS in 1-ms blocking slices for the rest of the frame interval.
+         * This gives the event loop ~16 chances per frame to drain the TCP send
+         * buffer, preventing frame queuing when the connection is slow. */
+        long target_us = 16667L; /* ~60 fps */
+        for (;;) {
+            ws_server_service();
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            long elapsed_us = (t1.tv_sec  - t0.tv_sec)  * 1000000L
+                            + (t1.tv_nsec - t0.tv_nsec) / 1000L;
+            if (elapsed_us >= target_us) break;
+        }
     }
 }
 

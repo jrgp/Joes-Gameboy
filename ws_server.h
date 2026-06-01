@@ -23,11 +23,15 @@ bool ws_server_init(const char *bind_addr, int port);
 /* Push a new framebuffer snapshot to all connected WebSocket clients.
  * pixels: 160×144 array of uint32_t in SDL_PIXELFORMAT_RGBA32 layout
  *         (little-endian: R=bits7-0, G=bits15-8, B=bits23-16, A=bits31-24)
+ *         Must be DMG greyscale (R=G=B ∈ {0xFF,0xAA,0x55,0x00}).
+ * Encodes as 2bpp (5760 bytes) — 16× smaller than raw RGBA.
  * After this call, ws_server_service() must be called to actually dispatch
  * the writeable callbacks. */
 void ws_server_notify_frame(const uint32_t *pixels, int w, int h);
 
-/* Drive the LWS event loop (non-blocking, call once per emulator frame). */
+/* Drive the LWS event loop (1ms blocking poll per call).
+ * Call in a tight loop for the full frame interval so LWS can drain the TCP
+ * send buffer without waiting a full 16ms between chances. */
 void ws_server_service(void);
 
 /* Tear down the LWS context and free resources. */
