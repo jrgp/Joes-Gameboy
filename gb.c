@@ -1251,6 +1251,7 @@ int cart_mbc1_mode = 0;  // 0=ROM banking mode (default), 1=RAM banking mode
 int cart_ram_bank = 0;   // current RAM bank (MBC3 uses this; MBC1 uses mbc1_upper)
 byte ext_ram[0x8000];    // 32KB external RAM (up to 4 banks × 8KB)
 int  cart_ram_size = 0;  // actual cartridge RAM in bytes (from header byte $0149)
+static bool ext_ram_dirty = false; /* set on any ext_ram write; cleared after sav_save */
 
 /* Cart types that have a battery-backed RAM chip */
 static bool cart_has_battery(void) {
@@ -1305,6 +1306,7 @@ static void sav_save(const char *rom_path) {
     if (!f) { perror("[sav] cannot open"); return; }
     size_t n = fwrite(ext_ram, 1, (size_t)cart_ram_size, f);
     fclose(f);
+    ext_ram_dirty = false;
     if ((int)n == cart_ram_size)
         fprintf(stderr, "[sav] saved %d bytes to %s\n", cart_ram_size, path);
     else
@@ -1995,6 +1997,7 @@ void mem_write(int pos, byte data) {
                 int ram_bank = is_mbc3() ? cart_ram_bank : (cart_mbc1_mode == 1 ? cart_mbc1_upper : 0);
                 int idx = ram_bank * 0x2000 + (pos - 0xA000);
                 ext_ram[idx] = data;
+                ext_ram_dirty = true;
                 // Detect blargg test completion: A000 written with non-0x80 value
                 // when magic bytes DE B0 61 are present at A001-A003
                 if (pos == 0xA000 && data != 0x80 &&
@@ -5782,8 +5785,9 @@ static void server_main_impl(void) {
         ws_server_service();  /* non-blocking: send frame, process any input */
 
         /* Flush battery-backed RAM to disk every ~5 seconds so in-game saves
-         * (e.g. Pokemon) are not lost if the server is killed uncleanly. */
-        if (++frame_num % 300 == 0 && savestate_rom_path[0] != '\0')
+         * (e.g. Pokemon) are not lost if the server is killed uncleanly.
+         * Only writes if ext_ram has actually been modified since last flush. */
+        if (++frame_num % 300 == 0 && ext_ram_dirty && savestate_rom_path[0] != '\0')
             sav_save(savestate_rom_path);
 
         clock_gettime(CLOCK_MONOTONIC, &t1);
