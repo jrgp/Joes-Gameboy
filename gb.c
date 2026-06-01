@@ -308,6 +308,7 @@ void gpu_init(void){
     gpu_cycles = 0;
     LY_REG = 0;
     real_ly = 0;
+    drawline_pending = false;
 
     // Initialize GPU control with default values
     gpu_control.enabled = false;
@@ -755,6 +756,9 @@ void gpu_write(int pos, byte data){
             // The comparison clock restarts immediately, so LYC=LY is re-evaluated.
             lcd_startup_mode0 = true;
             lcd_startup_line = true;
+            // Queue LY=0 for rendering (fires at T=80 of the first scanline).
+            drawline_pending    = true;
+            drawline_pending_ly = 0;
             // Recompute mode3_extra for the new scanline immediately, so the
             // first scanline after lcd_on uses the correct SCX-based extension.
             compute_mode3_extra();
@@ -772,6 +776,7 @@ void gpu_write(int pos, byte data){
             real_ly = 0;
             gpu_cycles = 0;
             window_line = 0;
+            drawline_pending = false;
             stat_irq_line = false;
         }
     }
@@ -795,6 +800,9 @@ void gpu_write(int pos, byte data){
     }
     if (pos == BGP) {
         BGP_REG = data;
+    }
+    if (pos == WX || pos == WY) {
+        RAM[pos] = data;
     }
     if (data > 0) {
  //       printf("wrote %x to %x\n", data, pos);
@@ -982,6 +990,9 @@ void gpu_step(int _cycles){
             LY_REG = 0;
             window_line = 0;
             vblank_pending = false;  // safety: clear any stale pending at frame start
+            // Queue LY=0 for rendering; OAM scan starts now, draw fires at gc>=80.
+            drawline_pending    = true;
+            drawline_pending_ly = 0;
         } else {
             LY_REG = real_ly;
             // Clear startup-line flag on first LY increment (LY=0→1)
