@@ -210,7 +210,7 @@ static void map_put(cbor_item_t *map, const char *key, cbor_item_t *val) {
         .key   = cbor_move(cbor_build_string(key)),
         .value = cbor_move(val)
     };
-    cbor_map_add(map, pair);
+    (void)cbor_map_add(map, pair);
 }
 
 #define MAP_BOOL(m, k, v)   map_put((m), (k), cbor_build_bool((v)))

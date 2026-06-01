@@ -2213,13 +2213,13 @@ word pop_stack(void) {
     const word f1 = mem_read(SP);
     const word f2 = mem_read(SP + 1);
     SP += 2;
-    return (f2 << 8) | f1;
+    return (word)((f2 << 8) | f1);
 }
 
 word peek_stack(void) {
     const word f1 = mem_read(SP);
     const word f2 = mem_read(SP + 1);
-    return (f2 << 8) | f1;
+    return (word)((f2 << 8) | f1);
 }
 
 word AF(void) {
@@ -2317,7 +2317,7 @@ byte cpu_read_next(void) {
 word cpu_read16(void) {
   const byte lo = cpu_read_next();
   const byte hi = cpu_read_next();
-  return lo | (hi << 8);
+  return (word)(lo | (hi << 8));
 }
 
 void do_interrupts(void){
