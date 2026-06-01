@@ -80,12 +80,13 @@ static const char HTML_PAGE[] =
 "  <button class='tb' id='bsv'>Save</button>\n"
 "  <button class='tb' id='bld'>Load</button>\n"
 "  <button class='tb' id='brs'>Reset</button>\n"
+"  <button class='tb' id='bft'>Fast</button>\n"
 "  <span id='st'>Connecting...</span>\n"
 "</div>\n"
 "<div id='sw'><canvas id='screen' width='160' height='144'></canvas></div>\n"
 "<canvas id='ctrl-canvas'></canvas>\n"
 "<div id='hint'>Arrows: D-Pad &nbsp; A: A &nbsp; S: B &nbsp; Enter: Start &nbsp;"
-               " Shift: Select &nbsp; F5: Save &nbsp; F8: Load</div>\n"
+               " Shift: Select &nbsp; F5: Save &nbsp; F8: Load &nbsp; F: Fast</div>\n"
 "<script>\n"
 "(function(){\n"
 "'use strict';\n"
@@ -206,9 +207,17 @@ static const char HTML_PAGE[] =
 "  if(btns!==prev)snd(2,btns);\n"
 "}\n"
 "var km={ArrowRight:0,ArrowLeft:1,ArrowUp:2,ArrowDown:3,a:4,A:4,s:5,S:5,Enter:7,Shift:6};\n"
+"var fast=false;\n"
+"function setFast(on){\n"
+"  fast=on;\n"
+"  var b=document.getElementById('bft');\n"
+"  b.textContent=fast?'Fast \u23e9':'Fast';\n"
+"  b.style.background=fast?'#c84':''\n"
+"}\n"
 "document.addEventListener('keydown',function(e){\n"
 "  if(e.key==='F5'){snd(3);e.preventDefault();return;}\n"
 "  if(e.key==='F8'){snd(4);e.preventDefault();return;}\n"
+"  if(e.key==='f'||e.key==='F'){snd(6);setFast(!fast);e.preventDefault();return;}\n"
 "  var b=km[e.key];\n"
 "  if(b!==undefined){setb(b,true);e.preventDefault();}\n"
 "});\n"
@@ -219,6 +228,7 @@ static const char HTML_PAGE[] =
 "document.getElementById('bsv').onclick=function(){snd(3);};\n"
 "document.getElementById('bld').onclick=function(){snd(4);};\n"
 "document.getElementById('brs').onclick=function(){snd(5);};\n"
+"document.getElementById('bft').onclick=function(){snd(6);setFast(!fast);};\n"
 "['touchstart','touchmove'].forEach(function(ev){\n"
 "  cc.addEventListener(ev,function(e){\n"
 "    e.preventDefault();\n"
@@ -374,6 +384,10 @@ static int callback_gb(struct lws *wsi, enum lws_callback_reasons reason,
 
         case 0x05: /* Reset */
             gb_reset();
+            break;
+
+        case 0x06: /* Fast mode toggle */
+            g_fast_mode = !g_fast_mode;
             break;
 
         default:

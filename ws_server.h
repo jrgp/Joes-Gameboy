@@ -35,3 +35,7 @@ void ws_server_service(void);
 
 /* Tear down the LWS context and free resources. */
 void ws_server_destroy(void);
+
+/* Fast-mode flag — set by the browser (0x06 message) or SDL (F key).
+ * When true, server_main_impl / frame() sleep 1/4 as long (~4× speed). */
+extern bool g_fast_mode;

@@ -46,6 +46,7 @@ static bool serial_active = false;    // true during an in-progress internal-clo
 static int  serial_bits_remaining = 0; // bits left in current transfer (8 down to 0)
 static byte serial_out_byte = 0;       // byte to transmit (saved at transfer start)
 bool headless = false;
+bool g_fast_mode = false; /* when true, sleep 1/4 of normal — runs at ~4× speed */
 long long max_cycles = 0;
 bool gbmicrotest_mode = false; // read 0xFF82 for pass/fail after cycle limit
 
@@ -5510,7 +5511,8 @@ bool frame(void){
 
     // More accurate frame timing - target 16.67ms per frame (60 FPS)
     if (diff < 16) {
-        const uint32_t nap_time = 16 - diff;
+        uint32_t nap_time = 16 - diff;
+        if (g_fast_mode) nap_time /= 4;
         SDL_Delay(nap_time);
     }
 
@@ -5568,6 +5570,10 @@ void sdl_main_impl(void){
                                 printf("[savestate] saved to %s\n", ss_path);
                             }
                         }
+                      break;
+                      case SDLK_f: // Fast mode toggle
+                        if (event.key.type == SDL_KEYDOWN)
+                            g_fast_mode = !g_fast_mode;
                       break;
                   }
                   if (joypad_key != NULL) {
@@ -5778,8 +5784,11 @@ static void server_main_impl(void) {
         long elapsed_us = (t1.tv_sec  - t0.tv_sec)  * 1000000L
                         + (t1.tv_nsec - t0.tv_nsec) / 1000L;
         long target_us  = 16667L; /* ~60 fps */
-        if (elapsed_us < target_us)
-            usleep((unsigned int)(target_us - elapsed_us));
+        if (elapsed_us < target_us) {
+            long sleep_us = target_us - elapsed_us;
+            if (g_fast_mode) sleep_us /= 4;
+            usleep((unsigned int)sleep_us);
+        }
     }
 }
 
