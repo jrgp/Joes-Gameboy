@@ -29,9 +29,8 @@ bool ws_server_init(const char *bind_addr, int port);
  * the writeable callbacks. */
 void ws_server_notify_frame(const uint32_t *pixels, int w, int h);
 
-/* Drive the LWS event loop (1ms blocking poll per call).
- * Call in a tight loop for the full frame interval so LWS can drain the TCP
- * send buffer without waiting a full 16ms between chances. */
+/* Drive the LWS event loop (non-blocking). Call once per emulator frame after
+ * ws_server_notify_frame(); the caller handles frame-rate pacing via usleep. */
 void ws_server_service(void);
 
 /* Tear down the LWS context and free resources. */

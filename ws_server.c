@@ -453,7 +453,7 @@ void ws_server_notify_frame(const uint32_t *pixels, int w, int h)
 void ws_server_service(void)
 {
     if (g_context)
-        lws_service(g_context, 1);  /* 1ms blocking poll — caller loops for full frame interval */
+        lws_service(g_context, 0);  /* non-blocking; caller handles sleep */
 }
 
 void ws_server_destroy(void)
