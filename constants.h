@@ -1,3 +1,7 @@
+#pragma once
+
+#include <stdint.h>
+
 #define LCDC 0xFF40
 #define STAT 0xFF41
 #define SCY 0xFF42
@@ -23,7 +27,7 @@
 #define INTERRUPT_SERIAL  8
 #define INTERRUPT_JOYPAD  16
 
-char INTERRUPT_PRIORITY[5] = {
+static const char INTERRUPT_PRIORITY[5] = {
 	INTERRUPT_VBLANK,
 	INTERRUPT_STAT,
 	INTERRUPT_TIMER,
@@ -31,7 +35,7 @@ char INTERRUPT_PRIORITY[5] = {
 	INTERRUPT_JOYPAD
 };
 
-char *INTERRUPT_NAMES[5] = {
+static const char *const INTERRUPT_NAMES[5] = {
 	"VBLANK",
 	"STAT",
 	"TIMER",
@@ -39,7 +43,7 @@ char *INTERRUPT_NAMES[5] = {
 	"JOYPAD"
 };
 
-uint16_t INTERRUPT_OFFSETS[5] = {
+static const uint16_t INTERRUPT_OFFSETS[5] = {
 	0x40,
 	0x48,
 	0x50,
@@ -49,7 +53,7 @@ uint16_t INTERRUPT_OFFSETS[5] = {
 
 #define FPS 60
 
-uint32_t pallette[4] = {
+static const uint32_t pallette[4] = {
     0xffffff,
     0xaaaaaa,
     0x555555,

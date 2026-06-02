@@ -1,7 +1,3 @@
-#ifndef HEADLESS_ONLY
-#include <SDL.h>
-#endif
-
 #include<unistd.h>
 #include<inttypes.h>
 #include<stdio.h>
@@ -13,6 +9,7 @@
 #include"constants.h"
 #include"opnames.h"
 #include"savestate.h"
+#include "gb.h"
 
 typedef uint8_t byte;
 typedef uint16_t word;
@@ -1253,7 +1250,7 @@ int cart_mbc1_mode = 0;  // 0=ROM banking mode (default), 1=RAM banking mode
 int cart_ram_bank = 0;   // current RAM bank (MBC3 uses this; MBC1 uses mbc1_upper)
 byte ext_ram[0x8000];    // 32KB external RAM (up to 4 banks × 8KB)
 int  cart_ram_size = 0;  // actual cartridge RAM in bytes (from header byte $0149)
-static bool ext_ram_dirty = false; /* set on any ext_ram write; cleared after sav_save */
+bool ext_ram_dirty = false; /* set on any ext_ram write; cleared after sav_save */
 
 /* Cart types that have a battery-backed RAM chip */
 static bool cart_has_battery(void) {
@@ -1285,7 +1282,7 @@ static void sav_path(const char *rom, char *out, size_t out_size) {
 }
 
 /* Load battery-backed RAM from <rom>.sav if it exists */
-static void sav_load(const char *rom_path) {
+void sav_load(const char *rom_path) {
     if (!cart_has_battery() || cart_ram_size <= 0) return;
     char path[4096];
     sav_path(rom_path, path, sizeof(path));
@@ -1300,7 +1297,7 @@ static void sav_load(const char *rom_path) {
 }
 
 /* Save battery-backed RAM to <rom>.sav */
-static void sav_save(const char *rom_path) {
+void sav_save(const char *rom_path) {
     if (!cart_has_battery() || cart_ram_size <= 0) return;
     char path[4096];
     sav_path(rom_path, path, sizeof(path));
@@ -5386,16 +5383,6 @@ void exec_next(void){
     }
 }
 
-//
-// SDL boilerplate
-//
-
-#ifndef HEADLESS_ONLY
-SDL_Window* window;
-SDL_Renderer* renderer;
-SDL_Texture* texture;
-#endif
-
 void pixels_init(void){
     pixels = malloc(sizeof(uint32_t) * VIEWPORT_WIDTH * VIEWPORT_HEIGHT);
     if (pixels == NULL) {
@@ -5405,61 +5392,6 @@ void pixels_init(void){
 
     memset(pixels, 0, sizeof(uint32_t) * VIEWPORT_WIDTH * VIEWPORT_HEIGHT);
 }
-
-#ifndef HEADLESS_ONLY
-void sdl_init(void){
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
-        printf("SDL could not initialize! SDL_Error: %s\n", SDL_GetError());
-        exit(1);
-    }
-    
-    window = SDL_CreateWindow("Joe's GB", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, VIEWPORT_WIDTH*2, VIEWPORT_HEIGHT*2, SDL_WINDOW_SHOWN);
-
-    if (window == NULL) {
-        printf("Window could not be created! SDL Error: %s\n", SDL_GetError());
-        exit(1);
-    }
-
-    SDL_SetWindowResizable(window, true);
-
-    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
-    if (renderer == NULL) {
-        printf("Renderer could not be created! SDL Error: %s\n", SDL_GetError());
-        exit(1);
-    }
-
-    texture = SDL_CreateTexture(renderer,
-        SDL_PIXELFORMAT_RGBA32,
-        SDL_TEXTUREACCESS_STREAMING,
-        VIEWPORT_WIDTH, VIEWPORT_HEIGHT);
-    if (texture == NULL) {
-          printf("Texture could not be created! SDL Error: %s\n", SDL_GetError());
-          exit(1);
-    }
-}
-
-void sdl_display(void){
-    // Diagnostic output removed
-    
-    int result = SDL_UpdateTexture(texture, NULL, pixels, VIEWPORT_WIDTH*sizeof(uint32_t));
-
-    if (result != 0) {
-          printf("Texture could not be updated! SDL Error: %s\n", SDL_GetError());
-          exit(1);
-    }
-
-    const SDL_Rect srcr = {.x = 0, .y = 0, .w = VIEWPORT_WIDTH, .h = VIEWPORT_HEIGHT};
-
-    result = SDL_RenderCopy(renderer, texture, &srcr, NULL);
-    if (result != 0) {
-          printf("SDL_RenderCopy failed. SDL Error: %s\n", SDL_GetError());
-          exit(1);
-    }
-
-    SDL_RenderPresent(renderer);
-}
-#endif /* HEADLESS_ONLY */
-
 
 bool frame_headless(void){
     static int frame_count = 0;
@@ -5510,105 +5442,8 @@ bool frame_headless(void){
     return true;
 }
 
-#ifndef HEADLESS_ONLY
-bool frame(void){
-    const uint32_t start_ticks = SDL_GetTicks();
-
-    frame_headless();
-    sdl_display();
-
-    const uint32_t diff = SDL_GetTicks() - start_ticks;
-
-    // More accurate frame timing - target 16.67ms per frame (60 FPS)
-    if (diff < 16) {
-        uint32_t nap_time = 16 - diff;
-        if (g_fast_mode) nap_time /= 4;
-        SDL_Delay(nap_time);
-    }
-
-    return true;
-}
-
-void sdl_main_impl(void){
-  bool run = true;
-  bool *joypad_key;
-  bool joypad_last;
-
-  // SDL main loop starting
-  SDL_Event event;
-  printf("SDL window created, starting main loop...\n");
-  while(run) {
-      while (SDL_PollEvent(&event)) {
-          switch (event.type) {
-              case SDL_QUIT:
-                  printf("got quit event - window closed\n");
-                  run = false;
-                  return;
-              case SDL_KEYDOWN:
-              case SDL_KEYUP:
-                  joypad_key = NULL;
-                  switch (event.key.keysym.sym) {
-                      case SDLK_RIGHT: // RIGHT
-                        joypad_key = &joypad_buttons.RIGHT;
-                      break;
-                      case SDLK_LEFT: // LEFT
-                        joypad_key = &joypad_buttons.LEFT;
-                      break;
-                      case SDLK_UP: // UP
-                        joypad_key = &joypad_buttons.UP;
-                      break;
-                      case SDLK_DOWN: // DOWN
-                        joypad_key = &joypad_buttons.DOWN;
-                      break;
-                      case SDLK_a: // A
-                        joypad_key = &joypad_buttons.A;
-                      break;
-                      case SDLK_s: // B
-                        joypad_key = &joypad_buttons.B;
-                      break;
-                      case SDLK_RSHIFT: // SELECT
-                        joypad_key = &joypad_buttons.SELECT;
-                      break;
-                      case SDLK_RETURN: // START
-                        joypad_key = &joypad_buttons.START;
-                      break;
-                      case SDLK_F5: // Save state
-                        if (event.key.type == SDL_KEYDOWN) {
-                            char ss_path[4096];
-                            savestate_default_path(savestate_rom_path, ss_path, sizeof(ss_path));
-                            if (save_state(ss_path)) {
-                                printf("[savestate] saved to %s\n", ss_path);
-                            }
-                        }
-                      break;
-                      case SDLK_f: // Fast mode toggle
-                        if (event.key.type == SDL_KEYDOWN)
-                            g_fast_mode = !g_fast_mode;
-                      break;
-                  }
-                  if (joypad_key != NULL) {
-                      joypad_last = *joypad_key;
-                      *joypad_key = event.key.type == SDL_KEYDOWN;
-                      if (joypad_last != *joypad_key) {
-                          request_interrupt(INTERRUPT_JOYPAD);
-                      }
-                  }
-                  break;
-          }
-      }
-
-      static int frame_count = 0;
-      frame_count++;
-      if (frame_count <= 5) {
-          printf("Processing frame %d...\n", frame_count);
-      }
-      run = frame();
-  }
-
-}
-#endif /* HEADLESS_ONLY */
-
 void headless_print_blargg_a000(void) {
+
     // Print blargg A000-format test output to stdout.
     // Format: A000=status, A001-A003=magic bytes DE B0 61, A004+=text
     if (ext_ram[1] == 0xDE && ext_ram[2] == 0xB0 && ext_ram[3] == 0x61) {
@@ -5741,6 +5576,17 @@ void ss_post_load(void) {
 
 /* ---- Public APIs for the WebSocket server layer ---- */
 
+bool gb_set_model(const char *name) {
+    if (strcmp(name, "dmg") == 0 || strcmp(name, "dmgABC") == 0) gb_model = MODEL_DMG;
+    else if (strcmp(name, "dmg0") == 0) gb_model = MODEL_DMG0;
+    else if (strcmp(name, "mgb") == 0)  gb_model = MODEL_MGB;
+    else if (strcmp(name, "sgb") == 0)  gb_model = MODEL_SGB;
+    else if (strcmp(name, "sgb2") == 0) gb_model = MODEL_SGB2;
+    else if (strcmp(name, "cgb") == 0 || strcmp(name, "gbc") == 0 || strcmp(name, "S") == 0) gb_model = MODEL_GBC;
+    else return false;
+    return true;
+}
+
 /*
  * Set or clear a joypad button and fire the joypad interrupt if state changed.
  * bit: 0=RIGHT, 1=LEFT, 2=UP, 3=DOWN, 4=A, 5=B, 6=SELECT, 7=START
@@ -5774,292 +5620,3 @@ void gb_reset(void) {
     joypad_init();
     sav_load(savestate_rom_path);
 }
-
-#ifndef GAMEBOY_LIB_MODE
-
-/* ---- Server mode (WebSocket remote frontend) ---- */
-
-#include "ws_server.h"
-#include <time.h>
-
-static void server_main_impl(void) {
-    int frame_num = 0;
-    while (1) {
-        struct timespec t0, t1;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-
-        frame_headless();
-        ws_server_notify_frame(pixels, VIEWPORT_WIDTH, VIEWPORT_HEIGHT);
-        ws_server_service();  /* non-blocking: send frame, process any input */
-
-        /* Flush battery-backed RAM to disk every ~5 seconds so in-game saves
-         * (e.g. Pokemon) are not lost if the server is killed uncleanly.
-         * Only writes if ext_ram has actually been modified since last flush. */
-        if (++frame_num % 300 == 0 && ext_ram_dirty && savestate_rom_path[0] != '\0')
-            sav_save(savestate_rom_path);
-
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        long elapsed_us = (t1.tv_sec  - t0.tv_sec)  * 1000000L
-                        + (t1.tv_nsec - t0.tv_nsec) / 1000L;
-        long target_us  = 16667L; /* ~60 fps */
-        if (elapsed_us < target_us) {
-            long sleep_us = target_us - elapsed_us;
-            if (g_fast_mode) sleep_us /= 4;
-            usleep((unsigned int)sleep_us);
-        }
-    }
-}
-
-int main(int argc, char **argv){
-  char *rom = "tetris.gb";
-  bool load_from_state = false;
-  bool server_mode = false;
-  int  server_port = 8080;
-  const char *server_bind = NULL;
-  const char *ppm_path = NULL;
-
-  for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--headless") == 0) {
-      headless = true;
-    } else if (strcmp(argv[i], "--server") == 0) {
-      server_mode = true;
-      headless = true;  /* server mode is also headless (no SDL window) */
-    } else if (strcmp(argv[i], "--port") == 0) {
-      if (i + 1 >= argc) {
-        fprintf(stderr, "Missing value for --port\n");
-        return 1;
-      }
-      server_port = atoi(argv[++i]);
-    } else if (strcmp(argv[i], "--bind") == 0) {
-      if (i + 1 >= argc) {
-        fprintf(stderr, "Missing value for --bind\n");
-        return 1;
-      }
-      server_bind = argv[++i];
-    } else if (strcmp(argv[i], "--gbmicrotest") == 0) {
-      gbmicrotest_mode = true;
-    } else if (strcmp(argv[i], "--cycles") == 0) {
-      if (i + 1 >= argc) {
-        fprintf(stderr, "Missing value for --cycles\n");
-        return 1;
-      }
-      max_cycles = strtoll(argv[++i], NULL, 10);
-    } else if (strcmp(argv[i], "--model") == 0) {
-      if (i + 1 >= argc) {
-        fprintf(stderr, "Missing value for --model\n");
-        return 1;
-      }
-      const char *m = argv[++i];
-      if (strcmp(m, "dmg") == 0 || strcmp(m, "dmgABC") == 0) gb_model = MODEL_DMG;
-      else if (strcmp(m, "dmg0") == 0) gb_model = MODEL_DMG0;
-      else if (strcmp(m, "mgb") == 0) gb_model = MODEL_MGB;
-      else if (strcmp(m, "sgb") == 0) gb_model = MODEL_SGB;
-      else if (strcmp(m, "sgb2") == 0) gb_model = MODEL_SGB2;
-      else if (strcmp(m, "cgb") == 0 || strcmp(m, "gbc") == 0 || strcmp(m, "S") == 0) gb_model = MODEL_GBC;
-      else { fprintf(stderr, "Unknown model: %s\n", m); return 1; }
-    } else if (strcmp(argv[i], "--ppm") == 0) {
-      if (i + 1 >= argc) { fprintf(stderr, "Missing value for --ppm\n"); return 1; }
-      ppm_path = argv[++i];
-    } else if (strncmp(argv[i], "--", 2) == 0) {
-      fprintf(stderr, "Unknown option: %s\n", argv[i]);
-      return 1;
-    } else {
-      rom = argv[i];
-      if (savestate_is_cbor_path(rom)) {
-        load_from_state = true;
-      }
-    }
-  }
-// cpu_init_debug_file(); // Disabled to prevent interference
-
-  if (load_from_state) {
-    /* Bootstrap enough to satisfy SDL/pixels before load_state overwrites state */
-    pixels_init();
-    if (!headless) {
-      sdl_init();
-    }
-    if (!load_state(rom)) {
-      fprintf(stderr, "Failed to load save state: %s\n", rom);
-      return 1;
-    }
-  } else {
-    /* In server mode, auto-load the .cbor savestate if one exists for this ROM
-     * so the session resumes exactly where it left off. */
-    char auto_ss[4096] = {0};
-    if (server_mode) {
-      savestate_default_path(rom, auto_ss, sizeof(auto_ss));
-      FILE *probe = fopen(auto_ss, "rb");
-      if (probe) { fclose(probe); load_from_state = true; }
-    }
-
-    if (load_from_state) {
-      /* auto-load path: cart_load is skipped; load_state restores everything */
-      pixels_init();
-      if (!load_state(auto_ss)) {
-        fprintf(stderr, "[server] auto-load of %s failed, booting fresh\n", auto_ss);
-        load_from_state = false;
-        /* fall through to fresh boot below */
-        cart_load(rom);
-        mem_init();
-        sav_load(rom);
-        gpu_init();
-        cpu_fake_init();
-        pixels_init();
-        joypad_init();
-      } else {
-        fprintf(stderr, "[server] auto-loaded savestate %s\n", auto_ss);
-      }
-    } else {
-      cart_load(rom);
-      mem_init();
-      sav_load(rom);    /* load battery-backed RAM before execution begins */
-      gpu_init();    // sets LCD state first
-      cpu_fake_init(); // overrides registers and (for DMG0) GPU scanline position
-      pixels_init();
-      if (!headless) {
-        sdl_init();
-      }
-      joypad_init();
-    }
-  }
-
-  if (server_mode) {
-    if (!ws_server_init(server_bind, server_port)) {
-      fprintf(stderr, "Failed to start WebSocket server\n");
-      return 1;
-    }
-    server_main_impl();
-    ws_server_destroy();
-  } else if (headless) {
-    headless_main_impl();
-  } else {
-    sdl_main_impl();
-  }
-
-  if (ppm_path) {
-    /* Debug: dump GPU register state */
-    fprintf(stderr, "PPU state at dump: LCDC=%02X LY=%02X SCX=%02X SCY=%02X WX=%02X WY=%02X BGP=%02X\n",
-            RAM[LCDC], RAM[LY], RAM[SCX], RAM[SCY], RAM[WX], RAM[WY], RAM[BGP]);
-    FILE *pf = fopen(ppm_path, "wb");
-    if (pf) {
-      fprintf(pf, "P6\n%d %d\n255\n", VIEWPORT_WIDTH, VIEWPORT_HEIGHT);
-      for (int i = 0; i < VIEWPORT_WIDTH * VIEWPORT_HEIGHT; i++) {
-        uint32_t px = pixels[i];
-        uint8_t rgb[3] = { (uint8_t)(px & 0xFF), (uint8_t)((px>>8)&0xFF), (uint8_t)((px>>16)&0xFF) };
-        fwrite(rgb, 1, 3, pf);
-      }
-      fclose(pf);
-      fprintf(stderr, "Frame dumped to %s\n", ppm_path);
-    }
-  }
-
-  /* Save battery-backed cartridge RAM (.sav) on every clean shutdown */
-  if (!load_from_state)
-    sav_save(rom);
-
-  /* Auto-save emulator state (.cbor) on clean shutdown (SDL or server mode) */
-  if (savestate_rom_path[0] != '\0') {
-    char ss_path[4096];
-    savestate_default_path(savestate_rom_path, ss_path, sizeof(ss_path));
-    save_state(ss_path);
-  }
-
-cpu_close_debug_file();
-
-  return 0;
-}
-#endif /* GAMEBOY_LIB_MODE */
-
-#ifdef __EMSCRIPTEN__
-#include <emscripten.h>
-
-EMSCRIPTEN_KEEPALIVE
-void wasm_init(const uint8_t *rom_data, int rom_size) {
-    FILE *f = fopen("/rom.gb", "wb");
-    if (f) { fwrite(rom_data, 1, (size_t)rom_size, f); fclose(f); }
-    cart_load("/rom.gb");
-    mem_init();
-    sav_load("/rom.gb");
-    gpu_init();
-    cpu_fake_init();
-    pixels_init();
-    joypad_init();
-}
-
-EMSCRIPTEN_KEEPALIVE
-void wasm_run_frame(void) {
-    frame_headless();
-}
-
-EMSCRIPTEN_KEEPALIVE
-uint32_t *wasm_get_pixels_ptr(void) {
-    return pixels;
-}
-
-EMSCRIPTEN_KEEPALIVE
-void wasm_set_buttons(int mask) {
-    for (int i = 0; i < 8; i++)
-        gb_set_button(i, (mask >> i) & 1);
-}
-
-EMSCRIPTEN_KEEPALIVE
-void wasm_save_state(void) {
-    save_state("/save.cbor");
-}
-
-EMSCRIPTEN_KEEPALIVE
-int wasm_save_state_size(void) {
-    FILE *f = fopen("/save.cbor", "rb");
-    if (!f) return 0;
-    fseek(f, 0, SEEK_END);
-    int sz = (int)ftell(f);
-    fclose(f);
-    return sz;
-}
-
-EMSCRIPTEN_KEEPALIVE
-void wasm_get_save_state(uint8_t *out, int size) {
-    FILE *f = fopen("/save.cbor", "rb");
-    if (!f) return;
-    (void)fread(out, 1, (size_t)size, f);
-    fclose(f);
-}
-
-EMSCRIPTEN_KEEPALIVE
-int wasm_load_state(const uint8_t *data, int size) {
-    FILE *f = fopen("/save.cbor", "wb");
-    if (!f) return 0;
-    fwrite(data, 1, (size_t)size, f);
-    fclose(f);
-    return load_state("/save.cbor") ? 1 : 0;
-}
-
-EMSCRIPTEN_KEEPALIVE
-void wasm_reset(void) {
-    gb_reset();
-}
-
-EMSCRIPTEN_KEEPALIVE
-void wasm_set_fast(int on) {
-    g_fast_mode = on ? true : false;
-}
-
-EMSCRIPTEN_KEEPALIVE
-int wasm_get_sav_size(void) {
-    return cart_ram_size;
-}
-
-EMSCRIPTEN_KEEPALIVE
-void wasm_get_sav(uint8_t *out) {
-    if (cart_ram_size > 0)
-        memcpy(out, ext_ram, (size_t)cart_ram_size);
-}
-
-EMSCRIPTEN_KEEPALIVE
-void wasm_load_sav(const uint8_t *data, int size) {
-    if (size > 0x8000) size = 0x8000;
-    memcpy(ext_ram, data, (size_t)size);
-    ext_ram_dirty = true;
-}
-
-#endif /* __EMSCRIPTEN__ */

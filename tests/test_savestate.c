@@ -5,10 +5,10 @@
  * Uses the same headless init path as the emulator.
  *
  * Build:
- *   gcc -I.. $(pkg-config --cflags sdl2 libcbor) -Wall -Wextra -g \
+ *   gcc -I.. $(pkg-config --cflags libcbor) -Wall -Wextra -g \
  *       test_savestate.c ../savestate.c ../gb.c \
  *       -o test_savestate_bin \
- *       $(pkg-config --libs sdl2 libcbor)
+ *       $(pkg-config --libs libcbor)
  */
 
 #include <stdio.h>

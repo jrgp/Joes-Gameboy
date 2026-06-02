@@ -42,8 +42,8 @@ WASM_EXPORTED_FUNCTIONS := \
 
 WASM_SRCS := gb.c savestate.c
 
-SRCS    := gb.c savestate.c ws_server.c
-HDRS    := bios.h bits.h constants.h opnames.h savestate.h ws_server.h
+SRCS    := gb.c savestate.c ws_server.c frontend_sdl.c frontend_server.c main.c
+HDRS    := bios.h bits.h constants.h opnames.h savestate.h ws_server.h gb.h
 
 gb: $(SRCS) $(HDRS)
 	$(CC) $(CFLAGS) $(CBOR_CFLAGS) $(LWS_CFLAGS) $(STRICT) -g $(SRCS) -o $@ $(LDFLAGS) $(CBOR_LDFLAGS) $(LWS_LDFLAGS)
@@ -51,11 +51,11 @@ gb: $(SRCS) $(HDRS)
 asan: $(SRCS) $(HDRS)
 	$(CC) $(CFLAGS) $(CBOR_CFLAGS) $(LWS_CFLAGS) $(STRICT) -g -fsanitize=undefined,address $(SRCS) -o gb_asan $(LDFLAGS) $(CBOR_LDFLAGS) $(LWS_LDFLAGS)
 
-test_savestate: tests/test_savestate.c savestate.c savestate.h $(HDRS)
-	$(CC) $(CFLAGS) $(CBOR_CFLAGS) $(STRICT) -g -DGAMEBOY_LIB_MODE \
+test_savestate: tests/test_savestate.c savestate.c savestate.h gb.c gb.h $(HDRS)
+	$(CC) $(CBOR_CFLAGS) $(STRICT) -g \
 		tests/test_savestate.c savestate.c gb.c \
 		-o tests/test_savestate_bin \
-		$(LDFLAGS) $(CBOR_LDFLAGS)
+		$(CBOR_LDFLAGS)
 
 test: gb
 	./tests/run_tests.sh
@@ -95,9 +95,8 @@ $(CBOR_LIB):
 $(DIST_DIR):
 	mkdir -p $(DIST_DIR)
 
-wasm: wasm-deps $(DIST_DIR) $(WASM_SRCS) $(HDRS)
+wasm: wasm-deps $(DIST_DIR) $(WASM_SRCS) frontend_wasm.c $(HDRS)
 	emcc -O2 \
-	  -DGAMEBOY_LIB_MODE -DHEADLESS_ONLY \
 	  -I$(CBOR_SRC)/src \
 	  -sWASM=1 \
 	  -sMODULARIZE=1 \
@@ -106,7 +105,7 @@ wasm: wasm-deps $(DIST_DIR) $(WASM_SRCS) $(HDRS)
 	  -sFORCE_FILESYSTEM=1 \
 	  -sEXPORTED_FUNCTIONS='[$(WASM_EXPORTED_FUNCTIONS)]' \
 	  -sEXPORTED_RUNTIME_METHODS='["FS"]' \
-	  $(WASM_SRCS) $(CBOR_LIB) \
+	  $(WASM_SRCS) frontend_wasm.c $(CBOR_LIB) \
 	  -o $(DIST_DIR)/gb.js
 
 clean-wasm:

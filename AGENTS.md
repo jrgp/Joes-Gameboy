@@ -82,7 +82,7 @@ and reads `0xFF82` for the pass/fail result after the cycle limit.
 
 | Target           | Command              | Output              | Purpose                       |
 |------------------|----------------------|---------------------|-------------------------------|
-| Default          | `make`               | `./gb`              | Normal build (with ws server) |
+| Default          | `make`               | `./gb`              | Native build (SDL + server frontends) |
 | ASan/UBSan       | `make asan`          | `./gb_asan`         | Sanitizer build               |
 | Save-state tests | `make test_savestate`| `tests/test_savestate_bin` | 38-test round-trip suite |
 | Clean            | `make clean`         | —                   | Remove all build artifacts    |
@@ -102,7 +102,7 @@ cd dist && python3 -m http.server 8000
 # Open http://localhost:8000/  (load frontend/index.html manually, or copy it to dist/)
 ```
 
-Build flags: `-DGAMEBOY_LIB_MODE -DHEADLESS_ONLY -sMODULARIZE=1 -sEXPORT_NAME=createGameBoy`
+Build flags: `-sMODULARIZE=1 -sEXPORT_NAME=createGameBoy`
 
 WASM dependency: `emscripten` (`apt install emscripten`)
 
@@ -114,11 +114,16 @@ Native dependencies: `libsdl2-dev`, `libcbor-dev`, `libwebsockets-dev`
 
 | File            | Purpose                                      |
 |-----------------|----------------------------------------------|
-| `gb.c`          | Single-file emulator (~5700 lines)           |
+| `gb.c`          | Emulator core (CPU, PPU, memory, timing, headless loop) |
+| `gb.h`          | Public emulator-core API shared by frontends |
+| `frontend_sdl.c`| SDL window, rendering, input, native UI loop |
+| `frontend_server.c` | WebSocket server run loop and pacing     |
+| `frontend_wasm.c` | Emscripten/WASM exported functions         |
+| `main.c`        | Argument parsing and frontend dispatch       |
 | `savestate.h/c` | CBOR save-state serialization (76-field map) |
 | `ws_server.h/c` | WebSocket/HTTP remote browser frontend       |
 | `bits.h`        | Bit-manipulation macros (`bit_set`, etc.)    |
-| `constants.h`   | Interrupt constants and priority table       |
+| `constants.h`   | Interrupt constants, palette, viewport sizes |
 | `Makefile`      | Build rules with strict flags                |
 | `tests/`        | Test scripts and ROM directories             |
 | `roms/blargg/`  | Blargg test ROMs                             |
