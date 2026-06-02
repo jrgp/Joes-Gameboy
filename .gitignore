@@ -12,3 +12,4 @@ dist/
 test_savestate_bin
 debug_out.txt
 ws_server_html.h
+*.sav
