@@ -8,3 +8,5 @@ debug_out.txt
 tests/test_savestate_bin
 deps/
 dist/
+*.cbor
+test_savestate_bin
