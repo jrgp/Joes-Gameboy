@@ -10,3 +10,4 @@ deps/
 dist/
 *.cbor
 test_savestate_bin
+debug_out.txt
