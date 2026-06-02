@@ -87,7 +87,26 @@ and reads `0xFF82` for the pass/fail result after the cycle limit.
 | Save-state tests | `make test_savestate`| `tests/test_savestate_bin` | 38-test round-trip suite |
 | Clean            | `make clean`         | —                   | Remove all build artifacts    |
 
-Dependencies: `libsdl2-dev`, `libcbor-dev`, `libwebsockets-dev`
+### WASM Build
+
+```bash
+make wasm-deps   # Download and compile libcbor with emcc (one-time)
+make wasm        # Build dist/gb.js + dist/gb.wasm
+```
+
+Outputs: `dist/gb.js`, `dist/gb.wasm`
+
+To test in browser:
+```bash
+cd dist && python3 -m http.server 8000
+# Open http://localhost:8000/  (load frontend/index.html manually, or copy it to dist/)
+```
+
+Build flags: `-DGAMEBOY_LIB_MODE -DHEADLESS_ONLY -sMODULARIZE=1 -sEXPORT_NAME=createGameBoy`
+
+WASM dependency: `emscripten` (`apt install emscripten`)
+
+Native dependencies: `libsdl2-dev`, `libcbor-dev`, `libwebsockets-dev`
 
 ---
 

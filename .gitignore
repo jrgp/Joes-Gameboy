@@ -6,3 +6,5 @@ gb_debug
 gb_g
 debug_out.txt
 tests/test_savestate_bin
+deps/
+dist/

@@ -81,6 +81,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <inttypes.h>
+#include <unistd.h>
 
 typedef uint8_t byte;
 typedef uint16_t word;
@@ -494,6 +495,14 @@ bool load_state(const char *path) {
         cbor_decref(&root);
         return false;
     }
+#ifdef __EMSCRIPTEN__
+    /* In WASM, save states may reference a host path that doesn't exist.
+     * Fall back to /rom.gb which is always written to MEMFS before load. */
+    if (access(rom_path, F_OK) != 0) {
+        strncpy(rom_path, "/rom.gb", sizeof(rom_path) - 1);
+        rom_path[sizeof(rom_path) - 1] = '\0';
+    }
+#endif
     cart_load(rom_path);
     mem_init();
     gpu_init();

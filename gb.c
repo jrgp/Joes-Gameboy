@@ -1,4 +1,6 @@
+#ifndef HEADLESS_ONLY
 #include <SDL.h>
+#endif
 
 #include<unistd.h>
 #include<inttypes.h>
@@ -5388,9 +5390,11 @@ void exec_next(void){
 // SDL boilerplate
 //
 
+#ifndef HEADLESS_ONLY
 SDL_Window* window;
 SDL_Renderer* renderer;
 SDL_Texture* texture;
+#endif
 
 void pixels_init(void){
     pixels = malloc(sizeof(uint32_t) * VIEWPORT_WIDTH * VIEWPORT_HEIGHT);
@@ -5402,6 +5406,7 @@ void pixels_init(void){
     memset(pixels, 0, sizeof(uint32_t) * VIEWPORT_WIDTH * VIEWPORT_HEIGHT);
 }
 
+#ifndef HEADLESS_ONLY
 void sdl_init(void){
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
         printf("SDL could not initialize! SDL_Error: %s\n", SDL_GetError());
@@ -5453,6 +5458,7 @@ void sdl_display(void){
 
     SDL_RenderPresent(renderer);
 }
+#endif /* HEADLESS_ONLY */
 
 
 bool frame_headless(void){
@@ -5504,6 +5510,7 @@ bool frame_headless(void){
     return true;
 }
 
+#ifndef HEADLESS_ONLY
 bool frame(void){
     const uint32_t start_ticks = SDL_GetTicks();
 
@@ -5599,6 +5606,7 @@ void sdl_main_impl(void){
   }
 
 }
+#endif /* HEADLESS_ONLY */
 
 void headless_print_blargg_a000(void) {
     // Print blargg A000-format test output to stdout.
@@ -5961,3 +5969,97 @@ cpu_close_debug_file();
   return 0;
 }
 #endif /* GAMEBOY_LIB_MODE */
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+
+EMSCRIPTEN_KEEPALIVE
+void wasm_init(const uint8_t *rom_data, int rom_size) {
+    FILE *f = fopen("/rom.gb", "wb");
+    if (f) { fwrite(rom_data, 1, (size_t)rom_size, f); fclose(f); }
+    cart_load("/rom.gb");
+    mem_init();
+    sav_load("/rom.gb");
+    gpu_init();
+    cpu_fake_init();
+    pixels_init();
+    joypad_init();
+}
+
+EMSCRIPTEN_KEEPALIVE
+void wasm_run_frame(void) {
+    frame_headless();
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint32_t *wasm_get_pixels_ptr(void) {
+    return pixels;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void wasm_set_buttons(int mask) {
+    for (int i = 0; i < 8; i++)
+        gb_set_button(i, (mask >> i) & 1);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void wasm_save_state(void) {
+    save_state("/save.cbor");
+}
+
+EMSCRIPTEN_KEEPALIVE
+int wasm_save_state_size(void) {
+    FILE *f = fopen("/save.cbor", "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    int sz = (int)ftell(f);
+    fclose(f);
+    return sz;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void wasm_get_save_state(uint8_t *out, int size) {
+    FILE *f = fopen("/save.cbor", "rb");
+    if (!f) return;
+    (void)fread(out, 1, (size_t)size, f);
+    fclose(f);
+}
+
+EMSCRIPTEN_KEEPALIVE
+int wasm_load_state(const uint8_t *data, int size) {
+    FILE *f = fopen("/save.cbor", "wb");
+    if (!f) return 0;
+    fwrite(data, 1, (size_t)size, f);
+    fclose(f);
+    return load_state("/save.cbor") ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void wasm_reset(void) {
+    gb_reset();
+}
+
+EMSCRIPTEN_KEEPALIVE
+void wasm_set_fast(int on) {
+    g_fast_mode = on ? true : false;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int wasm_get_sav_size(void) {
+    return cart_ram_size;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void wasm_get_sav(uint8_t *out) {
+    if (cart_ram_size > 0)
+        memcpy(out, ext_ram, (size_t)cart_ram_size);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void wasm_load_sav(const uint8_t *data, int size) {
+    if (size > 0x8000) size = 0x8000;
+    memcpy(ext_ram, data, (size_t)size);
+    ext_ram_dirty = true;
+}
+
+#endif /* __EMSCRIPTEN__ */

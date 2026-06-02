@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>
+<title>Game Boy</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-touch-callout:none;touch-action:manipulation}
+html{height:100%}
+body{height:100%;display:flex;flex-direction:column;align-items:stretch;background:#0d0d1a;color:#ccc;font-family:monospace;overflow:hidden;user-select:none}
+#bar{flex:0 0 auto;display:flex;gap:6px;padding:6px;background:#111120;justify-content:center;align-items:center;width:100%}
+.tb{background:#1e1e38;color:#999;border:1px solid #3a3a5a;border-radius:4px;padding:5px 10px;cursor:pointer;font:12px/1 monospace;touch-action:manipulation;-webkit-user-select:none;user-select:none}
+.tb:active{background:#3a3a6a}
+#st{font-size:11px;color:#555;margin-left:4px}
+#sw{flex:1 1 0;min-height:0;display:flex;align-items:center;justify-content:center;overflow:hidden}
+canvas{display:block;image-rendering:pixelated;image-rendering:crisp-edges;background:#111}
+#ctrl-canvas{flex:0 0 auto;display:block;width:100%;height:130px;background:#0a0a18;touch-action:none}
+#hint{flex:0 0 auto;font-size:11px;color:#555;text-align:center;padding:4px;width:100%}
+@media(min-width:540px){#ctrl-canvas{display:none}#hint{display:block}}
+@media(max-width:539px){#hint{display:none}}
+</style>
+</head>
+<body>
+<div id='bar'>
+  <button class='tb' id='bsv'>Save</button>
+  <button class='tb' id='bld'>Load</button>
+  <button class='tb' id='brs'>Reset</button>
+  <button class='tb' id='bft'>Fast</button>
+  <button class='tb' id='brm' style='display:none'>Load ROM</button>
+  <span id='st'>Connecting...</span>
+</div>
+<div id='sw'><canvas id='screen' width='160' height='144'></canvas></div>
+<canvas id='ctrl-canvas'></canvas>
+<div id='hint'>Arrows: D-Pad &nbsp; A: A &nbsp; S: B &nbsp; Enter: Start &nbsp; Shift: Select &nbsp; F5: Save &nbsp; F8: Load &nbsp; F: Fast</div>
+<script>
+'use strict';
+
+class RemoteBackend {
+  constructor(url) {
+    this.onframe = null;
+    this.onstatus = null;
+    this._url = url;
+    this._ws = null;
+    this._g_px = new Uint8ClampedArray(160 * 144 * 4);
+    this._PALETTE = new Uint8Array([255,255,255,170,170,170,85,85,85,0,0,0]);
+    this._connect();
+  }
+  _connect() {
+    this._ws = new WebSocket(this._url);
+    this._ws.binaryType = 'arraybuffer';
+    this._ws.onopen = () => { if (this.onstatus) this.onstatus('Connected'); };
+    this._ws.onclose = () => {
+      if (this.onstatus) this.onstatus('Disconnected');
+      setTimeout(() => this._connect(), 2000);
+    };
+    this._ws.onerror = () => {};
+    this._ws.onmessage = (e) => {
+      const d = new Uint8Array(e.data);
+      if (d[0] === 1 && d.length === 5761) {
+        let bi = 0;
+        for (let i = 1; i < 5761; i++) {
+          const b = d[i];
+          let x;
+          x=((b>>6)&3)*3; this._g_px[bi++]=this._PALETTE[x];this._g_px[bi++]=this._PALETTE[x+1];this._g_px[bi++]=this._PALETTE[x+2];this._g_px[bi++]=255;
+          x=((b>>4)&3)*3; this._g_px[bi++]=this._PALETTE[x];this._g_px[bi++]=this._PALETTE[x+1];this._g_px[bi++]=this._PALETTE[x+2];this._g_px[bi++]=255;
+          x=((b>>2)&3)*3; this._g_px[bi++]=this._PALETTE[x];this._g_px[bi++]=this._PALETTE[x+1];this._g_px[bi++]=this._PALETTE[x+2];this._g_px[bi++]=255;
+          x=(b&3)*3;      this._g_px[bi++]=this._PALETTE[x];this._g_px[bi++]=this._PALETTE[x+1];this._g_px[bi++]=this._PALETTE[x+2];this._g_px[bi++]=255;
+        }
+        if (this.onframe) this.onframe(this._g_px);
+      }
+    };
+  }
+  _snd(cmd, extra) {
+    if (!this._ws || this._ws.readyState !== 1) return;
+    const m = new Uint8Array(extra !== undefined ? 2 : 1);
+    m[0] = cmd;
+    if (extra !== undefined) m[1] = extra & 255;
+    this._ws.send(m.buffer);
+  }
+  sendJoypad(mask) { this._snd(2, mask); }
+  sendSave()       { this._snd(3); }
+  sendLoad()       { this._snd(4); }
+  sendReset()      { this._snd(5); }
+  setFast(_on)     { this._snd(6); }
+}
+
+class WasmBackend {
+  constructor(module) {
+    this.onframe = null;
+    this.onstatus = null;
+    this._mod = module;
+    this._g_px = new Uint8ClampedArray(160 * 144 * 4);
+    this._running = false;
+    this._fast = false;
+    this._loopToken = 0;
+  }
+  loadRom(romData) {
+    this._running = false;
+    this._loopToken++;
+    const mod = this._mod;
+    const ptr = mod._malloc(romData.length);
+    mod.HEAPU8.set(romData, ptr);
+    mod._wasm_init(ptr, romData.length);
+    mod._free(ptr);
+    if (this.onstatus) this.onstatus('Running (WASM)');
+    this._startLoop();
+  }
+  _startLoop() {
+    this._running = true;
+    const token = ++this._loopToken;
+    const loop = () => {
+      if (!this._running || token !== this._loopToken) return;
+      const t0 = performance.now();
+      this._mod._wasm_run_frame();
+      this._renderFrame();
+      const elapsed = performance.now() - t0;
+      const target = this._fast ? 4.17 : 16.67;
+      const delay = Math.max(0, target - elapsed);
+      setTimeout(loop, delay);
+    };
+    loop();
+  }
+  _renderFrame() {
+    const mod = this._mod;
+    const pixPtr = mod._wasm_get_pixels_ptr();
+    const src = mod.HEAPU8.subarray(pixPtr, pixPtr + 160 * 144 * 4);
+    this._g_px.set(src);
+    if (this.onframe) this.onframe(this._g_px);
+  }
+  sendJoypad(mask) {
+    this._mod._wasm_set_buttons(mask);
+  }
+  sendSave() {
+    const mod = this._mod;
+    mod._wasm_save_state();
+    const sz = mod._wasm_save_state_size();
+    if (sz <= 0) return;
+    const ptr = mod._malloc(sz);
+    mod._wasm_get_save_state(ptr, sz);
+    const data = mod.HEAPU8.slice(ptr, ptr + sz);
+    mod._free(ptr);
+    const blob = new Blob([data], {type: 'application/octet-stream'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'save.cbor';
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+  sendLoad() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.cbor';
+    input.onchange = (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      file.arrayBuffer().then((buf) => {
+        const data = new Uint8Array(buf);
+        const mod = this._mod;
+        const ptr = mod._malloc(data.length);
+        mod.HEAPU8.set(data, ptr);
+        mod._wasm_load_state(ptr, data.length);
+        mod._free(ptr);
+        if (this.onstatus) this.onstatus('State loaded');
+      });
+    };
+    input.click();
+  }
+  sendReset() {
+    this._mod._wasm_reset();
+  }
+  setFast(on) {
+    this._fast = !!on;
+    this._mod._wasm_set_fast(this._fast ? 1 : 0);
+  }
+}
+
+(function() {
+  const cv = document.getElementById('screen');
+  const ctx = cv.getContext('2d');
+  const st = document.getElementById('st');
+  const cc = document.getElementById('ctrl-canvas');
+  const cc2 = cc.getContext('2d');
+  const brom = document.getElementById('brm');
+  const frameImage = ctx.createImageData(160, 144);
+  let backend = null;
+  let isWasm = false;
+  let btns = 0;
+  let fast = false;
+  let cBtns = 0;
+  const cTouches = {};
+  const CL = {};
+  const km = {ArrowRight:0,ArrowLeft:1,ArrowUp:2,ArrowDown:3,a:4,A:4,s:5,S:5,Enter:7,Shift:6};
+
+  function updateStatus(text) {
+    st.textContent = text;
+  }
+
+  function renderFrame(pixels) {
+    frameImage.data.set(pixels);
+    ctx.putImageData(frameImage, 0, 0);
+  }
+
+  function setFastUi(on) {
+    fast = !!on;
+    const b = document.getElementById('bft');
+    b.textContent = fast ? 'Fast ⏩' : 'Fast';
+    b.style.background = fast ? '#c84' : '';
+  }
+
+  function ctrlLayout() {
+    const w = cc.offsetWidth;
+    if (!w) return;
+    cc.width = w;
+    cc.height = cc.offsetHeight || 130;
+    const h = cc.height;
+    CL.dpr = Math.min(w * 0.14, h * 0.44);
+    CL.dpx = w * 0.19;
+    CL.dpy = h * 0.5;
+    CL.ar = Math.min(w * 0.075, h * 0.26);
+    CL.ax = w * 0.85;
+    CL.ay = h * 0.65;
+    CL.bx = w * 0.74;
+    CL.by = h * 0.3;
+    CL.sw = Math.max(40, w * 0.11);
+    CL.sh = Math.max(18, h * 0.22);
+    CL.slx = w * 0.43;
+    CL.sly = h * 0.5;
+    CL.stx = w * 0.56;
+    CL.sty = h * 0.5;
+  }
+
+  function bitsAt(x, y) {
+    let b = 0;
+    const dx = x - CL.dpx;
+    const dy = y - CL.dpy;
+    const d = Math.sqrt(dx * dx + dy * dy);
+    if (d > 8 && d < CL.dpr + 14) {
+      const ax = Math.abs(dx);
+      const ay = Math.abs(dy);
+      if (dy < 0 && ay > ax * 0.5) b |= 4;
+      if (dy > 0 && ay > ax * 0.5) b |= 8;
+      if (dx < 0 && ax > ay * 0.5) b |= 2;
+      if (dx > 0 && ax > ay * 0.5) b |= 1;
+    }
+    const r2 = CL.ar * CL.ar * 2;
+    const adx = x - CL.ax;
+    const ady = y - CL.ay;
+    if (adx * adx + ady * ady < r2) b |= 16;
+    const bdx = x - CL.bx;
+    const bdy = y - CL.by;
+    if (bdx * bdx + bdy * bdy < r2) b |= 32;
+    if (Math.abs(x - CL.slx) < CL.sw / 2 && Math.abs(y - CL.sly) < CL.sh / 2) b |= 64;
+    if (Math.abs(x - CL.stx) < CL.sw / 2 && Math.abs(y - CL.sty) < CL.sh / 2) b |= 128;
+    return b;
+  }
+
+  function ctrlPt(t) {
+    const r = cc.getBoundingClientRect();
+    return {x:(t.clientX-r.left)*cc.width/r.width,y:(t.clientY-r.top)*cc.height/r.height};
+  }
+
+  function ctrlUpdate() {
+    let b = 0;
+    for (const id in cTouches) b |= cTouches[id];
+    if (b !== cBtns) {
+      cBtns = b;
+      if (backend) backend.sendJoypad(b);
+    }
+    drawCtrl();
+  }
+
+  function drawCtrl() {
+    if (!cc2 || !cc.width || !cc.height) return;
+    const w = cc.width;
+    const h = cc.height;
+    const c = cc2;
+    c.clearRect(0, 0, w, h);
+    c.textAlign = 'center';
+    c.textBaseline = 'middle';
+    [[2,0,-1,'▲'],[3,0,1,'▼'],[1,-1,0,'◄'],[0,1,0,'►']].forEach((d) => {
+      const on = cBtns & (1 << d[0]);
+      const ax = CL.dpx + d[1] * CL.dpr * 0.55;
+      const ay = CL.dpy + d[2] * CL.dpr * 0.55;
+      const aw = d[1] ? CL.dpr * 0.58 : CL.dpr * 0.48;
+      const ah = d[2] ? CL.dpr * 0.58 : CL.dpr * 0.48;
+      c.fillStyle = on ? '#3a3a70' : '#1a1a30';
+      c.beginPath();
+      c.roundRect(ax - aw / 2, ay - ah / 2, aw, ah, 4);
+      c.fill();
+      c.fillStyle = on ? '#ddd' : '#555';
+      c.font = Math.round(CL.dpr * 0.32) + 'px monospace';
+      c.fillText(d[3], ax, ay);
+    });
+    const cs = CL.dpr * 0.34;
+    c.fillStyle = '#0a0a18';
+    c.fillRect(CL.dpx - cs, CL.dpy - cs, cs * 2, cs * 2);
+    [[CL.ax,CL.ay,4,'A','#9b2020'],[CL.bx,CL.by,5,'B','#6b2090']].forEach((b) => {
+      const on = cBtns & (1 << b[2]);
+      c.beginPath();
+      c.arc(b[0], b[1], CL.ar, 0, Math.PI * 2);
+      c.fillStyle = on ? '#5050bb' : b[4];
+      c.fill();
+      c.fillStyle = '#fff';
+      c.font = 'bold ' + Math.round(CL.ar * 0.7) + 'px monospace';
+      c.fillText(b[3], b[0], b[1]);
+    });
+    [[CL.slx,CL.sly,6,'SEL'],[CL.stx,CL.sty,7,'START']].forEach((b) => {
+      const on = cBtns & (1 << b[2]);
+      c.beginPath();
+      c.roundRect(b[0] - CL.sw / 2, b[1] - CL.sh / 2, CL.sw, CL.sh, 5);
+      c.fillStyle = on ? '#3a3a70' : '#1a1a30';
+      c.fill();
+      c.fillStyle = on ? '#bbb' : '#555';
+      c.font = '9px monospace';
+      c.fillText(b[3], b[0], b[1]);
+    });
+  }
+
+  function resize() {
+    const sw = document.getElementById('sw');
+    const aw = sw.clientWidth || window.innerWidth;
+    const ah = sw.clientHeight || Math.floor(window.innerHeight * 0.6);
+    let s = Math.min(aw / 160, ah / 144);
+    if (s < 1) s = 1;
+    cv.style.width = Math.floor(160 * s) + 'px';
+    cv.style.height = Math.floor(144 * s) + 'px';
+    ctrlLayout();
+    drawCtrl();
+  }
+
+  function setButtonState(bit, on) {
+    const prev = btns;
+    btns = on ? (btns | (1 << bit)) : (btns & ~(1 << bit));
+    if (btns !== prev && backend) backend.sendJoypad(btns);
+  }
+
+  async function loadScript(src) {
+    return new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = src;
+      script.onload = resolve;
+      script.onerror = reject;
+      document.head.appendChild(script);
+    });
+  }
+
+  async function ensureWasmFactory() {
+    if (typeof window.createGameBoy === 'function') return true;
+    const candidates = ['../dist/gb.js', './gb.js'];
+    for (const src of candidates) {
+      try {
+        await loadScript(src);
+        if (typeof window.createGameBoy === 'function') return true;
+      } catch (_) {}
+    }
+    return false;
+  }
+
+  async function setupBackend() {
+    const preferWasm = location.search.indexOf('wasm') !== -1 || typeof window.createGameBoy === 'function';
+    if (preferWasm && await ensureWasmFactory()) {
+      const mod = await window.createGameBoy();
+      backend = new WasmBackend(mod);
+      isWasm = true;
+      brom.style.display = '';
+      updateStatus('Load a ROM');
+    } else {
+      const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+      backend = new RemoteBackend(proto + location.host + '/ws');
+      brom.style.display = 'none';
+    }
+    backend.onframe = renderFrame;
+    backend.onstatus = updateStatus;
+    resize();
+  }
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('load', resize);
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'F5') {
+      if (backend) backend.sendSave();
+      e.preventDefault();
+      return;
+    }
+    if (e.key === 'F8') {
+      if (backend) backend.sendLoad();
+      e.preventDefault();
+      return;
+    }
+    if (e.key === 'f' || e.key === 'F') {
+      if (backend) backend.setFast(!fast);
+      setFastUi(!fast);
+      e.preventDefault();
+      return;
+    }
+    const b = km[e.key];
+    if (b !== undefined) {
+      setButtonState(b, true);
+      e.preventDefault();
+    }
+  });
+
+  document.addEventListener('keyup', (e) => {
+    const b = km[e.key];
+    if (b !== undefined) {
+      setButtonState(b, false);
+      e.preventDefault();
+    }
+  });
+
+  document.getElementById('bsv').onclick = () => { if (backend) backend.sendSave(); };
+  document.getElementById('bld').onclick = () => { if (backend) backend.sendLoad(); };
+  document.getElementById('brs').onclick = () => { if (backend) backend.sendReset(); };
+  document.getElementById('bft').onclick = () => {
+    if (backend) backend.setFast(!fast);
+    setFastUi(!fast);
+  };
+  brom.onclick = () => {
+    if (!isWasm || !backend || typeof backend.loadRom !== 'function') return;
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.gb,.gbc';
+    input.onchange = (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      file.arrayBuffer().then((buf) => backend.loadRom(new Uint8Array(buf)));
+    };
+    input.click();
+  };
+
+  ['touchstart','touchmove'].forEach((ev) => {
+    cc.addEventListener(ev, (e) => {
+      e.preventDefault();
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const t = e.changedTouches[i];
+        const p = ctrlPt(t);
+        cTouches[t.identifier] = bitsAt(p.x, p.y);
+      }
+      ctrlUpdate();
+    }, {passive:false});
+  });
+
+  ['touchend','touchcancel'].forEach((ev) => {
+    cc.addEventListener(ev, (e) => {
+      e.preventDefault();
+      for (let i = 0; i < e.changedTouches.length; i++) delete cTouches[e.changedTouches[i].identifier];
+      ctrlUpdate();
+    }, {passive:false});
+  });
+
+  setFastUi(false);
+  resize();
+  setupBackend().catch((err) => {
+    console.error(err);
+    updateStatus('Backend init failed');
+  });
+})();
+</script>
+</body>
+</html>
