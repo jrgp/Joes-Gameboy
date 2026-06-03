@@ -70,8 +70,43 @@ class RemoteBackend {
     this._url = url;
     this._ws = null;
     this._g_px = new Uint8ClampedArray(160 * 144 * 4);
+    this._curr_2bpp = new Uint8Array(5760);      /* local framebuffer copy for tile-diff and re-palette */
     this._PALETTE = new Uint8Array([255,255,255,170,170,170,85,85,85,0,0,0]);
     this._connect();
+  }
+  /* Decode a full 5760-byte 2bpp buffer into _g_px using current palette. */
+  _decode2bpp(src) {
+    let bi = 0;
+    for (let i = 0; i < 5760; i++) {
+      const b = src[i];
+      let x;
+      x=((b>>6)&3)*3; this._g_px[bi++]=this._PALETTE[x];this._g_px[bi++]=this._PALETTE[x+1];this._g_px[bi++]=this._PALETTE[x+2];this._g_px[bi++]=255;
+      x=((b>>4)&3)*3; this._g_px[bi++]=this._PALETTE[x];this._g_px[bi++]=this._PALETTE[x+1];this._g_px[bi++]=this._PALETTE[x+2];this._g_px[bi++]=255;
+      x=((b>>2)&3)*3; this._g_px[bi++]=this._PALETTE[x];this._g_px[bi++]=this._PALETTE[x+1];this._g_px[bi++]=this._PALETTE[x+2];this._g_px[bi++]=255;
+      x=(b&3)*3;      this._g_px[bi++]=this._PALETTE[x];this._g_px[bi++]=this._PALETTE[x+1];this._g_px[bi++]=this._PALETTE[x+2];this._g_px[bi++]=255;
+    }
+  }
+  /* Patch a single 8x8 tile (tx,ty) from 16 bytes of 2bpp data into _curr_2bpp and _g_px. */
+  _patchTile(tx, ty, data, doff) {
+    for (let r = 0; r < 8; r++) {
+      const src_off = (ty * 8 + r) * 40 + tx * 2;  /* offset in _curr_2bpp */
+      const b0 = data[doff + r * 2];
+      const b1 = data[doff + r * 2 + 1];
+      this._curr_2bpp[src_off]     = b0;
+      this._curr_2bpp[src_off + 1] = b1;
+      /* Decode 8 pixels into _g_px */
+      const px_base = ((ty * 8 + r) * 160 + tx * 8) * 4;
+      for (let col = 0; col < 4; col++) {
+        const idx0 = ((b0 >> (6 - col * 2)) & 3) * 3;
+        let bi = px_base + col * 4;
+        this._g_px[bi++]=this._PALETTE[idx0];this._g_px[bi++]=this._PALETTE[idx0+1];this._g_px[bi++]=this._PALETTE[idx0+2];this._g_px[bi]=255;
+      }
+      for (let col = 0; col < 4; col++) {
+        const idx1 = ((b1 >> (6 - col * 2)) & 3) * 3;
+        let bi = px_base + (4 + col) * 4;
+        this._g_px[bi++]=this._PALETTE[idx1];this._g_px[bi++]=this._PALETTE[idx1+1];this._g_px[bi++]=this._PALETTE[idx1+2];this._g_px[bi]=255;
+      }
+    }
   }
   _connect() {
     this._ws = new WebSocket(this._url);
@@ -84,15 +119,20 @@ class RemoteBackend {
     this._ws.onerror = () => {};
     this._ws.onmessage = (e) => {
       const d = new Uint8Array(e.data);
-      if (d[0] === 1 && d.length === 5761) {
-        let bi = 0;
-        for (let i = 1; i < 5761; i++) {
-          const b = d[i];
-          let x;
-          x=((b>>6)&3)*3; this._g_px[bi++]=this._PALETTE[x];this._g_px[bi++]=this._PALETTE[x+1];this._g_px[bi++]=this._PALETTE[x+2];this._g_px[bi++]=255;
-          x=((b>>4)&3)*3; this._g_px[bi++]=this._PALETTE[x];this._g_px[bi++]=this._PALETTE[x+1];this._g_px[bi++]=this._PALETTE[x+2];this._g_px[bi++]=255;
-          x=((b>>2)&3)*3; this._g_px[bi++]=this._PALETTE[x];this._g_px[bi++]=this._PALETTE[x+1];this._g_px[bi++]=this._PALETTE[x+2];this._g_px[bi++]=255;
-          x=(b&3)*3;      this._g_px[bi++]=this._PALETTE[x];this._g_px[bi++]=this._PALETTE[x+1];this._g_px[bi++]=this._PALETTE[x+2];this._g_px[bi++]=255;
+      if (d[0] === 0x01 && d.length === 5761) {
+        /* Full framebuffer */
+        this._curr_2bpp.set(d.subarray(1, 5761));
+        this._decode2bpp(this._curr_2bpp);
+        if (this.onframe) this.onframe(this._g_px);
+      } else if (d[0] === 0x10 && d.length >= 3) {
+        /* Tile update batch */
+        const count = d[1] | (d[2] << 8);
+        let pos = 3;
+        for (let i = 0; i < count; i++) {
+          const tx = d[pos++];
+          const ty = d[pos++];
+          this._patchTile(tx, ty, d, pos);
+          pos += 16;
         }
         if (this.onframe) this.onframe(this._g_px);
       }
@@ -117,6 +157,9 @@ class RemoteBackend {
       this._PALETTE[i * 3 + 1] = pal.c[i * 3 + 1];
       this._PALETTE[i * 3 + 2] = pal.c[i * 3 + 2];
     }
+    /* Re-render current frame with new palette */
+    this._decode2bpp(this._curr_2bpp);
+    if (this.onframe) this.onframe(this._g_px);
   }
 }
 
