@@ -53,12 +53,7 @@ static const uint16_t INTERRUPT_OFFSETS[5] = {
 
 #define FPS 60
 
-static const uint32_t pallette[4] = {
-    0xffffffff,
-    0xffaaaaaa,
-    0xff555555,
-    0xff000000,
-};
+#include "palette.h"
 
 #define VIEWPORT_WIDTH 160
 #define VIEWPORT_HEIGHT 144

@@ -6,6 +6,7 @@
 #include "gb.h"
 #include "savestate.h"
 #include "constants.h"
+#include "palette.h"
 
 static SDL_Window *window;
 static SDL_Renderer *renderer;
@@ -108,6 +109,14 @@ void sdl_main_impl(void) {
                                 savestate_default_path(savestate_rom_path, ss_path, sizeof(ss_path));
                                 if (save_state(ss_path))
                                     printf("[savestate] saved to %s\n", ss_path);
+                            }
+                            break;
+                        case SDLK_F6:
+                            if (event.key.type == SDL_KEYDOWN) {
+                                int shift = (event.key.keysym.mod & KMOD_SHIFT) != 0;
+                                int idx = palette_get() + (shift ? -1 : 1);
+                                palette_set(idx);
+                                printf("[palette] %s\n", GB_PALETTES[palette_get()].name);
                             }
                             break;
                         case SDLK_f:

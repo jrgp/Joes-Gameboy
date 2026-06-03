@@ -11,6 +11,7 @@ body{height:100%;display:flex;flex-direction:column;align-items:stretch;backgrou
 #bar{flex:0 0 auto;display:flex;gap:6px;padding:6px;background:#111120;justify-content:center;align-items:center;width:100%}
 .tb{background:#1e1e38;color:#999;border:1px solid #3a3a5a;border-radius:4px;padding:5px 10px;cursor:pointer;font:12px/1 monospace;touch-action:manipulation;-webkit-user-select:none;user-select:none}
 .tb:active{background:#3a3a6a}
+select.tb{padding:4px 6px;-webkit-appearance:none;appearance:none;cursor:pointer}
 #st{font-size:11px;color:#555;margin-left:4px}
 #sw{flex:1 1 0;min-height:0;display:flex;align-items:center;justify-content:center;overflow:hidden}
 canvas{display:block;image-rendering:pixelated;image-rendering:crisp-edges;background:#111}
@@ -26,14 +27,41 @@ canvas{display:block;image-rendering:pixelated;image-rendering:crisp-edges;backg
   <button class='tb' id='bld'>Load</button>
   <button class='tb' id='brs'>Reset</button>
   <button class='tb' id='bft'>Fast</button>
+  <select class='tb' id='bpal' title='Palette'></select>
   <button class='tb' id='brm' style='display:none'>Load ROM</button>
   <span id='st'>Connecting...</span>
 </div>
 <div id='sw'><canvas id='screen' width='160' height='144'></canvas></div>
 <canvas id='ctrl-canvas'></canvas>
-<div id='hint'>Arrows: D-Pad &nbsp; A: A &nbsp; S: B &nbsp; Enter: Start &nbsp; Shift: Select &nbsp; F5: Save &nbsp; F8: Load &nbsp; F: Fast</div>
+<div id='hint'>Arrows: D-Pad &nbsp; A: A &nbsp; S: B &nbsp; Enter: Start &nbsp; Shift: Select &nbsp; F5: Save &nbsp; F8: Load &nbsp; F: Fast &nbsp; F6/⇧F6: Palette</div>
 <script>
 'use strict';
+
+/* Palette table — must match GB_PALETTES[] in palette.c.
+ * Each entry: { name, c: [r,g,b, r,g,b, r,g,b, r,g,b] } shade 0=lightest. */
+const PALETTES = [
+  { name: "DMG Gray",       c: [255,255,255,170,170,170,85,85,85,0,0,0] },
+  { name: "DMG Inverted",   c: [0,0,0,85,85,85,170,170,170,255,255,255] },
+  { name: "GB Green",       c: [155,188,15,139,172,15,48,98,48,15,56,15] },
+  { name: "GB Pocket",      c: [196,207,161,139,149,109,77,83,60,31,31,31] },
+  { name: "GB Light",       c: [224,248,224,136,208,136,56,104,56,8,16,8] },
+  { name: "GBC Brown",      c: [248,232,200,176,144,96,104,56,32,24,8,8] },
+  { name: "GBC Red",        c: [255,234,234,204,68,68,136,20,20,48,0,0] },
+  { name: "GBC Dark Brown", c: [240,208,136,192,112,48,112,64,16,16,8,0] },
+  { name: "GBC Pastel Mix", c: [248,248,232,200,168,88,104,80,40,24,16,0] },
+  { name: "GBC Blue",       c: [224,248,248,88,136,208,24,56,160,0,8,24] },
+  { name: "GBC Dark Blue",  c: [208,240,255,32,96,192,16,48,128,0,0,16] },
+  { name: "GBC Green",      c: [224,248,208,112,192,64,48,112,24,8,24,8] },
+  { name: "GBC Dark Green", c: [200,232,176,96,160,64,48,80,32,8,16,8] },
+  { name: "GBC Yellow",     c: [248,248,168,232,200,32,160,120,8,40,32,0] },
+  { name: "GBC Orange",     c: [248,224,168,240,144,32,160,72,8,32,16,0] },
+  { name: "GBC Reverse",    c: [15,56,15,48,98,48,139,172,15,155,188,15] },
+  { name: "Amber Terminal", c: [255,232,144,255,152,0,192,80,0,32,8,0] },
+  { name: "Green Terminal", c: [170,255,170,0,238,0,0,119,0,0,20,0] },
+  { name: "Ice Blue",       c: [232,244,255,144,200,240,32,96,184,0,20,40] },
+  { name: "High Contrast",  c: [255,255,255,136,136,136,51,51,51,0,0,0] },
+  { name: "Night Mode",     c: [143,168,192,64,88,104,24,40,56,4,8,16] },
+];
 
 class RemoteBackend {
   constructor(url) {
@@ -82,6 +110,14 @@ class RemoteBackend {
   sendLoad()       { this._snd(4); }
   sendReset()      { this._snd(5); }
   setFast(_on)     { this._snd(6); }
+  setPalette(idx) {
+    const pal = PALETTES[idx] || PALETTES[0];
+    for (let i = 0; i < 4; i++) {
+      this._PALETTE[i * 3]     = pal.c[i * 3];
+      this._PALETTE[i * 3 + 1] = pal.c[i * 3 + 1];
+      this._PALETTE[i * 3 + 2] = pal.c[i * 3 + 2];
+    }
+  }
 }
 
 class WasmBackend {
@@ -173,6 +209,9 @@ class WasmBackend {
     this._fast = !!on;
     this._mod._wasm_set_fast(this._fast ? 1 : 0);
   }
+  setPalette(idx) {
+    this._mod._wasm_set_palette(idx);
+  }
 }
 
 (function() {
@@ -182,6 +221,7 @@ class WasmBackend {
   const cc = document.getElementById('ctrl-canvas');
   const cc2 = cc.getContext('2d');
   const brom = document.getElementById('brm');
+  const bpal = document.getElementById('bpal');
   const frameImage = ctx.createImageData(160, 144);
   let backend = null;
   let isWasm = false;
@@ -191,6 +231,26 @@ class WasmBackend {
   const cTouches = {};
   const CL = {};
   const km = {ArrowRight:0,ArrowLeft:1,ArrowUp:2,ArrowDown:3,a:4,A:4,s:5,S:5,Enter:7,Shift:6};
+
+  /* Populate palette dropdown */
+  PALETTES.forEach((p, i) => {
+    const opt = document.createElement('option');
+    opt.value = i;
+    opt.textContent = p.name;
+    bpal.appendChild(opt);
+  });
+  let paletteIdx = parseInt(localStorage.getItem('gb_palette') || '0', 10);
+  if (paletteIdx < 0 || paletteIdx >= PALETTES.length) paletteIdx = 0;
+  bpal.value = paletteIdx;
+
+  function applyPalette(idx) {
+    paletteIdx = idx;
+    localStorage.setItem('gb_palette', idx);
+    bpal.value = idx;
+    if (backend && backend.setPalette) backend.setPalette(idx);
+  }
+
+  bpal.onchange = () => applyPalette(parseInt(bpal.value, 10));
 
   function updateStatus(text) {
     st.textContent = text;
@@ -372,6 +432,7 @@ class WasmBackend {
     }
     backend.onframe = renderFrame;
     backend.onstatus = updateStatus;
+    applyPalette(paletteIdx);
     resize();
   }
 

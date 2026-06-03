@@ -6,6 +6,7 @@
 #include <string.h>
 #include "gb.h"
 #include "savestate.h"
+#include "palette.h"
 
 EMSCRIPTEN_KEEPALIVE
 void wasm_init(const uint8_t *rom_data, int rom_size) {
@@ -97,6 +98,22 @@ void wasm_load_sav(const uint8_t *data, int size) {
     if (size > 0x8000) size = 0x8000;
     memcpy(ext_ram, data, (size_t)size);
     ext_ram_dirty = true;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void wasm_set_palette(int idx) {
+    palette_set(idx);
+}
+
+EMSCRIPTEN_KEEPALIVE
+int wasm_get_palette_count(void) {
+    return GB_PALETTE_COUNT;
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char *wasm_get_palette_name(int idx) {
+    if (idx < 0 || idx >= GB_PALETTE_COUNT) return "";
+    return GB_PALETTES[idx].name;
 }
 
 #endif /* __EMSCRIPTEN__ */

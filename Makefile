@@ -38,12 +38,13 @@ WASM_EXPORTED_FUNCTIONS := \
   _wasm_save_state,_wasm_save_state_size,_wasm_get_save_state,\
   _wasm_load_state,_wasm_reset,_wasm_set_fast,\
   _wasm_get_sav_size,_wasm_get_sav,_wasm_load_sav,\
+  _wasm_set_palette,_wasm_get_palette_count,_wasm_get_palette_name,\
   _malloc,_free
 
-WASM_SRCS := gb.c savestate.c
+WASM_SRCS := gb.c savestate.c palette.c
 
-SRCS    := gb.c savestate.c ws_server.c frontend_sdl.c frontend_server.c main.c
-HDRS    := bios.h bits.h constants.h opnames.h savestate.h ws_server.h gb.h
+SRCS    := gb.c savestate.c palette.c ws_server.c frontend_sdl.c frontend_server.c main.c
+HDRS    := bios.h bits.h constants.h opnames.h savestate.h ws_server.h gb.h palette.h
 
 ws_server_html.h: frontend/index.html tools/gen_html_header.py
 	python3 tools/gen_html_header.py $< > $@
@@ -54,9 +55,9 @@ gb: ws_server_html.h $(SRCS) $(HDRS)
 asan: ws_server_html.h $(SRCS) $(HDRS)
 	$(CC) $(CFLAGS) $(CBOR_CFLAGS) $(LWS_CFLAGS) $(STRICT) -g -fsanitize=undefined,address $(SRCS) -o gb_asan $(LDFLAGS) $(CBOR_LDFLAGS) $(LWS_LDFLAGS)
 
-test_savestate: tests/test_savestate.c savestate.c savestate.h gb.c gb.h $(HDRS)
+test_savestate: tests/test_savestate.c savestate.c savestate.h gb.c gb.h palette.c palette.h $(HDRS)
 	$(CC) $(CBOR_CFLAGS) $(STRICT) -g \
-		tests/test_savestate.c savestate.c gb.c \
+		tests/test_savestate.c savestate.c gb.c palette.c \
 		-o tests/test_savestate_bin \
 		$(CBOR_LDFLAGS)
 
@@ -107,7 +108,7 @@ wasm: wasm-deps $(DIST_DIR) $(WASM_SRCS) frontend_wasm.c $(HDRS)
 	  -sALLOW_MEMORY_GROWTH=1 \
 	  -sFORCE_FILESYSTEM=1 \
 	  -sEXPORTED_FUNCTIONS='[$(WASM_EXPORTED_FUNCTIONS)]' \
-	  -sEXPORTED_RUNTIME_METHODS='["FS"]' \
+	  -sEXPORTED_RUNTIME_METHODS='["FS","UTF8ToString"]' \
 	  $(WASM_SRCS) frontend_wasm.c $(CBOR_LIB) \
 	  -o $(DIST_DIR)/gb.js
 
