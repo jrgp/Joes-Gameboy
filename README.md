@@ -23,37 +23,24 @@ I started this project in 2021 and got as far as getting TETRIS playable, then I
 ### Screenshots
 
 
-<p align="center">
-  Pokemon red with red palette on iphone/websockets
-</p>
 
-<p align="center">
-  <img src="screenshots/iphone.png" width="400">
-</p>
+Pokemon red with red palette on iphone/websockets
 
-<p align="center">
-  Pokemon red with blue palette on safari/websockets (same game streamed)
-</p>
+<img src="screenshots/iphone.png" width="400">
 
-<p align="center">
-  <img src="screenshots/pokemon in browser.png" width="400">
-</p>
 
-<p align="center">
-  Donkey Kong Land with gold palette in SDL
-</p>
+Pokemon red with blue palette on safari/websockets (same game streamed)
 
-<p align="center">
-  <img src="screenshots/dkland in SDL.png" width="400">
-</p>
+<img src="screenshots/pokemon in browser.png" width="400">
 
-<p align="center">
-  Pokemon red with stock palette in SDL
-</p>
+Donkey Kong Land with gold palette in SDL
 
-<p align="center">
-  <img src="screenshots/pokemon red.png" width="400">
-</p>
+<img src="screenshots/dkland in SDL.png" width="400">
+
+Pokemon red with stock palette in SDL
+
+<img src="screenshots/pokemon red.png" width="400">
+
 
 ## Frontends
 
