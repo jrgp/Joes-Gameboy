@@ -20,6 +20,20 @@ I started this project in 2021 and got as far as getting TETRIS playable, then I
 - Native mac app
 - Auto builds/releases using GHA
 
+### Screenshots
+
+
+<p align="center">
+  Pokemon red with red palette on iphone/websockets
+  <img src="images/iphone.png">
+  Pokemon red with blue palette on safari/websockets (same game streamed)
+  <img src="images/pokemon in browser.png">
+  Donkey Kong Land with gold palette in SDL
+  <img src="images/dkland in SDL.png">
+  Pokemon red with stock palette in SDL
+  <img src="images/pokemon red">
+</p>
+
 ## Frontends
 
 | Frontend | Description |
