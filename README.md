@@ -9,7 +9,7 @@ I started this project in 2021 and got as far as getting TETRIS playable, then I
 - Multiple UIs - SDL/WASM/headless
 - A headless server mode that allows `screen -x` or `tmux attach` functionality, for gaming on the Go.
 - Game saves/snapshots
-- Toggleable Color Palettes 
+- Toggleable Color Palettes
 - Toggleable Fast Mode (4x) to make grinding Pokemon easier
 - Correctness: Blargg/Mooneye e2e tests pass.
 
@@ -106,7 +106,7 @@ cp frontend/index.html dist/
 cd dist && python3 -m http.server 8000
 ```
 
-Open `http://localhost:8000`, click **Load ROM**, pick a `.gb` file.
+Open `http://localhost:8000/?wasm=1`, click **Load ROM**, pick a `.gb` file.
 Save/load state downloads and uploads `.cbor` files locally.
 
 ## Headless / testing
