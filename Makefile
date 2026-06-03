@@ -46,11 +46,11 @@ WASM_SRCS := gb.c savestate.c palette.c
 SRCS    := gb.c savestate.c palette.c ws_server.c frontend_sdl.c frontend_server.c main.c
 HDRS    := bios.h bits.h constants.h opnames.h savestate.h ws_server.h gb.h palette.h
 
-ws_server_html.h: frontend/index.html tools/gen_html_header.py
-	python3 tools/gen_html_header.py $< > $@
-
 gb: ws_server_html.h $(SRCS) $(HDRS)
 	$(CC) $(CFLAGS) $(CBOR_CFLAGS) $(LWS_CFLAGS) $(STRICT) -g $(SRCS) -o $@ $(LDFLAGS) $(CBOR_LDFLAGS) $(LWS_LDFLAGS)
+
+ws_server_html.h: frontend/index.html tools/gen_html_header.py
+	python3 tools/gen_html_header.py $< > $@
 
 asan: ws_server_html.h $(SRCS) $(HDRS)
 	$(CC) $(CFLAGS) $(CBOR_CFLAGS) $(LWS_CFLAGS) $(STRICT) -g -fsanitize=undefined,address $(SRCS) -o gb_asan $(LDFLAGS) $(CBOR_LDFLAGS) $(LWS_LDFLAGS)
