@@ -1,6 +1,24 @@
 # cgb
 
-A Game Boy DMG emulator written in C. Passes 31/31 Blargg tests and 75/75 Mooneye tests.
+A Game Boy DMG emulator written in C
+
+I started this project in 2021 and got as far as getting TETRIS playable, then I left the project for a while. Starting in 2026, I've been guiding Claude Sonnet 4.6 to gradually complete the emulator and add many more features.
+
+### Features
+
+- Multiple UIs - SDL/WASM/headless
+- A headless server mode that allows `screen -x` or `tmux attach` functionality, for gaming on the Go.
+- Game saves/snapshots
+- Toggleable Color Palettes 
+- Toggleable Fast Mode (4x) to make grinding Pokemon easier
+- Correctness: Blargg/Mooneye e2e tests pass.
+
+### Upcoming features
+
+- Gameboy Color
+- Audio
+- Native mac app
+- Auto builds/releases using GHA
 
 ## Frontends
 
@@ -36,8 +54,16 @@ make
 ./gb game.gb
 ```
 
-Controls: Arrow keys = D-Pad, `A` = A, `S` = B, `Enter` = Start, `Shift` = Select,
-`F5` = save state, `F` = toggle fast mode (~4× speed).
+Controls:
+
+- Arrow keys = D-Pad
+- `A` = A
+- `S` = B
+- `Enter` = Start
+- `Shift` = Select
+- `F5` = Save state
+- `F6` / `shift + F6` = Change color palette
+- `F` = Toggle fast mode (~4× speed).
 
 ### Server (browser remote)
 ```bash
