@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <signal.h>
 #include "gb.h"
 #include "savestate.h"
 #include "ws_server.h"
@@ -14,7 +15,17 @@ void server_main_impl(void);
 extern uint8_t RAM[];
 extern void cpu_close_debug_file(void);
 
+volatile sig_atomic_t g_shutdown_requested = 0;
+
+static void handle_signal(int sig) {
+    (void)sig;
+    g_shutdown_requested = 1;
+}
+
 int main(int argc, char **argv) {
+    signal(SIGINT,  handle_signal);
+    signal(SIGTERM, handle_signal);
+
     char *rom = "tetris.gb";
     bool load_from_state = false;
     bool server_mode = false;
@@ -150,7 +161,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!load_from_state)
+    if (ext_ram_dirty)
         sav_save(rom);
 
     if (savestate_rom_path[0] != '\0') {

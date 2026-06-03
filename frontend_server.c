@@ -7,7 +7,7 @@
 
 void server_main_impl(void) {
     int frame_num = 0;
-    while (1) {
+    while (!g_shutdown_requested) {
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
 

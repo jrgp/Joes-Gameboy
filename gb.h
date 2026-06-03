@@ -1,6 +1,10 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+#include <signal.h>
+
+/* Set by SIGINT/SIGTERM handler; frontends check this to exit their loops. */
+extern volatile sig_atomic_t g_shutdown_requested;
 
 /* Pixel buffer */
 extern uint32_t *pixels;

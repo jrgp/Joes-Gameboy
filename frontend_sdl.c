@@ -84,7 +84,7 @@ void sdl_main_impl(void) {
 
     SDL_Event event;
     printf("SDL window created, starting main loop...\n");
-    while (run) {
+    while (run && !g_shutdown_requested) {
         while (SDL_PollEvent(&event)) {
             switch (event.type) {
                 case SDL_QUIT:
