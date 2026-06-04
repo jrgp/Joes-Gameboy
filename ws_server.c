@@ -62,6 +62,11 @@ extern char savestate_rom_path[4096];
  * At 300 tiles: 3 + 300×18 = 5403 bytes (vs 5761 for full frame).       */
 #define TILE_FULL_THRESHOLD 300
 
+/* Send a periodic keyframe every N rendered frames to self-heal any
+ * transient corruption caused by missed or mis-applied tile updates.
+ * 180 frames ≈ 3 seconds at 60 fps.                                      */
+#define KEYFRAME_INTERVAL_FRAMES 180
+
 #define MSG_FULL_FRAME  0x01
 #define MSG_TILE_BATCH  0x10
 
@@ -91,6 +96,9 @@ static bool    g_send_full_frame;  /* true = send full frame this tick */
 
 /* Force next notify_frame() to emit a full frame (reset/load-state events). */
 static bool    g_force_keyframe = true;  /* true at startup → first frame is full */
+
+/* Counts frames since last full keyframe; resets when a keyframe is sent. */
+static int     g_frames_since_keyframe = 0;
 
 /* Frame sequence counter (monotonically increasing, per-connection drop guard) */
 static uint32_t g_frame_seq = 1;
@@ -318,7 +326,8 @@ bool ws_server_init(const char *bind_addr, int port)
 
 static void ws_server_force_keyframe(void)
 {
-    g_force_keyframe = true;
+    g_force_keyframe        = true;
+    g_frames_since_keyframe = 0;
 }
 
 void ws_server_notify_frame(const uint32_t *pixels, int w, int h)
@@ -341,11 +350,12 @@ void ws_server_notify_frame(const uint32_t *pixels, int w, int h)
     }
 
     /* --- Step 2: Determine what to send --- */
-    if (g_force_keyframe) {
-        /* Forced keyframe: send full frame to all clients */
-        g_send_full_frame = true;
-        g_tile_batch_len  = 0;
-        g_force_keyframe  = false;
+    if (g_force_keyframe || g_frames_since_keyframe >= KEYFRAME_INTERVAL_FRAMES) {
+        /* Forced or periodic keyframe: send full frame to all clients */
+        g_send_full_frame        = true;
+        g_tile_batch_len         = 0;
+        g_force_keyframe         = false;
+        g_frames_since_keyframe  = 0;
         g_stats.full_frames++;
         g_stats.bytes_out += WS_FRAME_BYTES;
     } else {
@@ -373,9 +383,10 @@ void ws_server_notify_frame(const uint32_t *pixels, int w, int h)
             g_tile_batch_len  = 0;
             g_stats.no_change++;
         } else if (changed_count > TILE_FULL_THRESHOLD) {
-            /* Too many tiles — full frame is cheaper */
-            g_send_full_frame = true;
-            g_tile_batch_len  = 0;
+            /* Too many tiles — full frame is cheaper; also resets keyframe counter */
+            g_send_full_frame        = true;
+            g_tile_batch_len         = 0;
+            g_frames_since_keyframe  = 0;
             g_stats.full_frames++;
             g_stats.bytes_out += WS_FRAME_BYTES;
         } else {
@@ -406,6 +417,7 @@ void ws_server_notify_frame(const uint32_t *pixels, int w, int h)
 
     /* --- Step 3: Roll prev frame --- */
     memcpy(g_prev_2bpp, g_curr_2bpp, WS_FRAME_2BPP_PAYLOAD);
+    g_frames_since_keyframe++;
     g_frame_seq++;
     g_stats.frame_count++;
 
