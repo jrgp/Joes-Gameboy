@@ -4,20 +4,28 @@
  * One LWS protocol handles both HTTP (serving the page) and WebSocket
  * (streaming frames + receiving input/commands).
  *
+ * Transport modes (per connection, selected by client via message 0x07):
+ *   TRANSPORT_RELIABLE — always send full framebuffers (default).
+ *                        Best for LAN and low-latency links.
+ *   TRANSPORT_FAST     — tile-diff with periodic keyframes.
+ *                        Best for VPN and bandwidth-constrained links.
+ *
  * Wire protocol (binary WebSocket messages):
  *   Server → Client:
  *     [0x01] + 5760 bytes
  *         Full framebuffer, 2bpp packed, 4 pixels/byte, MSB-first.
  *         Palette indices 0-3: 0=white(FF), 1=lt-grey(AA), 2=dk-grey(55), 3=black(00).
- *         Sent on initial connection and after forced keyframe events (reset, load-state,
- *         or when >TILE_FULL_THRESHOLD tiles changed in one frame).
+ *         Always sent in TRANSPORT_RELIABLE mode.
+ *         Sent in TRANSPORT_FAST mode on connection, forced keyframe events
+ *         (reset, load-state), periodic keyframe interval, or when
+ *         >TILE_FULL_THRESHOLD tiles changed in one frame.
  *
  *     [0x10] + [count_lo, count_hi: uint16 LE] + count × tile_entry
  *         Tile update batch.  Only changed 8×8 tiles are sent.
  *         tile_entry = [tile_x: u8, tile_y: u8] + 16 bytes of 2bpp tile data
  *                      (8 rows × 2 bytes/row; same 2bpp encoding as full frame).
  *         The client patches each tile into its local framebuffer copy.
- *         Sent each frame when ≤ TILE_FULL_THRESHOLD tiles changed.
+ *         Sent only in TRANSPORT_FAST mode when ≤ TILE_FULL_THRESHOLD tiles changed.
  *
  *   Client → Server:
  *     [0x02, bitmask]   — joypad update (bit0=RIGHT,1=LEFT,2=UP,3=DOWN,
@@ -26,6 +34,7 @@
  *     [0x04]            — load state  (server sends a keyframe on next frame)
  *     [0x05]            — reset       (server sends a keyframe on next frame)
  *     [0x06]            — fast-mode toggle
+ *     [0x07, mode]      — set transport mode: 0=RELIABLE (full frames), 1=FAST (tile-diff)
  */
 
 #include "ws_server.h"
@@ -120,13 +129,21 @@ static struct {
     time_t   last_log;
 } g_stats;
 
+/* ---- Transport mode ---- */
+
+typedef enum {
+    TRANSPORT_RELIABLE = 0,   /* always send full framebuffers (default) */
+    TRANSPORT_FAST     = 1,   /* tile-diff with periodic keyframes        */
+} transport_mode_t;
+
 /* ---- Per-connection state ---- */
 
 typedef struct {
-    bool     is_ws;
-    bool     html_sent;
-    uint32_t last_sent_seq;
-    bool     needs_keyframe;  /* true → send full frame regardless of g_send_full_frame */
+    bool             is_ws;
+    bool             html_sent;
+    uint32_t         last_sent_seq;
+    bool             needs_keyframe;    /* FAST mode: send full frame next tick */
+    transport_mode_t transport;         /* per-connection transport selection   */
 } per_session_t;
 
 /* ---- Forward declaration ---- */
@@ -190,7 +207,8 @@ static int callback_gb(struct lws *wsi, enum lws_callback_reasons reason,
         if (pss) {
             pss->is_ws          = true;
             pss->last_sent_seq  = 0;
-            pss->needs_keyframe = true;   /* always send full frame on connect */
+            pss->needs_keyframe = true;    /* always send full frame on connect */
+            pss->transport      = TRANSPORT_RELIABLE;
             lws_callback_on_writable(wsi);
         }
         char peer[64] = "?";
@@ -248,6 +266,19 @@ static int callback_gb(struct lws *wsi, enum lws_callback_reasons reason,
             g_fast_mode = !g_fast_mode;
             break;
 
+        case 0x07: /* Transport mode selection */
+            if (len >= 2 && pss) {
+                transport_mode_t prev = pss->transport;
+                pss->transport = (data[1] == TRANSPORT_FAST)
+                                 ? TRANSPORT_FAST : TRANSPORT_RELIABLE;
+                /* Switching to fast: send a keyframe first to establish baseline */
+                if (pss->transport == TRANSPORT_FAST && prev != TRANSPORT_FAST)
+                    pss->needs_keyframe = true;
+                fprintf(stderr, "[ws] transport mode → %s\n",
+                        pss->transport == TRANSPORT_FAST ? "FAST" : "RELIABLE");
+            }
+            break;
+
         default:
             break;
         }
@@ -259,22 +290,29 @@ static int callback_gb(struct lws *wsi, enum lws_callback_reasons reason,
         if (!pss || !pss->is_ws) return 0;
         if (pss->last_sent_seq == g_frame_seq) return 0;
 
-        bool send_full = g_send_full_frame || pss->needs_keyframe;
-
-        if (send_full) {
-            /* Full framebuffer */
+        if (pss->transport == TRANSPORT_RELIABLE) {
+            /* Reliable mode: always send the complete framebuffer. */
             g_send_buf[LWS_PRE] = MSG_FULL_FRAME;
             memcpy(g_send_buf + LWS_PRE + 1, g_curr_2bpp, WS_FRAME_2BPP_PAYLOAD);
             lws_write(wsi, g_send_buf + LWS_PRE,
                       (size_t)WS_FRAME_BYTES, LWS_WRITE_BINARY);
-            pss->needs_keyframe = false;
-        } else if (g_tile_batch_len > 0) {
-            /* Tile update batch */
-            memcpy(g_send_buf + LWS_PRE, g_tile_batch, (size_t)g_tile_batch_len);
-            lws_write(wsi, g_send_buf + LWS_PRE,
-                      (size_t)g_tile_batch_len, LWS_WRITE_BINARY);
+        } else {
+            /* Fast mode: use tile-diff; full frame on keyframe events or threshold. */
+            bool send_full = g_send_full_frame || pss->needs_keyframe;
+
+            if (send_full) {
+                g_send_buf[LWS_PRE] = MSG_FULL_FRAME;
+                memcpy(g_send_buf + LWS_PRE + 1, g_curr_2bpp, WS_FRAME_2BPP_PAYLOAD);
+                lws_write(wsi, g_send_buf + LWS_PRE,
+                          (size_t)WS_FRAME_BYTES, LWS_WRITE_BINARY);
+                pss->needs_keyframe = false;
+            } else if (g_tile_batch_len > 0) {
+                memcpy(g_send_buf + LWS_PRE, g_tile_batch, (size_t)g_tile_batch_len);
+                lws_write(wsi, g_send_buf + LWS_PRE,
+                          (size_t)g_tile_batch_len, LWS_WRITE_BINARY);
+            }
+            /* g_tile_batch_len == 0 && !send_full: no changes, nothing to write */
         }
-        /* g_tile_batch_len == 0 && !send_full: no changes, nothing to write */
 
         pss->last_sent_seq = g_frame_seq;
         return 0;

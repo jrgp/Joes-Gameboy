@@ -28,6 +28,10 @@ canvas{display:block;image-rendering:pixelated;image-rendering:crisp-edges;backg
   <button class='tb' id='brs'>Reset</button>
   <button class='tb' id='bft'>Fast</button>
   <select class='tb' id='bpal' title='Palette'></select>
+  <select class='tb' id='btrans' title='Transport'>
+    <option value='0'>Reliable</option>
+    <option value='1'>Fast</option>
+  </select>
   <button class='tb' id='brm' style='display:none'>Load ROM</button>
   <span id='st'>Connecting...</span>
 </div>
@@ -72,6 +76,7 @@ class RemoteBackend {
     this._g_px = new Uint8ClampedArray(160 * 144 * 4);
     this._curr_2bpp = new Uint8Array(5760);      /* local framebuffer copy for tile-diff and re-palette */
     this._PALETTE = new Uint8Array([255,255,255,170,170,170,85,85,85,0,0,0]);
+    this._transportMode = 0;   /* 0=RELIABLE, 1=FAST */
     this._connect();
   }
   /* Decode a full 5760-byte 2bpp buffer into _g_px using current palette. */
@@ -111,7 +116,11 @@ class RemoteBackend {
   _connect() {
     this._ws = new WebSocket(this._url);
     this._ws.binaryType = 'arraybuffer';
-    this._ws.onopen = () => { if (this.onstatus) this.onstatus('Connected'); };
+    this._ws.onopen = () => {
+      if (this.onstatus) this.onstatus('Connected');
+      /* Notify server of the current transport mode immediately on (re)connect. */
+      this._snd(0x07, this._transportMode);
+    };
     this._ws.onclose = () => {
       if (this.onstatus) this.onstatus('Disconnected');
       setTimeout(() => this._connect(), 2000);
@@ -150,6 +159,10 @@ class RemoteBackend {
   sendLoad()       { this._snd(4); }
   sendReset()      { this._snd(5); }
   setFast(_on)     { this._snd(6); }
+  setTransport(mode) {
+    this._transportMode = mode & 1;
+    this._snd(0x07, this._transportMode);
+  }
   setPalette(idx) {
     const pal = PALETTES[idx] || PALETTES[0];
     for (let i = 0; i < 4; i++) {
@@ -265,6 +278,7 @@ class WasmBackend {
   const cc2 = cc.getContext('2d');
   const brom = document.getElementById('brm');
   const bpal = document.getElementById('bpal');
+  const btrans = document.getElementById('btrans');
   const frameImage = ctx.createImageData(160, 144);
   let backend = null;
   let isWasm = false;
@@ -294,6 +308,20 @@ class WasmBackend {
   }
 
   bpal.onchange = () => applyPalette(parseInt(bpal.value, 10));
+
+  /* Transport mode dropdown (RemoteBackend only; hidden for WasmBackend) */
+  let transportMode = parseInt(localStorage.getItem('gb_transport') || '0', 10);
+  if (transportMode !== 0 && transportMode !== 1) transportMode = 0;
+  btrans.value = transportMode;
+
+  function applyTransport(mode) {
+    transportMode = mode;
+    localStorage.setItem('gb_transport', mode);
+    btrans.value = mode;
+    if (backend && backend.setTransport) backend.setTransport(mode);
+  }
+
+  btrans.onchange = () => applyTransport(parseInt(btrans.value, 10));
 
   function updateStatus(text) {
     st.textContent = text;
@@ -467,15 +495,18 @@ class WasmBackend {
       backend = new WasmBackend(mod);
       isWasm = true;
       brom.style.display = '';
+      btrans.style.display = 'none';   /* transport mode only applies to RemoteBackend */
       updateStatus('Load a ROM');
     } else {
       const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
       backend = new RemoteBackend(proto + location.host + '/ws');
       brom.style.display = 'none';
+      btrans.style.display = '';
     }
     backend.onframe = renderFrame;
     backend.onstatus = updateStatus;
     applyPalette(paletteIdx);
+    if (!isWasm) applyTransport(transportMode);
     resize();
   }
 
