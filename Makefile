@@ -44,16 +44,20 @@ WASM_EXPORTED_FUNCTIONS := \
 WASM_SRCS := gb.c savestate.c palette.c
 
 SRCS    := gb.c savestate.c palette.c ws_server.c frontend_sdl.c frontend_server.c main.c
+SERVER_SRCS := gb.c savestate.c palette.c ws_server.c frontend_server.c main.c
 HDRS    := bios.h bits.h constants.h opnames.h savestate.h ws_server.h gb.h palette.h
 
 gb: ws_server_html.h $(SRCS) $(HDRS)
-	$(CC) $(CFLAGS) $(CBOR_CFLAGS) $(LWS_CFLAGS) $(STRICT) -g $(SRCS) -o $@ $(LDFLAGS) $(CBOR_LDFLAGS) $(LWS_LDFLAGS)
+	$(CC) $(CFLAGS) $(CBOR_CFLAGS) $(LWS_CFLAGS) $(STRICT) -g -DHAVE_SDL $(SRCS) -o $@ $(LDFLAGS) $(CBOR_LDFLAGS) $(LWS_LDFLAGS)
+
+gb-server: ws_server_html.h $(SERVER_SRCS) $(HDRS)
+	$(CC) $(CBOR_CFLAGS) $(LWS_CFLAGS) $(STRICT) -g $(SERVER_SRCS) -o $@ $(CBOR_LDFLAGS) $(LWS_LDFLAGS)
 
 ws_server_html.h: frontend/index.html tools/gen_html_header.py
 	python3 tools/gen_html_header.py $< > $@
 
 asan: ws_server_html.h $(SRCS) $(HDRS)
-	$(CC) $(CFLAGS) $(CBOR_CFLAGS) $(LWS_CFLAGS) $(STRICT) -g -fsanitize=undefined,address $(SRCS) -o gb_asan $(LDFLAGS) $(CBOR_LDFLAGS) $(LWS_LDFLAGS)
+	$(CC) $(CFLAGS) $(CBOR_CFLAGS) $(LWS_CFLAGS) $(STRICT) -g -fsanitize=undefined,address -DHAVE_SDL $(SRCS) -o gb_asan $(LDFLAGS) $(CBOR_LDFLAGS) $(LWS_LDFLAGS)
 
 test_savestate: tests/test_savestate.c savestate.c savestate.h gb.c gb.h palette.c palette.h $(HDRS)
 	$(CC) $(CBOR_CFLAGS) $(STRICT) -g \
@@ -116,4 +120,4 @@ clean-wasm:
 	rm -rf $(DEPS_DIR) $(DIST_DIR)
 
 clean: clean-wasm
-	rm -f gb gb_asan tests/test_savestate_bin ws_server_html.h
+	rm -f gb gb-server gb_asan tests/test_savestate_bin ws_server_html.h

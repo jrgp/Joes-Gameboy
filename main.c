@@ -9,8 +9,10 @@
 #include "ws_server.h"
 #include "constants.h"
 
+#ifdef HAVE_SDL
 void sdl_init(void);
 void sdl_main_impl(void);
+#endif
 void server_main_impl(void);
 extern uint8_t RAM[];
 extern void cpu_close_debug_file(void);
@@ -88,7 +90,11 @@ int main(int argc, char **argv) {
     if (load_from_state) {
         pixels_init();
         if (!headless)
+#ifdef HAVE_SDL
             sdl_init();
+#else
+            headless = true;
+#endif
         if (!load_state(rom)) {
             fprintf(stderr, "Failed to load save state: %s\n", rom);
             return 1;
@@ -127,7 +133,11 @@ int main(int argc, char **argv) {
             cpu_fake_init();
             pixels_init();
             if (!headless)
+#ifdef HAVE_SDL
                 sdl_init();
+#else
+                headless = true;
+#endif
             joypad_init();
         }
     }
@@ -142,7 +152,12 @@ int main(int argc, char **argv) {
     } else if (headless) {
         headless_main_impl();
     } else {
+#ifdef HAVE_SDL
         sdl_main_impl();
+#else
+        fprintf(stderr, "SDL frontend not compiled in; use --server or --headless\n");
+        return 1;
+#endif
     }
 
     if (ppm_path) {
