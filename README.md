@@ -61,18 +61,35 @@ sudo apt-get install gcc libsdl2-dev libcbor-dev libwebsockets-dev
 sudo apt-get install emscripten
 ```
 
-### Linux (dnf — RHEL / AlmaLinux 9)
+### Linux (dnf — RHEL / AlmaLinux 10)
+
+AlmaLinux 10 ships SDL3 and does not package `SDL2-devel` or `libcbor-devel`.
+Both need to be built from source.
+
 ```bash
+# Enable EPEL and CRB repos
 sudo dnf install epel-release
-sudo dnf install gcc SDL2-devel libcbor-devel libwebsockets-devel
-# WASM only (emscripten is not in EPEL — install via emsdk):
+sudo dnf config-manager --enable crb
+
+# Packaged deps
+sudo dnf install gcc SDL3-devel libwebsockets-devel
+
+# sdl2-compat: SDL2 API on top of SDL3 (headers + runtime)
+sudo dnf install sdl2-compat   # runtime shim (AppStream)
+git clone https://github.com/libsdl-org/sdl2-compat.git
+cd sdl2-compat && cmake -B build && cmake --build build && sudo cmake --install build
+cd ..
+
+# libcbor (not yet packaged for EL10)
+git clone https://github.com/PJK/libcbor.git
+cd libcbor && cmake -DCMAKE_BUILD_TYPE=Release . && make && sudo make install
+cd ..
+
+# WASM only (emscripten not in any EL10 repo — install via emsdk):
 git clone https://github.com/emscripten-core/emsdk.git
 cd emsdk && ./emsdk install latest && ./emsdk activate latest
 source ./emsdk_env.sh
 ```
-
-> **AlmaLinux 8 / RHEL 8:** SDL2-devel is in the PowerTools repo.
-> Enable it first with `sudo dnf config-manager --set-enabled powertools`.
 
 ### macOS (brew)
 ```bash
