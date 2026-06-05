@@ -54,12 +54,25 @@ All three frontends share the same emulator core (`gb.c`) and save-state format.
 
 ## Dependencies
 
-### Linux (apt)
+### Linux (apt — Debian/Ubuntu)
 ```bash
 sudo apt-get install gcc libsdl2-dev libcbor-dev libwebsockets-dev
 # WASM only:
 sudo apt-get install emscripten
 ```
+
+### Linux (dnf — RHEL / AlmaLinux 9)
+```bash
+sudo dnf install epel-release
+sudo dnf install gcc SDL2-devel libcbor-devel libwebsockets-devel
+# WASM only (emscripten is not in EPEL — install via emsdk):
+git clone https://github.com/emscripten-core/emsdk.git
+cd emsdk && ./emsdk install latest && ./emsdk activate latest
+source ./emsdk_env.sh
+```
+
+> **AlmaLinux 8 / RHEL 8:** SDL2-devel is in the PowerTools repo.
+> Enable it first with `sudo dnf config-manager --set-enabled powertools`.
 
 ### macOS (brew)
 ```bash
