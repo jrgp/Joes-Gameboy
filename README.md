@@ -63,8 +63,18 @@ sudo apt-get install emscripten
 
 ### Linux (dnf — RHEL / AlmaLinux 10)
 
-AlmaLinux 10 ships SDL3 and does not package `SDL2-devel` or `libcbor-devel`.
-Both need to be built from source.
+For the WebSocket/headless server (`gb-server`), libcbor is bundled at
+build time — no system package needed.  Only `gcc` and `libwebsockets-devel`
+are required:
+
+```bash
+sudo dnf install epel-release
+sudo dnf install gcc libwebsockets-devel
+make gb-server
+```
+
+For the full SDL desktop build, AlmaLinux 10 ships SDL3 and does not
+package `SDL2-devel` or `libcbor-devel`, so those still require manual steps:
 
 ```bash
 # Enable EPEL and CRB repos
@@ -75,14 +85,9 @@ sudo dnf config-manager --enable crb
 sudo dnf install gcc SDL3-devel libwebsockets-devel
 
 # sdl2-compat: SDL2 API on top of SDL3 (headers + runtime)
-sudo dnf install sdl2-compat   # runtime shim (AppStream)
+sudo dnf install sdl2-compat
 git clone https://github.com/libsdl-org/sdl2-compat.git
 cd sdl2-compat && cmake -B build && cmake --build build && sudo cmake --install build
-cd ..
-
-# libcbor (not yet packaged for EL10)
-git clone https://github.com/PJK/libcbor.git
-cd libcbor && cmake -DCMAKE_BUILD_TYPE=Release . && make && sudo make install
 cd ..
 
 # WASM only (emscripten not in any EL10 repo — install via emsdk):

@@ -11,7 +11,9 @@ DEPS_DIR := deps
 DIST_DIR := dist
 
 CBOR_SRC  := $(DEPS_DIR)/libcbor-0.8.0
-CBOR_LIB  := $(DEPS_DIR)/libcbor.a
+CBOR_LIB  := $(DEPS_DIR)/libcbor.a        # WASM static lib (built with emcc)
+CBOR_NATIVE_LIB := $(DEPS_DIR)/libcbor_native.a  # native static lib (built with gcc)
+CBOR_STAMP := $(DEPS_DIR)/.cbor-src-ready  # marks source + headers extracted
 CBOR_WASM_SRCS := \
   src/cbor.c \
   src/cbor/streaming.c \
@@ -50,8 +52,8 @@ HDRS    := bios.h bits.h constants.h opnames.h savestate.h ws_server.h gb.h pale
 gb: ws_server_html.h $(SRCS) $(HDRS)
 	$(CC) $(CFLAGS) $(CBOR_CFLAGS) $(LWS_CFLAGS) $(STRICT) -g -DHAVE_SDL $(SRCS) -o $@ $(LDFLAGS) $(CBOR_LDFLAGS) $(LWS_LDFLAGS)
 
-gb-server: ws_server_html.h $(SERVER_SRCS) $(HDRS)
-	$(CC) $(CBOR_CFLAGS) $(LWS_CFLAGS) $(STRICT) -g $(SERVER_SRCS) -o $@ $(CBOR_LDFLAGS) $(LWS_LDFLAGS)
+gb-server: ws_server_html.h $(CBOR_NATIVE_LIB) $(SERVER_SRCS) $(HDRS)
+	$(CC) -I$(CBOR_SRC)/src $(LWS_CFLAGS) $(STRICT) -g $(SERVER_SRCS) -o $@ $(CBOR_NATIVE_LIB) $(LWS_LDFLAGS)
 
 ws_server_html.h: frontend/index.html tools/gen_html_header.py
 	python3 tools/gen_html_header.py $< > $@
@@ -70,7 +72,8 @@ test: gb
 
 wasm-deps: $(CBOR_LIB)
 
-$(CBOR_LIB):
+# --- Shared: download source and generate cmake-produced headers ---
+$(CBOR_STAMP):
 	mkdir -p $(DEPS_DIR)
 	cd $(DEPS_DIR) && \
 	  curl -sL https://github.com/PJK/libcbor/archive/refs/tags/v0.8.0.tar.gz | tar xz
@@ -97,8 +100,20 @@ $(CBOR_LIB):
 	  '#define CBOR_RESTRICT_SPECIFIER restrict' \
 	  '#define CBOR_INLINE_SPECIFIER inline' \
 	  '#endif' > $(CBOR_SRC)/src/cbor/configuration.h
+	touch $@
+
+# --- WASM static lib (emcc) ---
+$(CBOR_LIB): $(CBOR_STAMP)
 	cd $(CBOR_SRC) && emcc -O2 -Isrc -c $(CBOR_WASM_SRCS)
 	cd $(CBOR_SRC) && emar rcs $(abspath $(CBOR_LIB)) *.o
+
+# --- Native static lib (gcc) — used by gb-server to avoid needing system libcbor ---
+$(CBOR_NATIVE_LIB): $(CBOR_STAMP)
+	mkdir -p $(DEPS_DIR)/cbor_native_obj
+	cd $(DEPS_DIR)/cbor_native_obj && \
+	  $(CC) -O2 -I../libcbor-0.8.0/src -c \
+	    $(addprefix ../libcbor-0.8.0/,$(CBOR_WASM_SRCS))
+	ar rcs $@ $(DEPS_DIR)/cbor_native_obj/*.o
 
 $(DIST_DIR):
 	mkdir -p $(DIST_DIR)
