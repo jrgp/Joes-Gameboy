@@ -6,7 +6,7 @@ I started this project in 2021 and got as far as getting TETRIS playable, then I
 
 ### Features
 
-- Multiple UIs - SDL/WASM/headless
+- Multiple UIs - SDL/WASM/headless/native macOS
 - A headless server mode that allows `screen -x` or `tmux attach` functionality, for gaming on the Go.
 - Game saves/snapshots
 - Toggleable Color Palettes
@@ -17,7 +17,6 @@ I started this project in 2021 and got as far as getting TETRIS playable, then I
 
 - Gameboy Color
 - Audio
-- Native mac app
 - Auto builds/releases using GHA
 
 ### Screenshots
@@ -47,10 +46,11 @@ Pokemon red with stock palette in SDL
 | Frontend | Description |
 |---|---|
 | **SDL** | Native desktop window (default) |
+| **macOS** | Native macOS app (`Joe's Gameboy.app`) with full AppKit UI |
 | **Server** | Headless + WebSocket; stream gameplay to a browser |
 | **WASM** | Runs entirely in the browser via WebAssembly |
 
-All three frontends share the same emulator core (`gb.c`) and save-state format.
+All frontends share the same emulator core (`gb.c`) and save-state format.
 
 ## Dependencies
 
@@ -103,6 +103,10 @@ brew install sdl2 libcbor libwebsockets
 brew install emscripten
 ```
 
+> **macOS app (`make mac`)** — libcbor is compiled from source at build time and
+> statically linked. Only `xcrun clang` (Xcode Command Line Tools) is required;
+> no Homebrew packages are needed for that target.
+
 ## Building
 
 ### SDL (desktop)
@@ -121,6 +125,41 @@ Controls:
 - `F5` = Save state
 - `F6` / `shift + F6` = Change color palette
 - `F` = Toggle fast mode (~4× speed).
+
+### macOS app
+
+Builds a self-contained `Joe's Gameboy.app` bundle — no dynamic dependencies
+beyond system frameworks.
+
+```bash
+make mac
+open "build/Release/Joe's Gameboy.app"
+```
+
+The first build downloads and compiles libcbor from source automatically.
+Subsequent builds are incremental (libcbor is cached in `deps/`).
+
+**Features:**
+- Native menu bar: File, Emulation, View, Palette, Window
+- `⌘O` Open ROM, `⌘S`/`⌘L` Save/Load State, `⌘R` Reset
+- `⌘P` Pause / Resume, `⌘F` Fast Forward (4×)
+- `⌃⌘F` Full screen (also via the green title-bar button)
+- **Open Recent** — last 10 ROMs, most-recently-loaded first
+- Auto-saves state when switching ROMs or closing the window
+- Auto-restores state when re-opening a previously played ROM
+- Drag a `.gb` / `.gbc` file onto the window to swap games
+- Palette menu mirrors all palettes available in the SDL frontend
+- Remembers last ROM and palette across launches
+
+**Controls:**
+
+| Key | Action |
+|---|---|
+| Arrow keys | D-Pad |
+| `A` | A button |
+| `S` | B button |
+| `Return` | Start |
+| `Shift` | Select |
 
 ### Server (browser remote)
 ```bash
@@ -155,11 +194,12 @@ Save/load state downloads and uploads `.cbor` files locally.
 
 ## Save states
 
-Save states use CBOR and are compatible across all three frontends.
+Save states use CBOR and are compatible across all frontends.
 
 | Frontend | Save | Load |
 |---|---|---|
 | SDL | `F5` | auto-loaded on next launch |
+| macOS | `⌘S` or auto-saved on close/ROM switch | `⌘L` or auto-restored on open |
 | Server | toolbar button / `F5` key in browser | toolbar button |
 | WASM | downloads `.cbor` file | uploads `.cbor` file |
 
