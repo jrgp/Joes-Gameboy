@@ -13,6 +13,7 @@ DIST_DIR := dist
 CBOR_SRC  := $(DEPS_DIR)/libcbor-0.8.0
 CBOR_LIB  := $(DEPS_DIR)/libcbor.a        # WASM static lib (built with emcc)
 CBOR_NATIVE_LIB := $(DEPS_DIR)/libcbor_native.a  # native static lib (built with gcc)
+CBOR_MAC_LIB    := $(DEPS_DIR)/libcbor_mac.a     # native static lib (built with xcrun clang)
 CBOR_STAMP := $(DEPS_DIR)/.cbor-src-ready  # marks source + headers extracted
 CBOR_WASM_SRCS := \
   src/cbor.c \
@@ -115,6 +116,16 @@ $(CBOR_NATIVE_LIB): $(CBOR_STAMP)
 	    $(addprefix ../libcbor-0.8.0/,$(CBOR_WASM_SRCS))
 	ar rcs $@ $(DEPS_DIR)/cbor_native_obj/*.o
 
+# --- Mac static lib (xcrun clang) — used by the macOS .app bundle ---
+$(CBOR_MAC_LIB): $(CBOR_STAMP)
+	mkdir -p $(DEPS_DIR)/cbor_mac_obj
+	cd $(DEPS_DIR)/cbor_mac_obj && \
+	  xcrun clang -O2 \
+	    -isysroot $(MAC_SDK) -mmacos-version-min=11.0 \
+	    -I../libcbor-0.8.0/src -c \
+	    $(addprefix ../libcbor-0.8.0/,$(CBOR_WASM_SRCS))
+	xcrun ar rcs $@ $(DEPS_DIR)/cbor_mac_obj/*.o
+
 $(DIST_DIR):
 	mkdir -p $(DIST_DIR)
 
@@ -134,5 +145,57 @@ wasm: wasm-deps $(DIST_DIR) $(WASM_SRCS) frontend_wasm.c $(HDRS)
 clean-wasm:
 	rm -rf $(DEPS_DIR) $(DIST_DIR)
 
+MAC_APP_NAME := Joe's Gameboy
+MAC_APP_EXE  := JoesGameboy
+MAC_APP_DIR  := build/Release
+MAC_SRCS     := gb.c savestate.c palette.c frontend_mac.m
+MAC_CC       := xcrun clang
+MAC_SDK      := $(shell xcrun --sdk macosx --show-sdk-path)
+MAC_CFLAGS   := -isysroot $(MAC_SDK) -mmacos-version-min=11.0 \
+                -fobjc-arc -I. -I$(CBOR_SRC)/src
+MAC_LFLAGS   := -isysroot $(MAC_SDK) -mmacos-version-min=11.0 \
+                -framework Cocoa -framework CoreGraphics
+
+.PHONY: mac
+mac: $(CBOR_MAC_LIB) icon.png
+	@mkdir -p "$(MAC_APP_DIR)/$(MAC_APP_NAME).app/Contents/MacOS" \
+	          "$(MAC_APP_DIR)/$(MAC_APP_NAME).app/Contents/Resources"
+	$(MAC_CC) $(MAC_CFLAGS) -O2 \
+	  -o "$(MAC_APP_DIR)/$(MAC_APP_NAME).app/Contents/MacOS/$(MAC_APP_EXE)" \
+	  $(MAC_SRCS) $(CBOR_MAC_LIB) $(MAC_LFLAGS)
+	@rm -rf /tmp/AppIcon.iconset && mkdir /tmp/AppIcon.iconset
+	@sips -z 16   16   icon.png --out /tmp/AppIcon.iconset/icon_16x16.png    >/dev/null
+	@sips -z 32   32   icon.png --out /tmp/AppIcon.iconset/icon_16x16@2x.png >/dev/null
+	@sips -z 32   32   icon.png --out /tmp/AppIcon.iconset/icon_32x32.png    >/dev/null
+	@sips -z 64   64   icon.png --out /tmp/AppIcon.iconset/icon_32x32@2x.png >/dev/null
+	@sips -z 128  128  icon.png --out /tmp/AppIcon.iconset/icon_128x128.png  >/dev/null
+	@sips -z 256  256  icon.png --out /tmp/AppIcon.iconset/icon_128x128@2x.png >/dev/null
+	@sips -z 256  256  icon.png --out /tmp/AppIcon.iconset/icon_256x256.png  >/dev/null
+	@sips -z 512  512  icon.png --out /tmp/AppIcon.iconset/icon_256x256@2x.png >/dev/null
+	@sips -z 512  512  icon.png --out /tmp/AppIcon.iconset/icon_512x512.png  >/dev/null
+	@sips -z 1000 1000 icon.png --out /tmp/AppIcon.iconset/icon_512x512@2x.png >/dev/null
+	@iconutil -c icns /tmp/AppIcon.iconset \
+	  -o "$(MAC_APP_DIR)/$(MAC_APP_NAME).app/Contents/Resources/AppIcon.icns"
+	@rm -rf /tmp/AppIcon.iconset
+	@printf '<?xml version="1.0" encoding="UTF-8"?>\n\
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n\
+<plist version="1.0"><dict>\n\
+  <key>CFBundleExecutable</key>      <string>JoesGameboy</string>\n\
+  <key>CFBundleIdentifier</key>      <string>com.joesgb.cgb</string>\n\
+  <key>CFBundleName</key>            <string>Joe'"'"'s Gameboy</string>\n\
+  <key>CFBundleDisplayName</key>     <string>Joe'"'"'s Gameboy</string>\n\
+  <key>CFBundleIconFile</key>        <string>AppIcon</string>\n\
+  <key>CFBundleVersion</key>         <string>1</string>\n\
+  <key>CFBundlePackageType</key>     <string>APPL</string>\n\
+  <key>LSMinimumSystemVersion</key>  <string>11.0</string>\n\
+  <key>NSPrincipalClass</key>        <string>NSApplication</string>\n\
+  <key>NSHighResolutionCapable</key> <true/>\n\
+  <key>NSSupportsAutomaticGraphicsSwitching</key> <true/>\n\
+</dict></plist>\n' > "$(MAC_APP_DIR)/$(MAC_APP_NAME).app/Contents/Info.plist"
+	codesign --force --sign - "$(MAC_APP_DIR)/$(MAC_APP_NAME).app"
+	@echo "Built: $(MAC_APP_DIR)/$(MAC_APP_NAME).app"
+	@echo "Run:   open \"$(MAC_APP_DIR)/$(MAC_APP_NAME).app\""
+
 clean: clean-wasm
 	rm -f gb gb-server gb_asan tests/test_savestate_bin ws_server_html.h
+	rm -rf build DerivedData
