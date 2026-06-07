@@ -61,6 +61,8 @@ const gb_palette_t GB_PALETTES[] = {
       { 0xFFC0A88F, 0xFF685840, 0xFF382818, 0xFF100804 } },
     { "Nord",
       { 0xFFF4EFEC, 0xFFD0C088, 0xFF6A564C, 0xFF40342E } },
+    { "Nord Dark",
+      { 0xFF40342E, 0xFF6A564C, 0xFFD0C088, 0xFFF4EFEC } },
 };
 
 const int GB_PALETTE_COUNT = (int)(sizeof(GB_PALETTES) / sizeof(GB_PALETTES[0]));
