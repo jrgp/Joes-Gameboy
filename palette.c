@@ -59,6 +59,8 @@ const gb_palette_t GB_PALETTES[] = {
       { 0xFFFFFFFF, 0xFF888888, 0xFF333333, 0xFF000000 } },
     { "Night Mode",
       { 0xFFC0A88F, 0xFF685840, 0xFF382818, 0xFF100804 } },
+    { "Nord",
+      { 0xFFF4EFEC, 0xFFD0C088, 0xFF6A564C, 0xFF40342E } },
 };
 
 const int GB_PALETTE_COUNT = (int)(sizeof(GB_PALETTES) / sizeof(GB_PALETTES[0]));
