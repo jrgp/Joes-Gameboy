@@ -8,36 +8,85 @@
 *{box-sizing:border-box;margin:0;padding:0;-webkit-touch-callout:none;touch-action:manipulation}
 html{height:100%}
 body{height:100%;display:flex;flex-direction:column;align-items:stretch;background:#0d0d1a;color:#ccc;font-family:monospace;overflow:hidden;user-select:none}
-#bar{flex:0 0 auto;display:flex;gap:6px;padding:6px;background:#111120;justify-content:center;align-items:center;width:100%}
+#bar{flex:0 0 auto;display:flex;gap:6px;padding:6px;background:#111120;justify-content:flex-start;align-items:center;width:100%;flex-wrap:wrap}
 .tb{background:#1e1e38;color:#999;border:1px solid #3a3a5a;border-radius:4px;padding:5px 10px;cursor:pointer;font:12px/1 monospace;touch-action:manipulation;-webkit-user-select:none;user-select:none}
 .tb:active{background:#3a3a6a}
 select.tb{padding:4px 6px;-webkit-appearance:none;appearance:none;cursor:pointer}
-#st{font-size:11px;color:#555;margin-left:4px}
+#st{font-size:11px;color:#555;margin-left:auto;padding-right:4px}
 #sw{flex:1 1 0;min-height:0;display:flex;align-items:center;justify-content:center;overflow:hidden}
 canvas{display:block;image-rendering:pixelated;image-rendering:crisp-edges;background:#111}
 #ctrl-canvas{flex:0 0 auto;display:block;width:100%;height:130px;background:#0a0a18;touch-action:none}
 #hint{flex:0 0 auto;font-size:11px;color:#555;text-align:center;padding:4px;width:100%}
 @media(min-width:540px){#ctrl-canvas{display:none}#hint{display:block}}
 @media(max-width:539px){#hint{display:none}}
+/* ---- Settings drawer (normal flow, slides in below the bar) ---- */
+#sdrawer{display:none;flex:0 0 auto;background:#111120;border-bottom:1px solid #3a3a5a;border-top:1px solid #2a2a3a;padding:8px 10px;flex-direction:column;gap:8px}
+#sdrawer.open{display:flex}
+.sdr-row{display:flex;align-items:center;gap:8px}
+.sdr-row label{color:#888;font-size:12px;min-width:76px;flex-shrink:0}
+.sdr-row select{flex:1}
+.sdr-sep{border:none;border-top:1px solid #252538;margin:2px 0}
+/* ---- Save slots modal (bottom sheet on mobile, centered on desktop) ---- */
+#slots-overlay{position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:100;display:none;align-items:flex-end;justify-content:center}
+#slots-overlay.open{display:flex}
+.slots-panel{background:#0d0d1a;border:1px solid #3a3a5a;border-radius:10px 10px 0 0;width:100%;max-width:480px;max-height:80vh;overflow-y:auto;padding-bottom:env(safe-area-inset-bottom,0px)}
+.slots-hdr{display:flex;justify-content:space-between;align-items:center;padding:11px 14px;border-bottom:1px solid #3a3a5a;font-size:13px;color:#ccc;position:sticky;top:0;background:#0d0d1a;z-index:1}
+.slot-row{padding:11px 14px;border-bottom:1px solid #181828;cursor:pointer}
+.slot-row:last-child{border-bottom:none}
+.slot-row.active-slot{background:#141430}
+.slot-top{display:flex;align-items:center;gap:7px;margin-bottom:2px}
+.slot-dot{width:8px;height:8px;border-radius:50%;border:1.5px solid #444;flex-shrink:0}
+.slot-row.active-slot .slot-dot{background:#7cb8ff;border-color:#7cb8ff}
+.slot-num{font-size:11px;color:#555;flex-shrink:0}
+.slot-sname{font-size:13px;color:#ccc}
+.slot-empty{font-size:13px;color:#2e2e48;font-style:italic}
+.slot-ts{font-size:11px;color:#555;margin-left:15px;margin-bottom:6px}
+.slot-btns{display:flex;gap:6px;margin-left:15px}
+.slot-btns .tb{flex:1;padding:6px 0;font-size:12px;text-align:center}
+@media(min-height:500px) and (min-width:480px){#slots-overlay{align-items:center}.slots-panel{border-radius:8px;max-height:70vh}}
 </style>
 </head>
 <body>
 <div id='bar'>
-  <button class='tb' id='bsv'>Save</button>
-  <button class='tb' id='bld'>Load</button>
+  <button class='tb' id='bmenu' title='Settings'>☰</button>
+  <button class='tb' id='bslots' style='display:none'>Slots</button>
   <button class='tb' id='brs'>Reset</button>
   <button class='tb' id='bft'>Fast</button>
-  <select class='tb' id='bpal' title='Palette'></select>
-  <select class='tb' id='btrans' title='Transport'>
-    <option value='0'>Reliable</option>
-    <option value='1'>Fast</option>
-  </select>
   <button class='tb' id='brm' style='display:none'>Load ROM</button>
-  <span id='st'>Connecting...</span>
+  <span id='st'>Connecting…</span>
+</div>
+<!-- Settings drawer (toggled by ☰) -->
+<div id='sdrawer'>
+  <div class='sdr-row'>
+    <label>Palette</label>
+    <select class='tb' id='bpal' title='Palette'></select>
+  </div>
+  <div class='sdr-row' id='transport-row'>
+    <label>Transport</label>
+    <select class='tb' id='btrans' title='Transport'>
+      <option value='0'>Reliable</option>
+      <option value='1'>Fast</option>
+    </select>
+  </div>
+  <hr class='sdr-sep' id='wasm-sep' style='display:none'>
+  <div class='sdr-row' id='wasm-saves' style='display:none'>
+    <button class='tb' id='bsv' style='flex:1'>Save State</button>
+    <button class='tb' id='bld' style='flex:1'>Load State</button>
+  </div>
+</div>
+<!-- Save slots modal -->
+<div id='slots-overlay'>
+  <div class='slots-panel'>
+    <div class='slots-hdr'>
+      <span>💾 Save Slots</span>
+      <button class='tb' id='slots-close'>✕</button>
+    </div>
+    <div id='slots-list'></div>
+  </div>
 </div>
 <div id='sw'><canvas id='screen' width='160' height='144'></canvas></div>
 <canvas id='ctrl-canvas'></canvas>
-<div id='hint'>Arrows: D-Pad &nbsp; A: A &nbsp; S: B &nbsp; Enter: Start &nbsp; Shift: Select &nbsp; F5: Save &nbsp; F8: Load &nbsp; F: Fast &nbsp; F6/⇧F6: Palette</div>
+<div id='hint'>Arrows: D-Pad &nbsp; A: A &nbsp; S: B &nbsp; Enter: Start &nbsp; Shift: Select &nbsp; F5: Quick Save &nbsp; F8: Quick Load &nbsp; F: Fast &nbsp; F6/⇧F6: Palette</div>
 <script>
 'use strict';
 
@@ -146,6 +195,12 @@ class RemoteBackend {
           pos += 16;
         }
         if (this.onframe) this.onframe(this._g_px);
+      } else if (d[0] === 0x12) {
+        /* Slot info update */
+        try {
+          const info = JSON.parse(new TextDecoder().decode(d.subarray(1)));
+          if (this.onslotinfo) this.onslotinfo(info);
+        } catch(_) {}
       }
     };
   }
@@ -165,6 +220,15 @@ class RemoteBackend {
     this._transportMode = mode & 1;
     this._snd(0x07, this._transportMode);
   }
+  sendSaveSlot(slot, name) {
+    if (!this._ws || this._ws.readyState !== 1) return;
+    const nb = (name && name.length) ? new TextEncoder().encode(name.slice(0, 64)) : new Uint8Array(0);
+    const msg = new Uint8Array(3 + nb.length);
+    msg[0] = 0x08; msg[1] = slot & 0xff; msg[2] = nb.length;
+    if (nb.length) msg.set(nb, 3);
+    this._ws.send(msg.buffer);
+  }
+  sendLoadSlot(slot) { this._snd(0x09, slot); }
   setPalette(idx) {
     const pal = PALETTES[idx] || PALETTES[0];
     for (let i = 0; i < 4; i++) {
@@ -281,6 +345,8 @@ class WasmBackend {
   const brom = document.getElementById('brm');
   const bpal = document.getElementById('bpal');
   const btrans = document.getElementById('btrans');
+  const sdrawer = document.getElementById('sdrawer');
+  const slotsOverlay = document.getElementById('slots-overlay');
   const frameImage = ctx.createImageData(160, 144);
   let backend = null;
   let isWasm = false;
@@ -290,6 +356,97 @@ class WasmBackend {
   const cTouches = {};
   const CL = {};
   const km = {ArrowRight:0,ArrowLeft:1,ArrowUp:2,ArrowDown:3,a:4,A:4,s:5,S:5,Enter:7,Shift:6};
+
+  /* ---- Slot state ---- */
+  let activeSlot = parseInt(localStorage.getItem('gb_active_slot') || '1', 10);
+  if (activeSlot < 1 || activeSlot > 5) activeSlot = 1;
+  let slotData = [1,2,3,4,5].map(n => ({slot:n,exists:false,name:'',ts:0}));
+
+  function escHtml(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function fmtTs(ts) {
+    if (!ts) return '';
+    return new Date(ts * 1000).toLocaleString(undefined,
+      {month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'});
+  }
+
+  function renderSlots() {
+    const list = document.getElementById('slots-list');
+    list.innerHTML = '';
+    slotData.forEach(sd => {
+      const active = sd.slot === activeSlot;
+      const div = document.createElement('div');
+      div.className = 'slot-row' + (active ? ' active-slot' : '');
+      const ts = fmtTs(sd.ts);
+      div.innerHTML =
+        '<div class="slot-top">' +
+          '<div class="slot-dot"></div>' +
+          '<span class="slot-num">Slot ' + sd.slot + '</span>' +
+          (sd.exists
+            ? '<span class="slot-sname">' + escHtml(sd.name || '') + '</span>'
+            : '<span class="slot-empty">— empty —</span>') +
+        '</div>' +
+        (ts ? '<div class="slot-ts">' + escHtml(ts) + '</div>' : '') +
+        '<div class="slot-btns">' +
+          '<button class="tb slot-save-btn" data-slot="' + sd.slot + '">Save</button>' +
+          '<button class="tb slot-load-btn" data-slot="' + sd.slot + '"' + (!sd.exists ? ' disabled' : '') + '>Load</button>' +
+        '</div>';
+      div.addEventListener('click', e => {
+        if (e.target.matches('button')) return;
+        activeSlot = sd.slot;
+        localStorage.setItem('gb_active_slot', activeSlot);
+        renderSlots();
+      });
+      list.appendChild(div);
+    });
+    list.querySelectorAll('.slot-save-btn').forEach(btn => {
+      btn.onclick = e => { e.stopPropagation(); doSaveSlot(parseInt(btn.dataset.slot)); };
+    });
+    list.querySelectorAll('.slot-load-btn').forEach(btn => {
+      btn.onclick = e => { e.stopPropagation(); doLoadSlot(parseInt(btn.dataset.slot)); };
+    });
+  }
+
+  function doSaveSlot(slot) {
+    const sd = slotData.find(s => s.slot === slot) || {};
+    const msg = sd.exists
+      ? 'Overwrite Slot ' + slot + (sd.name ? ': "' + sd.name + '"' : '') + '?\n\nNew name (leave blank to keep):'
+      : 'Save to Slot ' + slot + ':\n\nName (optional):';
+    const name = window.prompt(msg, sd.name || '');
+    if (name === null) return;
+    if (backend && backend.sendSaveSlot) backend.sendSaveSlot(slot, name.trim());
+    activeSlot = slot;
+    localStorage.setItem('gb_active_slot', activeSlot);
+  }
+
+  function doLoadSlot(slot) {
+    const sd = slotData.find(s => s.slot === slot);
+    if (!sd || !sd.exists) return;
+    const label = sd.name ? '"' + sd.name + '"' : 'Slot ' + slot;
+    if (!window.confirm('Load Slot ' + slot + ': ' + label + '?\n\nThis replaces the current game state.')) return;
+    if (backend && backend.sendLoadSlot) backend.sendLoadSlot(slot);
+    activeSlot = slot;
+    localStorage.setItem('gb_active_slot', activeSlot);
+    slotsOverlay.classList.remove('open');
+  }
+
+  /* ---- Settings drawer ---- */
+  document.getElementById('bmenu').onclick = () => sdrawer.classList.toggle('open');
+  /* Clicking on the game canvas closes the drawer */
+  cv.addEventListener('mousedown', () => sdrawer.classList.remove('open'));
+  cv.addEventListener('touchstart', () => sdrawer.classList.remove('open'), {passive:true});
+
+  /* ---- Slots modal ---- */
+  document.getElementById('bslots').onclick = () => {
+    renderSlots();
+    slotsOverlay.classList.add('open');
+  };
+  document.getElementById('slots-close').onclick = () => slotsOverlay.classList.remove('open');
+  slotsOverlay.addEventListener('click', e => {
+    if (e.target === slotsOverlay) slotsOverlay.classList.remove('open');
+  });
 
   /* Populate palette dropdown */
   PALETTES.forEach((p, i) => {
@@ -497,13 +654,16 @@ class WasmBackend {
       backend = new WasmBackend(mod);
       isWasm = true;
       brom.style.display = '';
-      btrans.style.display = 'none';   /* transport mode only applies to RemoteBackend */
+      document.getElementById('transport-row').style.display = 'none';
+      document.getElementById('wasm-saves').style.display = '';
+      document.getElementById('wasm-sep').style.display = '';
       updateStatus('Load a ROM');
     } else {
       const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
       backend = new RemoteBackend(proto + location.host + '/ws');
       brom.style.display = 'none';
-      btrans.style.display = '';
+      document.getElementById('bslots').style.display = '';
+      backend.onslotinfo = info => { slotData = info; renderSlots(); };
     }
     backend.onframe = renderFrame;
     backend.onstatus = updateStatus;
@@ -517,13 +677,15 @@ class WasmBackend {
 
   document.addEventListener('keydown', (e) => {
     if (e.key === 'F5') {
-      if (backend) backend.sendSave();
       e.preventDefault();
+      if (!isWasm) doSaveSlot(activeSlot);
+      else if (backend) backend.sendSave();
       return;
     }
     if (e.key === 'F8') {
-      if (backend) backend.sendLoad();
       e.preventDefault();
+      if (!isWasm) doLoadSlot(activeSlot);
+      else if (backend) backend.sendLoad();
       return;
     }
     if (e.key === 'f' || e.key === 'F') {
@@ -547,13 +709,13 @@ class WasmBackend {
     }
   });
 
-  document.getElementById('bsv').onclick = () => { if (backend) backend.sendSave(); };
-  document.getElementById('bld').onclick = () => { if (backend) backend.sendLoad(); };
   document.getElementById('brs').onclick = () => { if (backend) backend.sendReset(); };
   document.getElementById('bft').onclick = () => {
     if (backend) backend.setFast(!fast);
     setFastUi(!fast);
   };
+  document.getElementById('bsv').onclick = () => { if (backend) backend.sendSave(); };
+  document.getElementById('bld').onclick = () => { if (backend) backend.sendLoad(); };
   brom.onclick = () => {
     if (!isWasm || !backend || typeof backend.loadRom !== 'function') return;
     const input = document.createElement('input');

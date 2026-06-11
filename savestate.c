@@ -82,6 +82,7 @@
 #include <stdbool.h>
 #include <inttypes.h>
 #include <unistd.h>
+#include <time.h>
 
 typedef uint8_t byte;
 typedef uint16_t word;
@@ -293,10 +294,11 @@ static void get_string(const cbor_item_t *map, const char *key,
 /* ---- Number of fields in the map — keep in sync with MAP_* calls below ---- */
 #define SS_MAP_SIZE 76
 
-/* ---- save_state ---- */
+/* ---- save_state_internal: shared implementation ---- */
 
-bool save_state(const char *path) {
-    cbor_item_t *map = cbor_new_definite_map(SS_MAP_SIZE);
+static bool save_state_internal(const char *path, const char *slot_name) {
+    int has_meta = (slot_name && slot_name[0]) ? 1 : 0;
+    cbor_item_t *map = cbor_new_definite_map((size_t)(SS_MAP_SIZE + has_meta * 2));
     if (!map) { fprintf(stderr, "save_state: cbor_new_definite_map failed\n"); return false; }
 
     /*
@@ -398,6 +400,12 @@ bool save_state(const char *path) {
     MAP_U8  (map, "joypad",      joypad);
     MAP_BOOL(map, "in_bios",     inBios);
 
+    /* Optional slot metadata (only written when slot_name is non-empty) */
+    if (has_meta) {
+        MAP_STR(map, "slot_name", slot_name);
+        MAP_INT(map, "save_ts",   (int64_t)time(NULL));
+    }
+
     /* Serialize to buffer */
     uint8_t *buf = NULL;
     size_t buf_len = 0;
@@ -429,6 +437,9 @@ bool save_state(const char *path) {
     fprintf(stderr, "[savestate] saved %zu bytes to %s\n", buf_len, path);
     return true;
 }
+
+bool save_state(const char *path)                            { return save_state_internal(path, NULL); }
+bool save_state_slot(const char *path, const char *name)     { return save_state_internal(path, name); }
 
 /* ---- load_state ---- */
 
@@ -625,4 +636,48 @@ char *savestate_default_path(const char *rom_path, char *out, size_t out_size) {
     }
     strncat(out, ".cbor", out_size - strlen(out) - 1);
     return out;
+}
+
+char *savestate_slot_path(const char *rom_path, int slot, char *out, size_t out_size) {
+    /* Reserve room for ".slotN.cbor\0" (12 bytes) */
+    strncpy(out, rom_path, out_size - 13);
+    out[out_size - 13] = '\0';
+    char *dot = strrchr(out, '.');
+    char *slash = strrchr(out, '/');
+    if (dot && (!slash || dot > slash))
+        *dot = '\0';
+    char suffix[16];
+    snprintf(suffix, sizeof(suffix), ".slot%d.cbor", slot);
+    strncat(out, suffix, out_size - strlen(out) - 1);
+    return out;
+}
+
+bool slot_read_meta(const char *path, char *name_out, size_t name_size,
+                    int64_t *ts_out) {
+    if (name_out && name_size > 0) name_out[0] = '\0';
+    if (ts_out) *ts_out = 0;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    rewind(f);
+    if (sz <= 0 || sz > 4 * 1024 * 1024) { fclose(f); return false; }
+
+    uint8_t *buf = (uint8_t *)malloc((size_t)sz);
+    if (!buf) { fclose(f); return false; }
+    if ((long)fread(buf, 1, (size_t)sz, f) != sz) { free(buf); fclose(f); return false; }
+    fclose(f);
+
+    struct cbor_load_result res;
+    cbor_item_t *root = cbor_load(buf, (size_t)sz, &res);
+    free(buf);
+    if (!root) return false;
+
+    if (name_out) get_string(root, "slot_name", name_out, name_size);
+    if (ts_out)   *ts_out = get_int(root, "save_ts", 0);
+
+    cbor_decref(&root);
+    return true;
 }

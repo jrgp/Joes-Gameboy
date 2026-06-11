@@ -35,6 +35,13 @@
  *     [0x05]            — reset       (server sends a keyframe on next frame)
  *     [0x06]            — fast-mode toggle
  *     [0x07, mode]      — set transport mode: 0=RELIABLE (full frames), 1=FAST (tile-diff)
+ *     [0x08, slot, name_len, ...name]
+ *                       — save to slot N (1-5); name is UTF-8, name_len=0 for unnamed
+ *     [0x09, slot]      — load from slot N (1-5)
+ *
+ *   Server → Client (new):
+ *     [0x12] + JSON     — slot info update (sent on connect, after save/load)
+ *                         JSON: [{slot,exists,name,ts}, ...] for all SS_NUM_SLOTS slots
  */
 
 #include "ws_server.h"
@@ -48,6 +55,7 @@
 #include <stdbool.h>
 #include <time.h>
 #include <unistd.h>
+#include <inttypes.h>
 
 /* ---- Emulator interfaces (defined in gb.c) ---- */
 
@@ -112,10 +120,23 @@ static int     g_frames_since_keyframe = 0;
 /* Frame sequence counter (monotonically increasing, per-connection drop guard) */
 static uint32_t g_frame_seq = 1;
 
+/* ---- Slot info state ---- */
+
+/* JSON slot info buffer, pre-built by ws_build_slot_info().
+ * Layout: [LWS_PRE bytes padding][0x12][JSON bytes]                       */
+#define SLOT_JSON_BUF 2048
+static unsigned char g_slot_info_buf[LWS_PRE + SLOT_JSON_BUF];
+static int           g_slot_info_len;       /* payload bytes (type + JSON), 0 = not built */
+static uint32_t      g_slot_info_version = 1; /* incremented when slots change */
+
+static void ws_build_slot_info(void);
+static void ws_notify_all_slot_info(void);
+
 /* Send buffer (LWS_PRE headroom + payload) */
 static unsigned char g_send_buf[LWS_PRE + WS_SEND_BUF_MAX];
 
 static struct lws_context *g_context = NULL;
+static const struct lws_protocols *g_main_protocol = NULL;  /* set in ws_server_init */
 
 /* ---- Bandwidth statistics ---- */
 
@@ -142,13 +163,76 @@ typedef struct {
     bool             is_ws;
     bool             html_sent;
     uint32_t         last_sent_seq;
-    bool             needs_keyframe;    /* FAST mode: send full frame next tick */
-    transport_mode_t transport;         /* per-connection transport selection   */
+    bool             needs_keyframe;    /* FAST mode: send full frame next tick    */
+    transport_mode_t transport;         /* per-connection transport selection      */
+    uint32_t         last_slot_version; /* 0 on new conn → triggers slot info send */
 } per_session_t;
 
-/* ---- Forward declaration ---- */
+/* ---- Forward declarations ---- */
 
 static void ws_server_force_keyframe(void);
+static void ws_build_slot_info(void);
+static void ws_notify_all_slot_info(void);
+
+/* ---- Slot info helpers ---- */
+
+static void ws_build_slot_info(void) {
+    /* Build a JSON array describing all SS_NUM_SLOTS save slots and store it
+     * into g_slot_info_buf[LWS_PRE..] as: [0x12][JSON bytes].             */
+    char json[SLOT_JSON_BUF - 4];
+    int pos = 0;
+    json[pos++] = '[';
+
+    for (int s = 1; s <= SS_NUM_SLOTS; s++) {
+        char sp[4096], lp[4096];
+        savestate_slot_path(savestate_rom_path, s, sp, sizeof(sp));
+
+        bool exists = (savestate_rom_path[0] != '\0') && (access(sp, F_OK) == 0);
+        const char *rpath = sp;
+
+        /* Migration: if slot 1 not found but legacy game.cbor exists, expose it */
+        if (!exists && s == 1 && savestate_rom_path[0] != '\0') {
+            savestate_default_path(savestate_rom_path, lp, sizeof(lp));
+            if (access(lp, F_OK) == 0) { exists = true; rpath = lp; }
+        }
+
+        char name[128] = "";
+        int64_t ts = 0;
+        if (exists) slot_read_meta(rpath, name, sizeof(name), &ts);
+
+        /* JSON-escape the name string */
+        char esc[256]; int ei = 0;
+        for (int i = 0; name[i] && ei < 250; i++) {
+            unsigned char c = (unsigned char)name[i];
+            if (c == '"' || c == '\\') esc[ei++] = '\\';
+            else if (c < 0x20) { esc[ei++] = '\\'; esc[ei++] = 'u'; esc[ei++] = '0'; esc[ei++] = '0';
+                                  esc[ei++] = "0123456789abcdef"[c >> 4];
+                                  esc[ei++] = "0123456789abcdef"[c & 0xf]; continue; }
+            esc[ei++] = (char)c;
+        }
+        esc[ei] = '\0';
+
+        int n = snprintf(json + pos, sizeof(json) - (size_t)pos - 4,
+            "%s{\"slot\":%d,\"exists\":%s,\"name\":\"%s\",\"ts\":%" PRId64 "}",
+            pos > 1 ? "," : "", s, exists ? "true" : "false", esc, ts);
+        if (n > 0 && pos + n < (int)sizeof(json) - 4) pos += n;
+    }
+
+    if (pos < (int)sizeof(json) - 2) { json[pos++] = ']'; json[pos] = '\0'; }
+
+    g_slot_info_buf[LWS_PRE] = 0x12;
+    size_t jlen = (size_t)pos;
+    if (jlen > SLOT_JSON_BUF - 2) jlen = SLOT_JSON_BUF - 2;
+    memcpy(g_slot_info_buf + LWS_PRE + 1, json, jlen);
+    g_slot_info_len = (int)(jlen + 1);
+}
+
+static void ws_notify_all_slot_info(void) {
+    ws_build_slot_info();
+    g_slot_info_version++;
+    if (g_context && g_main_protocol)
+        lws_callback_on_writable_all_protocol(g_context, g_main_protocol);
+}
 
 /* ---- LWS callback ---- */
 
@@ -209,6 +293,8 @@ static int callback_gb(struct lws *wsi, enum lws_callback_reasons reason,
             pss->last_sent_seq  = 0;
             pss->needs_keyframe = true;    /* always send full frame on connect */
             pss->transport      = TRANSPORT_RELIABLE;
+            pss->last_slot_version = 0;    /* ensures slot info is sent on first writeable */
+            ws_build_slot_info();          /* refresh from disk for this connection */
             lws_callback_on_writable(wsi);
         }
         char peer[64] = "?";
@@ -279,6 +365,46 @@ static int callback_gb(struct lws *wsi, enum lws_callback_reasons reason,
             }
             break;
 
+        case 0x08: { /* Save to slot N with optional name */
+            if (len < 2) break;
+            int slot = (int)data[1];
+            if (slot < 1 || slot > SS_NUM_SLOTS) break;
+
+            char name[128] = "";
+            if (len >= 3) {
+                size_t nlen = data[2];
+                if (nlen > 64) nlen = 64;
+                if (len >= 3 + nlen) { memcpy(name, data + 3, nlen); name[nlen] = '\0'; }
+            }
+
+            char sp[4096];
+            savestate_slot_path(savestate_rom_path, slot, sp, sizeof(sp));
+            if (!save_state_slot(sp, name[0] ? name : NULL))
+                fprintf(stderr, "[ws] save slot %d failed: %s\n", slot, sp);
+            ws_notify_all_slot_info();
+            break;
+        }
+
+        case 0x09: { /* Load from slot N */
+            if (len < 2) break;
+            int slot = (int)data[1];
+            if (slot < 1 || slot > SS_NUM_SLOTS) break;
+
+            char sp[4096], lp[4096];
+            savestate_slot_path(savestate_rom_path, slot, sp, sizeof(sp));
+            /* Migration: slot 1 falls back to legacy game.cbor */
+            const char *rpath = sp;
+            if (slot == 1 && access(sp, F_OK) != 0) {
+                savestate_default_path(savestate_rom_path, lp, sizeof(lp));
+                if (access(lp, F_OK) == 0) rpath = lp;
+            }
+            if (!load_state(rpath))
+                fprintf(stderr, "[ws] load slot %d failed: %s\n", slot, rpath);
+            ws_server_force_keyframe();
+            ws_notify_all_slot_info();
+            break;
+        }
+
         default:
             break;
         }
@@ -288,6 +414,19 @@ static int callback_gb(struct lws *wsi, enum lws_callback_reasons reason,
     /* ---- WebSocket: socket ready to send ---- */
     case LWS_CALLBACK_SERVER_WRITEABLE: {
         if (!pss || !pss->is_ws) return 0;
+
+        /* Slot info takes priority — send first if client is out of date.
+         * lws_write is called at most once per WRITEABLE; if frame data is
+         * also pending we request another writable callback afterwards.    */
+        if (pss->last_slot_version != g_slot_info_version && g_slot_info_len > 0) {
+            lws_write(wsi, g_slot_info_buf + LWS_PRE,
+                      (size_t)g_slot_info_len, LWS_WRITE_BINARY);
+            pss->last_slot_version = g_slot_info_version;
+            if (pss->last_sent_seq != g_frame_seq)
+                lws_callback_on_writable(wsi);  /* come back for frame data */
+            return 0;
+        }
+
         if (pss->last_sent_seq == g_frame_seq) return 0;
 
         if (pss->transport == TRANSPORT_RELIABLE) {
@@ -356,6 +495,7 @@ bool ws_server_init(const char *bind_addr, int port)
         fprintf(stderr, "[ws] lws_create_context failed\n");
         return false;
     }
+    g_main_protocol = &protocols[0];
 
     g_stats.last_log = time(NULL);
     fprintf(stderr, "[ws] listening on port %d\n", port);
