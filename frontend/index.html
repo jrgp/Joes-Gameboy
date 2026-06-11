@@ -15,7 +15,7 @@ select.tb{padding:4px 6px;-webkit-appearance:none;appearance:none;cursor:pointer
 #st{font-size:11px;color:#555;margin-left:auto;padding-right:4px}
 #sw{flex:1 1 0;min-height:0;display:flex;align-items:center;justify-content:center;overflow:hidden}
 canvas{display:block;image-rendering:pixelated;image-rendering:crisp-edges;background:#111}
-#ctrl-canvas{flex:0 0 auto;display:block;width:100%;height:130px;background:#0a0a18;touch-action:none}
+#ctrl-canvas{flex:0 0 auto;display:block;width:100%;height:160px;background:#0a0a18;touch-action:none}
 #hint{flex:0 0 auto;font-size:11px;color:#555;text-align:center;padding:4px;width:100%}
 @media(min-width:540px){#ctrl-canvas{display:none}#hint{display:block}}
 @media(max-width:539px){#hint{display:none}}
@@ -504,7 +504,7 @@ class WasmBackend {
     cc.width = w;
     cc.height = cc.offsetHeight || 130;
     const h = cc.height;
-    CL.dpr = Math.min(w * 0.14, h * 0.44);
+    CL.dpr = Math.min(w * 0.18, h * 0.50);
     CL.dpx = w * 0.19;
     CL.dpy = h * 0.5;
     CL.ar = Math.min(w * 0.075, h * 0.26);
