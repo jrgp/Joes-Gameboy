@@ -16,3 +16,5 @@ ws_server_html.h
 build/
 *.dSYM/
 .DS_Store
+roms/
+tests/assets/

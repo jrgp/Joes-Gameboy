@@ -27,7 +27,7 @@ get_model_flag() {
     esac
 }
 
-for rom in roms/mooneye/acceptance/**/*.gb roms/mooneye/acceptance/*.gb; do
+for rom in tests/assets/mooneye-test-suite/acceptance/**/*.gb tests/assets/mooneye-test-suite/acceptance/*.gb; do
     [[ -f "$rom" ]] || continue
     name="${rom#roms/mooneye/acceptance/}"
     model_flag=$(get_model_flag "$rom")

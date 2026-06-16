@@ -7,6 +7,15 @@ LWS_LDFLAGS  := $(shell pkg-config --libs libwebsockets)
 CC      := gcc
 STRICT  := -Wall -Wextra -Wconversion -Wsign-conversion -Wshadow -Wundef -Werror
 
+# ---- Test asset configuration ----
+# Pinned to c-sp/game-boy-test-roms v7.0 (2024-02-25).
+# To update: change CSPTEST_VERSION and CSPTEST_SHA256, then run make clean-test-assets.
+CSPTEST_VERSION := v7.0
+CSPTEST_URL     := https://github.com/c-sp/game-boy-test-roms/releases/download/$(CSPTEST_VERSION)/game-boy-test-roms-$(CSPTEST_VERSION).zip
+CSPTEST_SHA256  := b9a9d7a1075aa35a3d07c07c34974048672d8520dca9e07a50178f5860c3832c
+TESTS_ASSETS    := tests/assets
+TESTS_STAMP     := $(TESTS_ASSETS)/.downloaded
+
 DEPS_DIR := deps
 DIST_DIR := dist
 
@@ -68,8 +77,32 @@ test_savestate: tests/test_savestate.c savestate.c savestate.h gb.c gb.h palette
 		-o tests/test_savestate_bin \
 		$(CBOR_LDFLAGS)
 
-test: gb
+test: gb test-assets
 	./tests/run_tests.sh
+	./tests/run_mooneye.sh
+
+# ---- Test asset download ----
+# Downloads and extracts the pinned c-sp/game-boy-test-roms bundle.
+# Stamp file prevents re-downloading on subsequent runs.
+test-assets: $(TESTS_STAMP)
+
+$(TESTS_STAMP):
+	@echo "[test-assets] Downloading c-sp/game-boy-test-roms $(CSPTEST_VERSION) ..."
+	@mkdir -p $(TESTS_ASSETS)
+	@curl -L --fail --progress-bar \
+	    "$(CSPTEST_URL)" -o $(TESTS_ASSETS)/roms.zip \
+	    || { echo "ERROR: download failed" >&2; rm -f $(TESTS_ASSETS)/roms.zip; exit 1; }
+	@printf "[test-assets] Verifying checksum ... "
+	@echo "$(CSPTEST_SHA256)  $(TESTS_ASSETS)/roms.zip" | sha256sum -c - \
+	    || { echo "ERROR: checksum mismatch — archive may be corrupt" >&2; rm -f $(TESTS_ASSETS)/roms.zip; exit 1; }
+	@echo "[test-assets] Extracting ..."
+	@cd $(TESTS_ASSETS) && unzip -q -o roms.zip
+	@rm $(TESTS_ASSETS)/roms.zip
+	@touch $(TESTS_STAMP)
+	@echo "[test-assets] Ready."
+
+clean-test-assets:
+	rm -rf $(TESTS_ASSETS)
 
 wasm-deps: $(CBOR_LIB)
 

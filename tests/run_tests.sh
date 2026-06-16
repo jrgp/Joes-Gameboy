@@ -61,18 +61,20 @@ run_suite() {
     fi
 }
 
+ASSETS="$ROOT/tests/assets"
+
 echo "=== blargg test suites ==="
 echo "Binary : $GB"
 echo "Cycles : $CYCLES"
 echo ""
 
-run_suite "cpu_instrs"   "$ROOT/roms/blargg"
-run_suite "mem_timing"   "$ROOT/roms/mem_timing"
-run_suite "mem_timing-2" "$ROOT/roms/mem_timing-2"
-run_suite "instr_timing" "$ROOT/roms/instr_timing"
-run_suite "halt_bug"     "$ROOT/roms/halt_bug.gb"
-run_suite "interrupt_time" "$ROOT/roms/interrupt_time"
-run_suite "oam_bug"      "$ROOT/roms/oam_bug"
+run_suite "cpu_instrs"   "$ASSETS/blargg/cpu_instrs/individual"
+run_suite "mem_timing"   "$ASSETS/blargg/mem_timing"
+run_suite "mem_timing-2" "$ASSETS/blargg/mem_timing-2"
+run_suite "instr_timing" "$ASSETS/blargg/instr_timing"
+run_suite "halt_bug"     "$ASSETS/blargg/halt_bug.gb"
+run_suite "interrupt_time" "$ASSETS/blargg/interrupt_time"
+run_suite "oam_bug"      "$ASSETS/blargg/oam_bug"
 
 echo "=== Results: $pass/$total passed ==="
 
