@@ -1,4 +1,6 @@
-# cgb
+<img src="icon.png" width="100" align="left" style="margin-right:16px">
+
+# Joe's Gameboy
 
 A Game Boy DMG emulator written in C
 
