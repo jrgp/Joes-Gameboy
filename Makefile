@@ -80,6 +80,7 @@ test_savestate: tests/test_savestate.c savestate.c savestate.h gb.c gb.h palette
 test: gb test-assets
 	./tests/run_tests.sh
 	./tests/run_mooneye.sh
+	./tests/run_cgb_tests.sh
 
 # ---- Test asset download ----
 # Downloads and extracts the pinned c-sp/game-boy-test-roms bundle.

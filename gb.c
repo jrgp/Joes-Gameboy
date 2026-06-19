@@ -76,6 +76,20 @@ int  dma_source = 0;           // source start address
 // CGB double-speed mode state (KEY1/$FF4D)
 bool double_speed = false;
 
+// CGB VRAM bank select (VBK/$FF4F): 0 or 1.  Two 8KB banks at $8000-$9FFF.
+// Bank 1 is used for tile attributes in CGB mode; bank 0 is compatible with DMG.
+static int cgb_vram_bank = 0;
+
+// CGB WRAM bank select (SVBK/$FF70): 1-7 (0 maps to bank 1).  Banks 1-7 at $D000-$DFFF.
+static int cgb_wram_bank = 1;
+
+// True when CGB color-mode features are active:
+//   - Running on GBC hardware (gb_model == MODEL_GBC), AND
+//   - Cartridge header signals CGB support ($0143 = $80 CGB-enhanced or $C0 CGB-only).
+// In DMG-compatibility mode (DMG cart on GBC), CGB color registers (KEY1, SVBK, palette
+// DMA, etc.) return $FF.  VBK and a few hardware registers remain accessible regardless.
+#define CGB_COLOR_MODE() (gb_model == MODEL_GBC && (cart_cgb_flag & 0x80u))
+
 // Minimal APU: only length counters for channels 1 and 2 (needed for interrupt_time test)
 // Length counter fires at 256 Hz real-time = 16384 T-cycles at 1x, 32768 T-cycles at 2x.
 bool apu_ch1_active = false;
@@ -1735,10 +1749,43 @@ byte mem_read(int pos) {
                 // bits 3-0: button states (0=pressed).
                 return (joypad & 0x30) | (joypad_read() & 0x0F) | 0xC0;
             case 0xFF4D:
-                // KEY1: CGB speed switch register - only accessible on CGB hardware
-                // On DMG, this register doesn't exist and reads as $FF
-                if (cart_cgb_flag == 0xC0)
+                // KEY1: speed switch — only in CGB color mode (not DMG compat)
+                if (CGB_COLOR_MODE())
                     return (double_speed ? 0x80 : 0x00) | (RAM[0xFF4D] & 0x01) | 0x7E;
+                return 0xFF;
+            case 0xFF4F:
+                // VBK: VRAM bank — accessible on GBC hardware regardless of cart type
+                if (gb_model == MODEL_GBC)
+                    return (byte)((cgb_vram_bank & 0x01) | 0xFE);
+                return 0xFF;
+            case 0xFF51: case 0xFF52: case 0xFF53: case 0xFF54:
+                // HDMA1-4: DMA source/dest (CGB color mode only; reads return 0xFF)
+                return CGB_COLOR_MODE() ? 0xFF : 0xFF;
+            case 0xFF55:
+                // HDMA5: DMA length/mode/start; $FF = no active transfer
+                return CGB_COLOR_MODE() ? (byte)(RAM[0xFF55] | 0x80) : 0xFF;
+            case 0xFF56:
+                // RP: infrared (CGB color mode only; stub)
+                return CGB_COLOR_MODE() ? 0x02 : 0xFF;
+            case 0xFF68:
+                // BCPS: BG color palette spec (CGB color mode only)
+                return CGB_COLOR_MODE() ? RAM[0xFF68] | 0x40 : 0xFF;
+            case 0xFF69:
+                // BCPD: BG color palette data (CGB color mode only; stub → 0xFF)
+                return CGB_COLOR_MODE() ? 0xFF : 0xFF;
+            case 0xFF6A:
+                // OCPS: OBJ color palette spec (CGB color mode only)
+                return CGB_COLOR_MODE() ? RAM[0xFF6A] | 0x40 : 0xFF;
+            case 0xFF6B:
+                // OCPD: OBJ color palette data (CGB color mode only; stub → 0xFF)
+                return CGB_COLOR_MODE() ? 0xFF : 0xFF;
+            case 0xFF6C:
+                // OPRI: OBJ priority mode (CGB only)
+                return gb_model == MODEL_GBC ? (RAM[0xFF6C] | 0xFE) : 0xFF;
+            case 0xFF70:
+                // SVBK: WRAM bank select (CGB color mode only)
+                if (CGB_COLOR_MODE())
+                    return (byte)((cgb_wram_bank & 0x07) | 0xF8);
                 return 0xFF;
             case 0xFF26: // NR52: sound master control; bit0=ch1, bit1=ch2 active
                 return (RAM[0xFF26] & 0x80) |
@@ -1921,8 +1968,56 @@ void mem_write(int pos, byte data) {
             break;
         }
         case 0xFF4D:
-            // KEY1: only bit 0 (arm speed switch) is writable
-            RAM[0xFF4D] = data & 0x01;
+            // KEY1: speed switch arm (CGB color mode only)
+            if (CGB_COLOR_MODE())
+                RAM[0xFF4D] = data & 0x01;
+            break;
+        case 0xFF4F:
+            // VBK: VRAM bank (GBC hardware always, even in DMG compat mode)
+            if (gb_model == MODEL_GBC)
+                cgb_vram_bank = data & 0x01;
+            break;
+        case 0xFF51: case 0xFF52: case 0xFF53: case 0xFF54: case 0xFF55:
+            // HDMA1-5: DMA registers (CGB color mode only)
+            if (CGB_COLOR_MODE())
+                RAM[pos] = data;
+            break;
+        case 0xFF56:
+            // RP: infrared (CGB color mode only)
+            if (CGB_COLOR_MODE())
+                RAM[0xFF56] = data & 0xC1;
+            break;
+        case 0xFF68:
+            // BCPS: BG color palette spec (CGB color mode only)
+            if (CGB_COLOR_MODE())
+                RAM[0xFF68] = data;
+            break;
+        case 0xFF69:
+            // BCPD: BG color palette data (CGB color mode only)
+            if (CGB_COLOR_MODE())
+                RAM[0xFF69] = data;
+            break;
+        case 0xFF6A:
+            // OCPS: OBJ color palette spec (CGB color mode only)
+            if (CGB_COLOR_MODE())
+                RAM[0xFF6A] = data;
+            break;
+        case 0xFF6B:
+            // OCPD: OBJ color palette data (CGB color mode only)
+            if (CGB_COLOR_MODE())
+                RAM[0xFF6B] = data;
+            break;
+        case 0xFF6C:
+            // OPRI: OBJ priority mode (CGB hardware)
+            if (gb_model == MODEL_GBC)
+                RAM[0xFF6C] = data & 0x01;
+            break;
+        case 0xFF70:
+            // SVBK: WRAM bank (CGB color mode only; bits 2:0, 0→bank 1)
+            if (CGB_COLOR_MODE()) {
+                cgb_wram_bank = (data & 0x07);
+                if (cgb_wram_bank == 0) cgb_wram_bank = 1;
+            }
             break;
         // APU channel 1 registers
         case 0xFF11: // NR11: length/duty
@@ -2028,6 +2123,8 @@ void mem_init(void){
     serial_out_byte = 0;
     blargg_done = false;
     double_speed = false;
+    cgb_vram_bank = 0;
+    cgb_wram_bank = 1;
     RAM[0xFF4D] = 0;
     apu_ch1_active = false;
     apu_ch1_length_enable = false;
@@ -2104,6 +2201,12 @@ void cpu_fake_init(void){
     halt_bug_active = false;
     inBios = false;
 
+    // Auto-detect CGB mode: if the cartridge header marks this as CGB-only
+    // ($0143=$C0) and no explicit model has been chosen (still DMG), switch
+    // to CGB.  This lets CGB-only ROMs boot correctly without --model cgb.
+    if (cart_cgb_flag == 0xC0 && gb_model == MODEL_DMG)
+        gb_model = MODEL_GBC;
+
     // Set post-boot-ROM register state based on hardware model.
     // Values from Pan Docs and mooneye test suite documentation.
     switch (gb_model) {
@@ -2135,12 +2238,22 @@ void cpu_fake_init(void){
             apu_ch1_active = false;  // SGB2 boot ROM does not play a chime
             break;
         case MODEL_GBC:
-            // Game Boy Color: A=$11 (signals CGB hardware to games).
-            A = 0x11; F = 0x80; B = 0x00; C = 0x00; D = 0xFF; E = 0x56; H = 0x00; L = 0x0D;
+            // Game Boy Color post-boot register state.
+            // CPU registers: A=$11 (CGB signal), F=$80 (Z), B=0, C=$13 (same as DMG),
+            // D=$00, E=$D8, H=$01, L=$4D.  Values confirmed by Pan Docs and SameBoy.
+            // Note: D=$FF, E=$56, H=$00, L=$0D are CGB0 (first revision) values;
+            // ABCDE (common) revision uses the DMG-compatible set below.
+            A = 0x11; F = 0x80; B = 0x00; C = 0x13; D = 0x00; E = 0xD8; H = 0x01; L = 0x4D;
             // Derived from mooneye boot_div-cgbABCDE (N=27 preamble): timer_internal=0x2674.
             timer_internal = 0x2674;
-            // GBC bootrom leaves P1 with neither row selected (bits 5-4 = 1).
+            // GBC boot ROM leaves P1 with neither row selected (bits 5-4 = 1).
             joypad_write(0x30);
+            // Initialize CGB-specific registers to post-boot values.
+            cgb_vram_bank = 0;   // VBK=$FF4F: bank 0 active (reads as $FE)
+            cgb_wram_bank = 1;   // SVBK=$FF70: bank 1 active (reads as $F9)
+            RAM[0xFF4F] = 0;     // VBK stored value (not directly used in reads; see mem_read)
+            RAM[0xFF70] = 1;     // SVBK stored value
+            RAM[0xFF6C] = 0;     // OPRI: DMG-compatible priority mode
             break;
         default: // MODEL_DMG (DMG-ABC)
             // CGB-only ROMs ($0143=$C0) expect A=$11; DMG/CGB-enhanced use $01.
@@ -2714,9 +2827,9 @@ void exec_op(byte opcode){
     // STOP
     case 0x10:
       cpu_read_next(); // consume 0x00 operand
-      // CGB speed switch: if KEY1 bit 0 is armed, toggle double-speed mode
-      fprintf(stderr, "[STOP] PC=%04X KEY1=%02X\n", PC, RAM[0xFF4D]);
-      if (RAM[0xFF4D] & 0x01) {
+      // CGB speed switch: only in CGB color mode (not DMG compat)
+      if (CGB_COLOR_MODE() && (RAM[0xFF4D] & 0x01)) {
+          fprintf(stderr, "[STOP] PC=%04X KEY1=%02X → speed switch\n", PC, RAM[0xFF4D]);
           double_speed = !double_speed;
           RAM[0xFF4D] = 0;  // clear arm bit; bit 7 updated via mem_read
           cycles += 2050 * 4;  // 2050 M-cycle stall per Pan Docs
