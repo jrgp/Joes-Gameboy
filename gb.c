@@ -1627,10 +1627,14 @@ void apu_step(int cpu_cycles) {
     int period = double_speed ? 32768 : 16384;
     while (apu_length_cycles >= period) {
         apu_length_cycles -= period;
-        if (apu_ch1_active && apu_ch1_length_enable) {
+        // On CGB, length counters clock even for inactive (disabled) channels.
+        // On DMG, length only clocks while the channel is active.
+        bool ch1_len = apu_ch1_length_enable && (apu_ch1_active || gb_model == MODEL_GBC);
+        bool ch2_len = apu_ch2_length_enable && (apu_ch2_active || gb_model == MODEL_GBC);
+        if (ch1_len) {
             if (--apu_ch1_length <= 0) apu_ch1_active = false;
         }
-        if (apu_ch2_active && apu_ch2_length_enable) {
+        if (ch2_len) {
             if (--apu_ch2_length <= 0) apu_ch2_active = false;
         }
     }
@@ -2072,6 +2076,7 @@ void mem_write(int pos, byte data) {
             break;
         case 0xFF12: // NR12: volume/envelope (DAC on if bits 7-3 != 0)
             RAM[pos] = data;
+            if ((data & 0xF8) == 0) apu_ch1_active = false;  // DAC disabled → silence ch1
             break;
         case 0xFF14: // NR14: freq hi + trigger + length enable
             RAM[pos] = data;
@@ -2089,6 +2094,7 @@ void mem_write(int pos, byte data) {
             break;
         case 0xFF17: // NR22: volume/envelope
             RAM[pos] = data;
+            if ((data & 0xF8) == 0) apu_ch2_active = false;  // DAC disabled → silence ch2
             break;
         case 0xFF19: // NR24: freq hi + trigger + length enable
             RAM[pos] = data;
