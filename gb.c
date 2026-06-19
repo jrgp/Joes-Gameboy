@@ -2082,7 +2082,10 @@ void mem_write(int pos, byte data) {
             RAM[pos] = data;
             apu_ch1_length_enable = (data >> 6) & 1;
             if (data & 0x80) { // trigger bit
-                apu_ch1_active = true;
+                // DAC must be on (NR12 bits 7:3 non-zero) to enable channel on trigger
+                if (RAM[0xFF12] & 0xF8) {
+                    apu_ch1_active = true;
+                }
                 if (apu_ch1_length == 0) apu_ch1_length = 64;
                 apu_length_cycles = 0; // sync phase on trigger
             }
@@ -2100,7 +2103,10 @@ void mem_write(int pos, byte data) {
             RAM[pos] = data;
             apu_ch2_length_enable = (data >> 6) & 1;
             if (data & 0x80) { // trigger bit
-                apu_ch2_active = true;
+                // DAC must be on (NR22 bits 7:3 non-zero) to enable channel on trigger
+                if (RAM[0xFF17] & 0xF8) {
+                    apu_ch2_active = true;
+                }
                 if (apu_ch2_length == 0) apu_ch2_length = 64;
                 apu_length_cycles = 0; // sync phase on trigger
             }
