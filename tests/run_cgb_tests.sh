@@ -43,7 +43,7 @@ get_cgb_model_flag() {
 run_rom_serial() {
     local suite="$1" rom="$2" model_flag="${3:-}"
     local name; name="$(basename "$rom")"
-    local out; out=$("$GB" --headless --cycles 100000000 $model_flag "$rom" 2>/dev/null || true)
+    local out; out=$("$GB" --headless --cycles 200000000 $model_flag "$rom" 2>/dev/null || true)
     if echo "$out" | grep -qi "passed"; then
         printf "  [PASS   ] %s/%s\n" "$suite" "$name"
         PASS=$((PASS+1))

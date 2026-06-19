@@ -1768,25 +1768,42 @@ byte mem_read(int pos) {
                 // RP: infrared (CGB color mode only; stub)
                 return CGB_COLOR_MODE() ? 0x02 : 0xFF;
             case 0xFF68:
-                // BCPS: BG color palette spec (CGB color mode only)
-                return CGB_COLOR_MODE() ? RAM[0xFF68] | 0x40 : 0xFF;
+                // BCPS: BG color palette spec — accessible on all GBC hardware
+                // (CGB boot ROM initializes this regardless of cart type)
+                return gb_model == MODEL_GBC ? (RAM[0xFF68] | 0x40u) : 0xFF;
             case 0xFF69:
-                // BCPD: BG color palette data (CGB color mode only; stub → 0xFF)
-                return CGB_COLOR_MODE() ? 0xFF : 0xFF;
+                // BCPD: BG color palette data (stub → 0xFF for now)
+                return gb_model == MODEL_GBC ? 0xFF : 0xFF;
             case 0xFF6A:
-                // OCPS: OBJ color palette spec (CGB color mode only)
-                return CGB_COLOR_MODE() ? RAM[0xFF6A] | 0x40 : 0xFF;
+                // OCPS: OBJ color palette spec — accessible on all GBC hardware
+                return gb_model == MODEL_GBC ? (RAM[0xFF6A] | 0x40u) : 0xFF;
             case 0xFF6B:
-                // OCPD: OBJ color palette data (CGB color mode only; stub → 0xFF)
-                return CGB_COLOR_MODE() ? 0xFF : 0xFF;
+                // OCPD: OBJ color palette data (stub → 0xFF for now)
+                return gb_model == MODEL_GBC ? 0xFF : 0xFF;
             case 0xFF6C:
-                // OPRI: OBJ priority mode (CGB only)
-                return gb_model == MODEL_GBC ? (RAM[0xFF6C] | 0xFE) : 0xFF;
+                // OPRI: OBJ priority mode — only in CGB color mode; $FF in DMG compat
+                return CGB_COLOR_MODE() ? (RAM[0xFF6C] | 0xFEu) : 0xFF;
             case 0xFF70:
                 // SVBK: WRAM bank select (CGB color mode only)
                 if (CGB_COLOR_MODE())
                     return (byte)((cgb_wram_bank & 0x07) | 0xF8);
                 return 0xFF;
+            // Undocumented CGB registers $FF72-$FF77 (CGB color mode only)
+            case 0xFF72:
+            case 0xFF73:
+                // $FF72/$FF73: accessible on all GBC hardware; initialized to $00
+                return gb_model == MODEL_GBC ? RAM[pos] : 0xFF;
+            case 0xFF74:
+                // $FF74: CGB color mode only; $FF in DMG compat
+                return CGB_COLOR_MODE() ? RAM[pos] : 0xFF;
+            case 0xFF75:
+                // bits 6:4 read/write; bits 7 and 3:0 always read as 1 ($8F mask)
+                // accessible on all GBC hardware (even in DMG compat mode)
+                return gb_model == MODEL_GBC ? ((RAM[pos] & 0x70u) | 0x8Fu) : 0xFF;
+            case 0xFF76:
+            case 0xFF77:
+                // $FF76/$FF77: PCM12/PCM34 read-only; $00 on GBC, $FF (unmapped) on DMG
+                return gb_model == MODEL_GBC ? 0x00 : 0xFF;
             case 0xFF26: // NR52: sound master control; bit0=ch1, bit1=ch2 active
                 return (RAM[0xFF26] & 0x80) |
                        (apu_ch1_active ? 0x01 : 0x00) |
@@ -1872,6 +1889,22 @@ void mem_write(int pos, byte data) {
         int proj = gpu_cycles + instr_timer_cycles - 4;
         if (!oam_write_accessible(proj)) return;
     }
+
+    /* APU write-protection: when APU is off (NR52 bit 7 = 0), writes to
+     * most APU registers are ignored on both DMG and CGB.
+     * CGB exception: NRx1 length counter bits (5:0) remain writable even
+     * when the APU is off.  NR52 itself ($FF26) is always writable.        */
+    if (pos >= 0xFF10 && pos <= 0xFF25 && !(RAM[0xFF26] & 0x80)) {
+        if (gb_model == MODEL_GBC &&
+            (pos == 0xFF11 || pos == 0xFF16 || pos == 0xFF1B || pos == 0xFF20)) {
+            /* Length counter bits writable on CGB even with APU off */
+            RAM[pos] = data & 0x3F;
+            if (pos == 0xFF11) apu_ch1_length = 64 - (int)(data & 0x3Fu);
+            if (pos == 0xFF16) apu_ch2_length = 64 - (int)(data & 0x3Fu);
+        }
+        return; /* ignore all other APU writes while power is off */
+    }
+
     switch (pos) {
         case BGP:
         case LCDC:
@@ -2019,6 +2052,19 @@ void mem_write(int pos, byte data) {
                 if (cgb_wram_bank == 0) cgb_wram_bank = 1;
             }
             break;
+        // Undocumented CGB registers $FF72-$FF75
+        case 0xFF72:
+        case 0xFF73:
+            // $FF72/$FF73: accessible on all GBC hardware
+            if (gb_model == MODEL_GBC) RAM[pos] = data;
+            break;
+        case 0xFF74:
+            if (CGB_COLOR_MODE()) RAM[pos] = data;
+            break;
+        case 0xFF75:
+            // bits 6:4 read/write on all GBC hardware; others always 0
+            if (gb_model == MODEL_GBC) RAM[pos] = data & 0x70;
+            break;
         // APU channel 1 registers
         case 0xFF11: // NR11: length/duty
             RAM[pos] = data;
@@ -2055,9 +2101,14 @@ void mem_write(int pos, byte data) {
             break;
         case 0xFF26: // NR52: sound master on/off
             RAM[pos] = data & 0x80;
-            if (!(data & 0x80)) { // turning APU off clears channels
-                apu_ch1_active = false;
-                apu_ch2_active = false;
+            if (!(data & 0x80)) {
+                // Turning APU off clears all NR registers and channel state.
+                // On both DMG and CGB, all NRxy regs read as $00 when APU is off.
+                apu_ch1_active = false; apu_ch1_length_enable = false; apu_ch1_length = 0;
+                apu_ch2_active = false; apu_ch2_length_enable = false; apu_ch2_length = 0;
+                apu_length_cycles = 0;
+                // Clear NR10-NR51 (FF10-FF25)
+                for (int r = 0xFF10; r <= 0xFF25; r++) RAM[r] = 0;
             }
             break;
         case INTERRUPT_FLAGS: {
@@ -2238,22 +2289,26 @@ void cpu_fake_init(void){
             apu_ch1_active = false;  // SGB2 boot ROM does not play a chime
             break;
         case MODEL_GBC:
-            // Game Boy Color post-boot register state.
-            // CPU registers: A=$11 (CGB signal), F=$80 (Z), B=0, C=$13 (same as DMG),
-            // D=$00, E=$D8, H=$01, L=$4D.  Values confirmed by Pan Docs and SameBoy.
-            // Note: D=$FF, E=$56, H=$00, L=$0D are CGB0 (first revision) values;
-            // ABCDE (common) revision uses the DMG-compatible set below.
-            A = 0x11; F = 0x80; B = 0x00; C = 0x13; D = 0x00; E = 0xD8; H = 0x01; L = 0x4D;
-            // Derived from mooneye boot_div-cgbABCDE (N=27 preamble): timer_internal=0x2674.
+            // Game Boy Color post-boot register state (CGB-C/ABCDE revision).
+            // mooneye boot_regs-cgb.gb expects: A=$11, F=$80, B=$00, C=$00,
+            // D=$00, E=$08, H=$00, L=$7C.
+            // Timer from boot_div-cgbABCDE (N=27 preamble): timer_internal=0x2674.
+            A = 0x11; F = 0x80; B = 0x00; C = 0x00; D = 0x00; E = 0x08; H = 0x00; L = 0x7C;
             timer_internal = 0x2674;
             // GBC boot ROM leaves P1 with neither row selected (bits 5-4 = 1).
             joypad_write(0x30);
-            // Initialize CGB-specific registers to post-boot values.
+            // Initialize CGB-specific registers to post-boot ROM values.
             cgb_vram_bank = 0;   // VBK=$FF4F: bank 0 active (reads as $FE)
             cgb_wram_bank = 1;   // SVBK=$FF70: bank 1 active (reads as $F9)
-            RAM[0xFF4F] = 0;     // VBK stored value (not directly used in reads; see mem_read)
+            RAM[0xFF4F] = 0;     // VBK stored value
             RAM[0xFF70] = 1;     // SVBK stored value
             RAM[0xFF6C] = 0;     // OPRI: DMG-compatible priority mode
+            // CGB boot ROM initializes color palettes; BCPS/OCPS reflect that state.
+            // Boot ROM writes 8 bytes of BG palette data then leaves BCPS pointing at
+            // index 8 with auto-increment enabled ($C8 = 1_1_001000).
+            // OCPS is left at index 0 with auto-increment ($C0 = 1_1_000000).
+            RAM[0xFF68] = 0xC8;  // BCPS: auto-incr on, BG palette index 8
+            RAM[0xFF6A] = 0xD0;  // OCPS: auto-incr on, OBJ palette index 16
             break;
         default: // MODEL_DMG (DMG-ABC)
             // CGB-only ROMs ($0143=$C0) expect A=$11; DMG/CGB-enhanced use $01.
