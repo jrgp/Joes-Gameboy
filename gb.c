@@ -2045,20 +2045,24 @@ byte mem_read(int pos) {
                 return RAM[pos] | 0x80;
             case 0xFF11: // NR11: duty (bits 7:6) readable; length (bits 5:0) write-only → read as 1
                 return (RAM[pos] & 0xC0) | 0x3F;
+            case 0xFF12: // NR12: all bits readable
+                return RAM[pos];
             case 0xFF13: // NR13: frequency lo — write-only
                 return 0xFF;
             case 0xFF14: // NR14: length_enable (bit 6) readable; rest read as 1
                 return (RAM[pos] & 0x40) | 0xBF;
             case 0xFF16: // NR21: same structure as NR11
                 return (RAM[pos] & 0xC0) | 0x3F;
+            case 0xFF17: // NR22: all bits readable
+                return RAM[pos];
             case 0xFF18: // NR23: frequency lo — write-only
                 return 0xFF;
             case 0xFF19: // NR24: same structure as NR14
                 return (RAM[pos] & 0x40) | 0xBF;
-            case 0xFF1B: // NR31: length — write-only
-                return 0xFF;
             case 0xFF1A: // NR30: bits 6-0 always 1
                 return RAM[pos] | 0x7F;
+            case 0xFF1B: // NR31: length — write-only
+                return 0xFF;
             case 0xFF1C: // NR32: bits 7 and 4-0 always 1
                 return RAM[pos] | 0x9F;
             case 0xFF1D: // NR33: frequency lo — write-only
@@ -2067,13 +2071,22 @@ byte mem_read(int pos) {
                 return (RAM[pos] & 0x40) | 0xBF;
             case 0xFF20: // NR41: length counter (bits 5:0) write-only; bits 7:6 unused → all read as 1
                 return 0xFF;
+            case 0xFF21: // NR42: all bits readable
+                return RAM[pos];
+            case 0xFF22: // NR43: all bits readable
+                return RAM[pos];
             case 0xFF23: // NR44: length_enable (bit 6) + bit 7 always 1; bits 5:0 always 1
                 return (RAM[pos] & 0x40) | 0xBF;
+            case 0xFF24: // NR50: master volume — all bits readable
+                return RAM[pos];
+            case 0xFF25: // NR51: sound panning — all bits readable
+                return RAM[pos];
             // Unmapped I/O: always return 0xFF
             case 0xFF03:
             case 0xFF08: case 0xFF09: case 0xFF0A: case 0xFF0B:
             case 0xFF0C: case 0xFF0D: case 0xFF0E:
-            case 0xFF15: case 0xFF1F:
+            case 0xFF15: // unused between ch1 and ch2
+            case 0xFF1F: // unused between ch3 and ch4
             case 0xFF27: case 0xFF28: case 0xFF29:
             case 0xFF2A: case 0xFF2B: case 0xFF2C: case 0xFF2D: case 0xFF2E: case 0xFF2F:
                 return 0xFF;
