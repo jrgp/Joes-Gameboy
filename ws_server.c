@@ -16,7 +16,8 @@
  *   Server → Client:
  *     [0x01] + 5760 bytes      — DMG full frame (2bpp, palette indices 0-3).
  *     [0x10] + count16 + tiles — DMG tile update batch (Fast transport only).
- *     [0x11] + 69120 bytes     — CGB full frame (RGB888, 160×144×3 bytes, R-G-B order).
+ *     [0x11] + 69120 bytes     — CGB full frame (RGB888, 160×144×3 bytes, uncompressed).
+ *     [0x14] + N bytes         — CGB compressed frame (zlib/deflate of 69120 byte RGB888).
  *     [0x12] + JSON            — Slot info update.
  *     [0x13, mode]             — Mode announcement (0=DMG, 1=CGB); sent on connect.
  *
@@ -54,6 +55,7 @@ extern bool gb_is_cgb_mode(void);
 /* ---- Embedded HTML frontend (generated from frontend/index.html) ---- */
 
 #include "ws_server_html.h"
+#include <zlib.h>
 
 /* ---- Tile-diff constants ---- */
 
@@ -76,6 +78,7 @@ extern bool gb_is_cgb_mode(void);
 #define MSG_TILE_BATCH  0x10   /* DMG: tile-diff update batch                */
 #define MSG_CGB_FRAME   0x11   /* CGB: RGB888 full frame (160×144×3 bytes)   */
 #define MSG_MODE_INFO   0x13   /* mode announcement: [0x13, mode] (0=DMG,1=CGB) */
+#define MSG_CGB_ZFRAME  0x14   /* CGB: zlib-deflate compressed RGB888 frame  */
 
 /* ---- Wire format sizes ---- */
 
@@ -93,7 +96,11 @@ extern bool gb_is_cgb_mode(void);
 
 /* CGB full frame: type byte + 160×144×3 bytes of RGB888 */
 #define WS_CGB_PIXELS    (160 * 144 * 3)       /* 69120 bytes */
-#define WS_CGB_FRAME_BYTES (1 + WS_CGB_PIXELS) /* 69121 bytes */
+#define WS_CGB_FRAME_BYTES (1 + WS_CGB_PIXELS) /* 69121 bytes (uncompressed) */
+
+/* CGB compressed frame: type byte + zlib-deflated RGB888.
+ * Worst case: compressBound(69120) ≈ 69230 bytes; use 80KB to be safe. */
+#define WS_CGB_ZBUF_MAX  (1 + 80000)
 
 /* ---- Global framebuffer state ---- */
 
@@ -103,6 +110,10 @@ static uint8_t g_prev_2bpp[WS_FRAME_2BPP_PAYLOAD];
 
 /* CGB: current RGB888 frame (R,G,B triples, row-major) */
 static uint8_t g_curr_rgb[WS_CGB_PIXELS];
+
+/* CGB: zlib-compressed RGB888 frame (built in ws_server_notify_frame) */
+static uint8_t g_curr_zrgb[WS_CGB_ZBUF_MAX];
+static size_t  g_curr_zrgb_len;   /* compressed payload bytes (including type byte) */
 
 /* Current rendering mode (updated in ws_server_notify_frame) */
 static bool g_is_cgb = false;
@@ -134,9 +145,9 @@ static void ws_build_slot_info(void);
 static void ws_notify_all_slot_info(void);
 
 /* Send buffers (LWS_PRE headroom + payload) */
-static unsigned char g_send_buf[LWS_PRE + WS_SEND_BUF_MAX];         /* DMG frames  */
-static unsigned char g_cgb_send_buf[LWS_PRE + WS_CGB_FRAME_BYTES];  /* CGB frames  */
-static unsigned char g_mode_buf[LWS_PRE + 2];                        /* mode announ */
+static unsigned char g_send_buf[LWS_PRE + WS_SEND_BUF_MAX];       /* DMG frames    */
+static unsigned char g_cgb_send_buf[LWS_PRE + WS_CGB_ZBUF_MAX];   /* CGB frames    */
+static unsigned char g_mode_buf[LWS_PRE + 2];                      /* mode announce */
 
 static struct lws_context *g_context = NULL;
 static const struct lws_protocols *g_main_protocol = NULL;  /* set in ws_server_init */
@@ -443,9 +454,9 @@ static int callback_gb(struct lws *wsi, enum lws_callback_reasons reason,
         if (pss->last_sent_seq == g_frame_seq) return 0;
 
         if (g_is_cgb) {
-            /* CGB mode: always send full RGB888 frame. */
+            /* CGB mode: send zlib-compressed (or uncompressed fallback) RGB888 frame. */
             lws_write(wsi, g_cgb_send_buf + LWS_PRE,
-                      (size_t)WS_CGB_FRAME_BYTES, LWS_WRITE_BINARY);
+                      g_curr_zrgb_len, LWS_WRITE_BINARY);
         } else if (pss->transport == TRANSPORT_RELIABLE) {
             /* DMG reliable mode: always send the complete framebuffer. */
             g_send_buf[LWS_PRE] = MSG_FULL_FRAME;
@@ -483,21 +494,6 @@ static int callback_gb(struct lws *wsi, enum lws_callback_reasons reason,
 
 /* ---- WebSocket extensions ---- */
 
-/* Offer permessage-deflate (RFC 7692) to all WebSocket clients.
- * This is negotiated in the WS handshake via:
- *   Sec-WebSocket-Extensions: permessage-deflate
- * LWS handles deflate/inflate transparently — no wire format changes needed.
- * client_no_context_takeover: each message compressed independently (lower
- * memory, negligible penalty for our large binary frames). */
-static const struct lws_extension g_extensions[] = {
-    {
-        "permessage-deflate",
-        lws_extension_callback_pm_deflate,
-        "permessage-deflate; client_no_context_takeover; server_no_context_takeover"
-    },
-    { NULL, NULL, NULL }
-};
-
 /* ---- Protocol table ---- */
 
 static struct lws_protocols protocols[] = {
@@ -522,7 +518,10 @@ bool ws_server_init(const char *bind_addr, int port)
     info.port       = port;
     info.iface      = bind_addr;
     info.protocols  = protocols;
-    info.extensions = g_extensions;  /* enable permessage-deflate */
+    /* No LWS extensions: permessage-deflate in LWS 4.x breaks the
+     * client→server receive path (WS frames silently dropped).
+     * CGB frame compression is done at the application layer instead
+     * (zlib in ws_server_notify_frame; browser uses DecompressionStream). */
     info.options    = 0;
 
     g_context = lws_create_context(&info);
@@ -533,7 +532,7 @@ bool ws_server_init(const char *bind_addr, int port)
     g_main_protocol = &protocols[0];
 
     g_stats.last_log = time(NULL);
-    fprintf(stderr, "[ws] listening on port %d (permessage-deflate enabled)\n", port);
+    fprintf(stderr, "[ws] listening on port %d (app-level zlib CGB compression)\n", port);
     return true;
 }
 
@@ -549,7 +548,10 @@ void ws_server_notify_frame(const uint32_t *pixels, int w, int h)
     g_is_cgb = gb_is_cgb_mode();
 
     if (g_is_cgb) {
-        /* --- CGB mode: encode pixels as RGB888 --- */
+        /* --- CGB mode: encode pixels as RGB888, then zlib-compress ---
+         * Application-level compression avoids the permessage-deflate LWS
+         * extension mechanism which breaks client→server receive in LWS 4.x.
+         * The browser decompresses using the native DecompressionStream API. */
         int n = w * h;
         for (int i = 0; i < n; i++) {
             uint32_t px = pixels[i];
@@ -557,12 +559,24 @@ void ws_server_notify_frame(const uint32_t *pixels, int w, int h)
             g_curr_rgb[i * 3 + 1] = (uint8_t)((px >> 8) & 0xFFu); /* G */
             g_curr_rgb[i * 3 + 2] = (uint8_t)((px >> 16) & 0xFFu);/* B */
         }
-        /* Build the CGB send buffer once (shared across all connections). */
-        g_cgb_send_buf[LWS_PRE] = MSG_CGB_FRAME;
-        memcpy(g_cgb_send_buf + LWS_PRE + 1, g_curr_rgb, WS_CGB_PIXELS);
-
+        /* Compress RGB888 data with zlib (deflate). */
+        uLongf zlen = (uLongf)(WS_CGB_ZBUF_MAX - 1);
+        int zret = compress2(g_curr_zrgb + 1, &zlen,
+                             g_curr_rgb, (uLong)WS_CGB_PIXELS, Z_DEFAULT_COMPRESSION);
+        if (zret == Z_OK && zlen < (uLongf)(WS_CGB_PIXELS)) {
+            /* Compressed successfully and smaller than raw → send compressed. */
+            g_curr_zrgb[0]   = MSG_CGB_ZFRAME;
+            g_curr_zrgb_len  = (size_t)zlen + 1;
+            memcpy(g_cgb_send_buf + LWS_PRE, g_curr_zrgb, g_curr_zrgb_len);
+            g_stats.bytes_out += (uint64_t)g_curr_zrgb_len;
+        } else {
+            /* Fallback: send uncompressed if compression failed or wasn't smaller. */
+            g_cgb_send_buf[LWS_PRE] = MSG_CGB_FRAME;
+            memcpy(g_cgb_send_buf + LWS_PRE + 1, g_curr_rgb, WS_CGB_PIXELS);
+            g_curr_zrgb_len = (size_t)WS_CGB_FRAME_BYTES;
+            g_stats.bytes_out += (uint64_t)WS_CGB_FRAME_BYTES;
+        }
         g_stats.full_frames++;
-        g_stats.bytes_out += (uint64_t)WS_CGB_FRAME_BYTES;
     } else {
         /* --- DMG mode: encode pixels as 2bpp --- */
         int n = w * h;

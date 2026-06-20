@@ -4,6 +4,7 @@ CBOR_CFLAGS  := $(shell pkg-config --cflags libcbor)
 CBOR_LDFLAGS := $(shell pkg-config --libs libcbor)
 LWS_CFLAGS   := $(shell pkg-config --cflags libwebsockets)
 LWS_LDFLAGS  := $(shell pkg-config --libs libwebsockets)
+ZLIB_LDFLAGS := -lz
 CC      := gcc
 STRICT  := -Wall -Wextra -Wconversion -Wsign-conversion -Wshadow -Wundef -Werror
 
@@ -60,16 +61,16 @@ SERVER_SRCS := gb.c savestate.c palette.c ws_server.c frontend_server.c main.c
 HDRS    := bios.h bits.h constants.h opnames.h savestate.h ws_server.h gb.h palette.h
 
 gb: ws_server_html.h $(SRCS) $(HDRS)
-	$(CC) $(CFLAGS) $(CBOR_CFLAGS) $(LWS_CFLAGS) $(STRICT) -g -DHAVE_SDL $(SRCS) -o $@ $(LDFLAGS) $(CBOR_LDFLAGS) $(LWS_LDFLAGS)
+	$(CC) $(CFLAGS) $(CBOR_CFLAGS) $(LWS_CFLAGS) $(STRICT) -g -DHAVE_SDL $(SRCS) -o $@ $(LDFLAGS) $(CBOR_LDFLAGS) $(LWS_LDFLAGS) $(ZLIB_LDFLAGS)
 
 gb-server: ws_server_html.h $(CBOR_NATIVE_LIB) $(SERVER_SRCS) $(HDRS)
-	$(CC) -I$(CBOR_SRC)/src $(LWS_CFLAGS) $(STRICT) -g $(SERVER_SRCS) -o $@ $(CBOR_NATIVE_LIB) $(LWS_LDFLAGS)
+	$(CC) -I$(CBOR_SRC)/src $(LWS_CFLAGS) $(STRICT) -g $(SERVER_SRCS) -o $@ $(CBOR_NATIVE_LIB) $(LWS_LDFLAGS) $(ZLIB_LDFLAGS)
 
 ws_server_html.h: frontend/index.html tools/gen_html_header.py
 	python3 tools/gen_html_header.py $< > $@
 
 asan: ws_server_html.h $(SRCS) $(HDRS)
-	$(CC) $(CFLAGS) $(CBOR_CFLAGS) $(LWS_CFLAGS) $(STRICT) -g -fsanitize=undefined,address -DHAVE_SDL $(SRCS) -o gb_asan $(LDFLAGS) $(CBOR_LDFLAGS) $(LWS_LDFLAGS)
+	$(CC) $(CFLAGS) $(CBOR_CFLAGS) $(LWS_CFLAGS) $(STRICT) -g -fsanitize=undefined,address -DHAVE_SDL $(SRCS) -o gb_asan $(LDFLAGS) $(CBOR_LDFLAGS) $(LWS_LDFLAGS) $(ZLIB_LDFLAGS)
 
 test_savestate: tests/test_savestate.c savestate.c savestate.h gb.c gb.h palette.c palette.h $(HDRS)
 	$(CC) $(CBOR_CFLAGS) $(STRICT) -g \

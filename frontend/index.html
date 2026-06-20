@@ -154,6 +154,29 @@ class RemoteBackend {
       this._g_px[di+3] = 255;
     }
   }
+  /* Decompress zlib data and decode as RGB888 (CGB compressed frame 0x14). */
+  async _decompressAndDecodeRGB888(compressed) {
+    try {
+      const ds = new DecompressionStream('deflate');
+      const writer = ds.writable.getWriter();
+      const reader = ds.readable.getReader();
+      writer.write(compressed);
+      writer.close();
+      const chunks = [];
+      let total = 0;
+      while (true) {
+        const {done, value} = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        total += value.length;
+      }
+      const raw = new Uint8Array(total);
+      let off = 0;
+      for (const c of chunks) { raw.set(c, off); off += c.length; }
+      this._decodeRGB888(raw);
+      if (this.onframe) this.onframe(this._g_px);
+    } catch(e) { /* decompression failed: skip frame */ }
+  }
   /* Patch a single 8x8 tile (tx,ty) from 16 bytes of 2bpp data into _curr_2bpp and _g_px. */
   _patchTile(tx, ty, data, doff) {
     for (let r = 0; r < 8; r++) {
@@ -208,9 +231,12 @@ class RemoteBackend {
         }
         if (this.onframe) this.onframe(this._g_px);
       } else if (d[0] === 0x11 && d.length === 69121) {
-        /* CGB full frame (RGB888) — display server-rendered colors directly */
+        /* CGB full frame (RGB888 uncompressed) */
         this._decodeRGB888(d.subarray(1));
         if (this.onframe) this.onframe(this._g_px);
+      } else if (d[0] === 0x14) {
+        /* CGB compressed frame (zlib/deflate RGB888) */
+        this._decompressAndDecodeRGB888(d.subarray(1));
       } else if (d[0] === 0x12) {
         /* Slot info update */
         try {
