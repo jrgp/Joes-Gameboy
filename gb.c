@@ -95,6 +95,15 @@ static int cgb_wram_bank = 1;
 uint8_t cgb_bg_pal[64];   // BG palette RAM: 8 palettes × 4 colors × 2 bytes
 uint8_t cgb_obj_pal[64];  // OBJ palette RAM
 
+// CGB H-Blank DMA (HDMA) state:
+// hdma_active: true when an H-Blank DMA transfer is in progress (triggered by FF55 bit7=1).
+// hdma_remaining: number of 16-byte blocks remaining (0x00-0x7F).
+// hdma_src / hdma_dst: current source/destination pointers (advanced after each block).
+bool     hdma_active    = false;
+int      hdma_remaining = 0;
+uint16_t hdma_src       = 0;
+uint16_t hdma_dst       = 0;
+
 // Forward declaration needed by CGB rendering helpers defined below.
 extern byte cart_cgb_flag;
 
@@ -1228,6 +1237,27 @@ void gpu_step(int _cycles){
         if (new_mode == 3) {
             recompute_mode3_extra_at_mode3();
         }
+        // CGB H-Blank DMA: transfer one 16-byte block each time mode 0 starts
+        // (only during the active display area, not during VBlank scanlines).
+        if (new_mode == 0 && hdma_active && real_ly < 144) {
+            for (int i = 0; i < 16; i++) {
+                byte b = mem_read((hdma_src + (uint16_t)i) & 0xFFFF);
+                // Destination wraps within VRAM ($8000-$9FFF = 8KB)
+                uint16_t dst_addr = (uint16_t)(0x8000u + ((hdma_dst - 0x8000u + (uint16_t)i) & 0x1FFFu));
+                gpu_write(dst_addr, b);
+            }
+            hdma_src = (uint16_t)(hdma_src + 16);
+            // Advance dst, wrapping within VRAM ($8000-$9FFF)
+            hdma_dst = (uint16_t)(0x8000u + ((hdma_dst - 0x8000u + 16u) & 0x1FFFu));
+            if (hdma_remaining == 0) {
+                // All blocks transferred
+                hdma_active = false;
+                RAM[0xFF55]  = 0xFF;
+            } else {
+                hdma_remaining--;
+                RAM[0xFF55] = (byte)hdma_remaining;
+            }
+        }
         stat_check_irq();
     }
 
@@ -2196,18 +2226,33 @@ void mem_write(int pos, byte data) {
             if (CGB_COLOR_MODE()) {
                 uint16_t src  = (uint16_t)((uint16_t)((unsigned)RAM[0xFF51] << 8u) | ((unsigned)RAM[0xFF52] & 0xF0u));
                 uint16_t dst  = (uint16_t)(0x8000u | (uint16_t)((unsigned)(RAM[0xFF53] & 0x1F) << 8u) | ((unsigned)RAM[0xFF54] & 0xF0u));
-                int      len  = (int)((data & 0x7F) + 1) * 16; // length in bytes
-                bool     hdma = (data & 0x80) != 0;            // bit 7: 0=GDMA, 1=HDMA
-                if (!hdma) {
+                int      blocks = (int)(data & 0x7F) + 1; // number of 16-byte blocks
+                bool     is_hdma = (data & 0x80) != 0;    // bit 7: 0=GDMA, 1=HDMA
+                if (!is_hdma) {
                     // GDMA: transfer all bytes immediately
+                    int len = blocks * 16;
                     for (int i = 0; i < len; i++) {
-                        byte b = mem_read((src + i) & 0xFFFF);
-                        gpu_write((dst + i) & 0x9FFF, b);
+                        byte b = mem_read((src + (uint16_t)i) & 0xFFFF);
+                        // Destination wraps within VRAM ($8000-$9FFF = 8KB)
+                        uint16_t dst_addr = (uint16_t)(0x8000u + ((dst - 0x8000u + (uint16_t)i) & 0x1FFFu));
+                        gpu_write(dst_addr, b);
                     }
-                    RAM[0xFF55] = 0xFF;  // transfer complete
+                    hdma_active    = false;
+                    RAM[0xFF55]    = 0xFF; // transfer complete
                 } else {
-                    // HDMA: store length for H-Blank DMA (not yet fully implemented; stub)
-                    RAM[0xFF55] = data & 0x7F;  // remaining blocks
+                    // HDMA: write data & 0x80 == 0 cancels an in-progress HDMA
+                    if (hdma_active) {
+                        // Cancel: write $80 stops transfer; HDMA5 shows remaining | $80 → but bit7=1 means stopped
+                        hdma_active = false;
+                        RAM[0xFF55] = (byte)(hdma_remaining | 0x80);
+                    } else {
+                        // Start new HDMA transfer; transfer one block per H-Blank
+                        hdma_active    = true;
+                        hdma_remaining = (byte)(data & 0x7F);
+                        hdma_src       = src;
+                        hdma_dst       = dst;
+                        RAM[0xFF55]    = (byte)(hdma_remaining); // bit7=0 = active
+                    }
                 }
             }
             break;
@@ -2397,6 +2442,10 @@ void mem_init(void){
     cgb_vram_bank = 0;
     cgb_wram_bank = 1;
     RAM[0xFF4D] = 0;
+    hdma_active    = false;
+    hdma_remaining = 0;
+    hdma_src       = 0;
+    hdma_dst       = 0;
     apu_ch1_active = false;
     apu_ch1_length_enable = false;
     apu_ch1_length = 0;
@@ -5790,7 +5839,11 @@ bool frame_headless(void){
     } else {
         cycles = 0;
         int instruction_count = 0;
-        while (cycles < 69905) {
+        // In CGB double-speed mode the CPU runs at 8 MHz (twice normal).
+        // The GPU runs at 4 MHz (half the CPU rate); the timer also runs at 4 MHz.
+        // We run twice as many CPU cycles per frame to compensate.
+        int frame_cycles = double_speed ? 139810 : 69905;
+        while (cycles < frame_cycles) {
             if (bailAfterBios && !inBios) {
                 printf("bailing after bios\n");
                 break;
@@ -5803,7 +5856,9 @@ bool frame_headless(void){
             do_interrupts();
             int dispatch_cycles = cycles - prevcycles;
             if (dispatch_cycles > 0) {
-                gpu_step(dispatch_cycles);
+                int dc_gpu = double_speed ? (dispatch_cycles >> 1) : dispatch_cycles;
+                gpu_step(dc_gpu);
+                // Timer always advances at full CPU rate (in double-speed mode timer runs 2× faster)
                 timer_step(dispatch_cycles - instr_timer_cycles);
                 dma_step(dispatch_cycles);
                 instr_timer_cycles = 0;
@@ -5811,14 +5866,15 @@ bool frame_headless(void){
             exec_next_start_cycles = cycles;
             exec_next();
             int cpu_cycles = cycles - prevcycles - dispatch_cycles;
-
-            gpu_step(cpu_cycles);
+            int gc_gpu = double_speed ? (cpu_cycles >> 1) : cpu_cycles;
+            gpu_step(gc_gpu);
+            // Timer always advances at full CPU rate (double-speed CGB behavior: DIV/TIMA 2× faster)
             timer_step(cpu_cycles - instr_timer_cycles);
-            dma_step(cpu_cycles - instr_timer_cycles);
+            dma_step(cpu_cycles);
             instruction_count++;
 
             // Safety check for infinite loops
-            if (instruction_count > 100000) {
+            if (instruction_count > 200000) {
                 printf("WARNING: Infinite loop detected at frame %d, PC=0x%04X\n", frame_count, PC);
                 break;
             }
@@ -5953,13 +6009,15 @@ void ss_set_gb_model(int v)                { gb_model = (gb_model_t)v; }
 /* Called after all fields are loaded to rebuild any derived state */
 void ss_post_load(void) {
     /*
-     * Nothing needed here currently:
-     * - RAM[] is fully restored from the CBOR bytestring (which was saved with
-     *   named registers synced into their RAM slots by save_state).
-     * - Named registers (LY_REG, SCX_REG, etc.) are restored from named fields.
-     * - gpu_parse_control is called by load_state after LCDC_REG is set.
-     * - timer_internal is synced to RAM[REG_DIV] by ss_set_timer_internal.
+     * RAM[] is fully restored from the CBOR bytestring.
+     * Derived C variables must be synced from their RAM register counterparts.
      */
+    // CGB: restore VRAM/WRAM bank selections from their control registers
+    if (gb_model == MODEL_GBC) {
+        cgb_vram_bank = RAM[0xFF4F] & 0x01;
+        cgb_wram_bank = RAM[0xFF70] & 0x07;
+        if (cgb_wram_bank == 0) cgb_wram_bank = 1; // bank 0 → bank 1 per hardware
+    }
 }
 
 /* ---- Public APIs for the WebSocket server layer ---- */

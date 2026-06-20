@@ -150,6 +150,14 @@ extern bool dma_oam_locked;
 extern int  dma_cycles_remaining;
 extern int  dma_startup_remaining;
 extern int  dma_source;
+extern bool     hdma_active;
+extern int      hdma_remaining;
+extern uint16_t hdma_src;
+extern uint16_t hdma_dst;
+
+/* CGB bank selection variables (derived from registers at load time) */
+extern int cgb_vram_bank;
+extern int cgb_wram_bank;
 
 /* ROM path (set by cart_load, accessed here) */
 extern char savestate_rom_path[4096];
@@ -298,7 +306,7 @@ static void get_string(const cbor_item_t *map, const char *key,
 }
 
 /* ---- Number of fields in the map — keep in sync with MAP_* calls below ---- */
-#define SS_MAP_SIZE 80  /* 76 base + 4 CGB fields (vram1, cgb_wram, cgb_bg_pal, cgb_obj_pal) */
+#define SS_MAP_SIZE 84  /* 76 base + 4 CGB fields (vram1/wram/pals) + 4 HDMA fields */
 
 /* ---- save_state_internal: shared implementation ---- */
 
@@ -411,6 +419,10 @@ static bool save_state_internal(const char *path, const char *slot_name) {
     MAP_BYTES(map, "cgb_wram",   cgb_wram, 8 * 4096);
     MAP_BYTES(map, "cgb_bg_pal", cgb_bg_pal, 64);
     MAP_BYTES(map, "cgb_obj_pal",cgb_obj_pal, 64);
+    MAP_BOOL (map, "hdma_act",   hdma_active);
+    MAP_INT  (map, "hdma_rem",   hdma_remaining);
+    MAP_INT  (map, "hdma_src",   (int)hdma_src);
+    MAP_INT  (map, "hdma_dst",   (int)hdma_dst);
 
     /* Optional slot metadata (only written when slot_name is non-empty) */
     if (has_meta) {
@@ -626,6 +638,10 @@ bool load_state(const char *path) {
     get_bytes(root, "cgb_wram",   cgb_wram,   8 * 4096);
     get_bytes(root, "cgb_bg_pal", cgb_bg_pal, 64);
     get_bytes(root, "cgb_obj_pal",cgb_obj_pal,64);
+    hdma_active    = get_bool(root, "hdma_act", false);
+    hdma_remaining = (int)get_int(root, "hdma_rem", 0);
+    hdma_src       = (uint16_t)get_int(root, "hdma_src", 0);
+    hdma_dst       = (uint16_t)get_int(root, "hdma_dst", 0);
 
     cbor_decref(&root);
 
