@@ -1,23 +1,25 @@
-<img src="icon.png" width="100" align="left" style="margin-right:16px">
+<div align="center">
+<img src="icon.png" width="100">
 
 # Joe's Gameboy
+</div>
 
-A Game Boy DMG emulator written in C
+A Game Boy and Game Boy Color emulator written in C
 
 I started this project in 2021 and got as far as getting TETRIS playable, then I left the project for a while. Starting in 2026, I've been guiding Claude Sonnet 4.6 to gradually complete the emulator and add many more features.
 
 ### Features
 
+- **Game Boy Color support** — full CGB hardware: VRAM banking, color palettes, HDMA, double-speed CPU
 - Multiple UIs - SDL/WASM/headless/native macOS
 - A headless server mode that allows `screen -x` or `tmux attach` functionality, for gaming on the Go.
-- Game saves/snapshots
-- Toggleable Color Palettes
+- Game saves/snapshots with 5 named save slots
+- **Color palettes** for original Game Boy games (DMG only; GBC games render in their native colors)
 - Toggleable Fast Mode (4x) to make grinding Pokemon easier
 - Correctness: Blargg/Mooneye e2e tests pass.
 
 ### Upcoming features
 
-- Gameboy Color
 - Audio
 - Auto builds/releases using GHA
 
@@ -125,7 +127,7 @@ Controls:
 - `Enter` = Start
 - `Shift` = Select
 - `F5` = Save state
-- `F6` / `shift + F6` = Change color palette
+- `F6` / `shift + F6` = Change color palette (DMG games only)
 - `F` = Toggle fast mode (~4× speed).
 
 ### macOS app
