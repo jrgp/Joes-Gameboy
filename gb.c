@@ -29,7 +29,14 @@ extern byte RAM[0xffff + 1];
 int gpu_cycles;
 int exec_next_start_cycles; // cycles count at start of exec_next (after do_interrupts)
 int cycles; // CPU cycle counter (forward-declared here for gpu_write access)
-byte VRAM[0x2000];  // VRAM is 8KB, not 64KB
+byte VRAM[0x2000];  // VRAM bank 0 (8KB) — compatible with DMG
+byte VRAM1[0x2000]; // VRAM bank 1 (8KB) — CGB only; tile attributes
+
+// CGB WRAM: 8 banks × 4096 bytes = 32KB.
+// Bank 0 at $C000-$CFFF (always fixed).
+// Banks 1-7 at $D000-$DFFF (switched via SVBK).
+// Bank 0 lives in cgb_wram[0..4095]; bank N in cgb_wram[N*4096..N*4096+4095].
+uint8_t cgb_wram[8 * 4096];
 byte LY_REG = 0;    // LY register (0xFF44) — may show 0 mid-line-153 (hardware quirk)
 byte real_ly = 0;  // Actual scanline counter — never changes mid-scanline
 byte SCX_REG = 0;   // SCX register (0xFF43)
@@ -82,6 +89,14 @@ static int cgb_vram_bank = 0;
 
 // CGB WRAM bank select (SVBK/$FF70): 1-7 (0 maps to bank 1).  Banks 1-7 at $D000-$DFFF.
 static int cgb_wram_bank = 1;
+
+// CGB color palettes: 8 palettes × 4 colors × 2 bytes = 64 bytes each.
+// Accessed via BCPS/BCPD ($FF68/$FF69) for BG and OCPS/OCPD ($FF6A/$FF6B) for OBJ.
+uint8_t cgb_bg_pal[64];   // BG palette RAM: 8 palettes × 4 colors × 2 bytes
+uint8_t cgb_obj_pal[64];  // OBJ palette RAM
+
+// Forward declaration needed by CGB rendering helpers defined below.
+extern byte cart_cgb_flag;
 
 // True when CGB color-mode features are active:
 //   - Running on GBC hardware (gb_model == MODEL_GBC), AND
@@ -329,6 +344,7 @@ static void recompute_mode3_extra_at_mode3(void) {
 
 void gpu_init(void){
     memset(VRAM, 0, 0x2000);
+    memset(VRAM1, 0, 0x2000);
     gpu_cycles = 0;
     LY_REG = 0;
     real_ly = 0;
@@ -623,7 +639,8 @@ byte gpu_read(int pos){
             }
             if (locked) return 0xFF;
         }
-        return VRAM[pos - 0x8000];
+        // CGB VRAM banking: bank 1 holds tile attributes
+        return cgb_vram_bank ? VRAM1[pos - 0x8000] : VRAM[pos - 0x8000];
     }
     if (pos == STAT) {
         if (!gpu_control.enabled) {
@@ -734,7 +751,8 @@ byte gpu_read(int pos){
 
 void gpu_write(int pos, byte data){
     if (pos >= 0x8000 && pos <= 0x9FFF) {
-        VRAM[pos - 0x8000] = data;
+        if (cgb_vram_bank) VRAM1[pos - 0x8000] = data;
+        else               VRAM[pos - 0x8000] = data;
     }
     if (pos == STAT) {
         // Bits 3-6 are writable; bits 0-2 are read-only
@@ -852,6 +870,29 @@ void gpu_write(int pos, byte data){
     }
 }
 
+// Read a byte from VRAM bank 1 directly (for CGB tile attributes).
+static byte vram1_read(int addr) {
+    return VRAM1[addr & 0x1FFF];
+}
+
+// CGB RGB555 → RGB888 conversion and palette lookup.
+// pal_ram: pointer to 64-byte palette RAM (cgb_bg_pal or cgb_obj_pal).
+// pal_num: palette number 0-7.
+// color: 2-bit color index 0-3.
+static uint32_t cgb_palette_color(const uint8_t *pal_ram, int pal_num, byte color) {
+    int idx = pal_num * 8 + color * 2;
+    uint16_t rgb555 = (uint16_t)(pal_ram[idx] | ((uint16_t)pal_ram[idx + 1] << 8));
+    uint8_t r5 = (uint8_t)((rgb555 >> 0) & 0x1F);
+    uint8_t g5 = (uint8_t)((rgb555 >> 5) & 0x1F);
+    uint8_t b5 = (uint8_t)((rgb555 >> 10) & 0x1F);
+    // Scale 5-bit to 8-bit: multiply by 8 (or use (x << 3) | (x >> 2) for full range)
+    uint8_t r8 = (uint8_t)((r5 << 3) | (r5 >> 2));
+    uint8_t g8 = (uint8_t)((g5 << 3) | (g5 >> 2));
+    uint8_t b8 = (uint8_t)((b5 << 3) | (b5 >> 2));
+    // Pack as RGBA (R in low byte, matching pallette[] format)
+    return (uint32_t)(0xFF000000u | ((uint32_t)b8 << 16) | ((uint32_t)g8 << 8) | r8);
+}
+
 uint32_t gpu_pallete_color(byte number, int paletteIndex) {
     const byte config = mem_read(paletteIndex);
     // Each color number occupies 2 bits: bits [n*2+1 : n*2]
@@ -865,6 +906,7 @@ uint32_t gpu_pallete_color(byte number, int paletteIndex) {
 // transparent0: if true (sprites), skip color index 0.
 // for_sprite: if true, use 0x8000 base (unsigned); otherwise use BG/window tile data.
 // Records BG color index into bg_scanline[] when !transparent0.
+// cgb_attr: CGB tile attribute byte (from VRAM bank 1); ignored for DMG.
 void gpu_render_tile(byte ly, int xprefix, int tile_row, byte tileIndex,
                      int paletteIndex, bool flipx, bool flipy,
                      bool transparent0, bool for_sprite) {
@@ -899,17 +941,77 @@ void gpu_render_tile(byte ly, int xprefix, int tile_row, byte tileIndex,
     }
 }
 
+// CGB-specific tile renderer: uses VRAM bank selection and CGB palette RAM.
+// cgb_attr: tile attribute from VRAM bank 1.
+// is_sprite: true for sprites, false for BG/window.
+// pal_ram: cgb_bg_pal or cgb_obj_pal.
+static void gpu_render_tile_cgb(byte ly, int xprefix, int tile_row, byte tileIndex,
+                                byte cgb_attr, bool for_sprite,
+                                bool transparent0, const uint8_t *pal_ram) {
+    int pal_num  = cgb_attr & 0x07;
+    bool flip_x  = (cgb_attr >> 5) & 1;
+    bool flip_y  = (cgb_attr >> 6) & 1;
+    int  vbank   = (cgb_attr >> 3) & 1;  // VRAM bank for tile data (BG only)
+
+    int data_base;
+    int actual;
+    if (for_sprite) {
+        data_base = 0x8000;
+        actual    = tileIndex;
+        vbank     = (cgb_attr >> 3) & 1;  // sprite uses bit 3 for VRAM bank too
+    } else {
+        data_base = gpu_control.BgWindowTileData;
+        if (gpu_control.BgTileDataSigned)
+            actual = (int)(int8_t)tileIndex;
+        else
+            actual = tileIndex;
+    }
+
+    int row = flip_y ? (7 - tile_row) : tile_row;
+    const int base = data_base + actual * 16;
+    /* Read tile data from the selected VRAM bank */
+    int vram_offset = (base + row * 2) & 0x1FFF;
+    byte hi, lo;
+    if (vbank) {
+        hi = VRAM1[vram_offset];
+        lo = VRAM1[vram_offset + 1];
+    } else {
+        hi = VRAM[vram_offset];
+        lo = VRAM[vram_offset + 1];
+    }
+
+    for (int i = 0; i < 8; i++) {
+        int x = xprefix + (flip_x ? (7 - i) : i);
+        if (x < 0 || x >= VIEWPORT_WIDTH) continue;
+        byte color = 0;
+        if (bit_check(lo, 7 - i)) color |= 2;
+        if (bit_check(hi, 7 - i)) color |= 1;
+        if (transparent0 && color == 0) continue;
+        set_pixel(x, ly, cgb_palette_color(pal_ram, pal_num, color));
+        if (!transparent0) bg_scanline[x] = color;
+    }
+}
+
 void gpu_draw_bg(byte ly){
     if (gpu_control.bg) {
         int fine_x = SCX_REG & 7;
         int fine_y = (ly + SCY_REG) & 7;
+        bool cgb = CGB_COLOR_MODE();
         // Render 21 tiles to cover 160 pixels + fine X offset
         for (int tile = 0; tile <= 20; tile++) {
             int map_x = ((SCX_REG / 8) + tile) & 31;
             int map_y = ((ly + SCY_REG) / 8) & 31;
-            int tileIndex = mem_read(gpu_control.bgtilemap + (map_y * 32) + map_x);
-            gpu_render_tile(ly, tile * 8 - fine_x, fine_y, (byte)tileIndex,
-                            BGP, false, false, false, false);
+            int map_addr = gpu_control.bgtilemap + (map_y * 32) + map_x;
+            int tileIndex = mem_read(map_addr);
+            if (cgb) {
+                // Attribute byte lives in VRAM bank 1 at the same tilemap address
+                byte attr = vram1_read(map_addr);
+                gpu_render_tile_cgb(ly, tile * 8 - fine_x, fine_y, (byte)tileIndex,
+                                    attr, false, false, cgb_bg_pal);
+            } else {
+                gpu_render_tile(ly, tile * 8 - fine_x, fine_y, (byte)tileIndex,
+                                BGP, false, false, false, false);
+            }
         }
     } else {
         for (int i = 0; i < VIEWPORT_WIDTH; i++) {
@@ -925,14 +1027,22 @@ void gpu_draw_window(byte ly){
     int wx = (int)RAM[WX] - 7;  // WX=7 means window starts at x=0
     if (ly < wy) return;
     int fine_y = window_line & 7;
+    bool cgb = CGB_COLOR_MODE();
     for (int tile = 0; tile <= 20; tile++) {
         int xpos = wx + tile * 8;
         if (xpos >= VIEWPORT_WIDTH) break;
         int map_x = tile & 31;
         int map_y = (window_line / 8) & 31;
-        int tileIndex = mem_read(gpu_control.windowtilemap + (map_y * 32) + map_x);
-        gpu_render_tile(ly, xpos, fine_y, (byte)tileIndex,
-                        BGP, false, false, false, false);
+        int map_addr = gpu_control.windowtilemap + (map_y * 32) + map_x;
+        int tileIndex = mem_read(map_addr);
+        if (cgb) {
+            byte attr = vram1_read(map_addr);
+            gpu_render_tile_cgb(ly, xpos, fine_y, (byte)tileIndex,
+                                attr, false, false, cgb_bg_pal);
+        } else {
+            gpu_render_tile(ly, xpos, fine_y, (byte)tileIndex,
+                            BGP, false, false, false, false);
+        }
     }
     window_line++;
 }
@@ -940,6 +1050,7 @@ void gpu_draw_window(byte ly){
 void gpu_draw_sprites(byte ly){
     if (!gpu_control.sprite) return;
     int sprite_height = gpu_control.sprite_tall ? 16 : 8;
+    bool cgb = CGB_COLOR_MODE();
     // Render in reverse OAM order so sprite 0 has highest priority (drawn last = on top)
     for (int i = 39; i >= 0; i--) {
         const int oam = 0xFE00 + (i * 4);
@@ -956,7 +1067,6 @@ void gpu_draw_sprites(byte ly){
         const bool flipy    = bit_check(flags, 6);
         const bool flipx    = bit_check(flags, 5);
         const bool bg_prio  = bit_check(flags, 7);
-        const int paletteIndex = bit_check(flags, 4) ? OBP1 : OBP0;
 
         int tile_row = (int)ly - actual_y;
         if (gpu_control.sprite_tall) {
@@ -968,27 +1078,54 @@ void gpu_draw_sprites(byte ly){
         }
         if (flipy) tile_row = 7 - tile_row;  // flipy handled here, not in render_tile
 
-        // For bg_prio sprites: only draw over BG color 0
-        if (bg_prio) {
-            // Render pixel-by-pixel with priority check
-            int row = tile_row;
-            const int addr = 0x8000 + tileIndex * 16;
-            const byte hi = mem_read(addr + row * 2);
-            const byte lo = mem_read(addr + row * 2 + 1);
-            for (int pi = 0; pi < 8; pi++) {
-                int x = actual_x + (flipx ? (7 - pi) : pi);
-                if (x < 0 || x >= VIEWPORT_WIDTH) continue;
-                if (bg_scanline[x] != 0) continue;  // BG wins
-                byte color = 0;
-                if (bit_check(lo, 7 - pi)) color |= 2;
-                if (bit_check(hi, 7 - pi)) color |= 1;
-                if (color == 0) continue;
-                set_pixel(x, ly, gpu_pallete_color(color, paletteIndex));
+        if (cgb) {
+            // CGB sprites: palette from bits 2:0 of flags, VRAM bank from bit 3
+            byte cgb_attr = (byte)((flags & 0x07) | ((flags & 0x08)) | (flipx ? 0x20 : 0));
+            // For bg_prio: render pixel-by-pixel respecting BG priority
+            if (bg_prio) {
+                int vbank = (flags >> 3) & 1;
+                int vram_off = (0x8000 + tileIndex * 16 + tile_row * 2) & 0x1FFF;
+                byte hi = vbank ? VRAM1[vram_off]   : VRAM[vram_off];
+                byte lo = vbank ? VRAM1[vram_off+1] : VRAM[vram_off+1];
+                int pal_num = flags & 0x07;
+                for (int pi = 0; pi < 8; pi++) {
+                    int x = actual_x + (flipx ? (7 - pi) : pi);
+                    if (x < 0 || x >= VIEWPORT_WIDTH) continue;
+                    if (bg_scanline[x] != 0) continue;  // BG wins
+                    byte color = 0;
+                    if (bit_check(lo, 7 - pi)) color |= 2;
+                    if (bit_check(hi, 7 - pi)) color |= 1;
+                    if (color == 0) continue;
+                    set_pixel(x, ly, cgb_palette_color(cgb_obj_pal, pal_num, color));
+                }
+            } else {
+                gpu_render_tile_cgb(ly, actual_x, tile_row, tileIndex,
+                                    cgb_attr, true, true, cgb_obj_pal);
             }
         } else {
-            // Normal sprite: transparent0=true, flipy already applied to tile_row
-            gpu_render_tile(ly, actual_x, tile_row, tileIndex,
-                            paletteIndex, flipx, false, true, true);
+            const int paletteIndex = bit_check(flags, 4) ? OBP1 : OBP0;
+            // For bg_prio sprites: only draw over BG color 0
+            if (bg_prio) {
+                // Render pixel-by-pixel with priority check
+                int row = tile_row;
+                const int addr = 0x8000 + tileIndex * 16;
+                const byte hi = mem_read(addr + row * 2);
+                const byte lo = mem_read(addr + row * 2 + 1);
+                for (int pi = 0; pi < 8; pi++) {
+                    int x = actual_x + (flipx ? (7 - pi) : pi);
+                    if (x < 0 || x >= VIEWPORT_WIDTH) continue;
+                    if (bg_scanline[x] != 0) continue;  // BG wins
+                    byte color = 0;
+                    if (bit_check(lo, 7 - pi)) color |= 2;
+                    if (bit_check(hi, 7 - pi)) color |= 1;
+                    if (color == 0) continue;
+                    set_pixel(x, ly, gpu_pallete_color(color, paletteIndex));
+                }
+            } else {
+                // Normal sprite: transparent0=true, flipy already applied to tile_row
+                gpu_render_tile(ly, actual_x, tile_row, tileIndex,
+                                paletteIndex, flipx, false, true, true);
+            }
         }
     }
 }
@@ -1367,8 +1504,8 @@ void cart_write(int pos, byte data) {
             return;
         }
         if (pos <= 0x5FFF) {
-            // MBC3: RAM bank (0-3) or RTC select (0x08-0x0C); only 0-3 supported
-            cart_ram_bank = data & 0x03;
+            // MBC3: RAM bank (0-3) or RTC select (0x08-0x0C)
+            cart_ram_bank = data;  // store full value including RTC register select (0x08-0x0C)
             return;
         }
         if (pos <= 0x7FFF) {
@@ -1690,10 +1827,27 @@ byte mem_read(int pos) {
     } else if (pos >= 0x8000 && pos <= 0x9FFF) {
         return gpu_read(pos);
     } else if (pos >= 0xA000 && pos <= 0xBFFF) {
-        int ram_bank = is_mbc3() ? cart_ram_bank : (cart_mbc1_mode == 1 ? cart_mbc1_upper : 0);
+        // MBC3 RTC register access (bank select 0x08-0x0C)
+        if (is_mbc3() && cart_ram_bank >= 0x08) {
+            return 0x00;  // RTC stub: return 0 for all RTC registers
+        }
+        int ram_bank = is_mbc3() ? (cart_ram_bank & 0x03) : (cart_mbc1_mode == 1 ? cart_mbc1_upper : 0);
         return ext_ram[ram_bank * 0x2000 + (pos - 0xA000)];
+    } else if (pos >= 0xC000 && pos <= 0xCFFF) {
+        // WRAM bank 0 (fixed)
+        return gb_model == MODEL_GBC ? cgb_wram[pos - 0xC000] : RAM[pos];
+    } else if (pos >= 0xD000 && pos <= 0xDFFF) {
+        // WRAM banks 1-7 (CGB) or bank 1 only (DMG)
+        return gb_model == MODEL_GBC
+            ? cgb_wram[cgb_wram_bank * 0x1000 + (pos - 0xD000)]
+            : RAM[pos];
     } else if (pos >= 0xE000 && pos < 0xFE00) {
         // Echo RAM: $E000-$FDFF mirrors WRAM $C000-$DDFF
+        if (gb_model == MODEL_GBC) {
+            int wpos = pos - 0x2000;
+            if (wpos <= 0xCFFF) return cgb_wram[wpos - 0xC000];
+            return cgb_wram[cgb_wram_bank * 0x1000 + (wpos - 0xD000)];
+        }
         return RAM[pos - 0x2000];
     } else if (pos >= 0xFE00 && pos <= 0xFE9F) {
         // OAM: returns 0xFF when DMA is active (after startup grace) or during GPU modes 2/3.
@@ -1773,16 +1927,23 @@ byte mem_read(int pos) {
                 return CGB_COLOR_MODE() ? 0x02 : 0xFF;
             case 0xFF68:
                 // BCPS: BG color palette spec — accessible on all GBC hardware
-                // (CGB boot ROM initializes this regardless of cart type)
                 return gb_model == MODEL_GBC ? (RAM[0xFF68] | 0x40u) : 0xFF;
             case 0xFF69:
-                // BCPD: BG color palette data (stub → 0xFF for now)
+                // BCPD: BG color palette data — read from palette RAM in CGB color mode
+                if (CGB_COLOR_MODE()) {
+                    uint8_t idx = RAM[0xFF68] & 0x3F;
+                    return cgb_bg_pal[idx];
+                }
                 return gb_model == MODEL_GBC ? 0xFF : 0xFF;
             case 0xFF6A:
                 // OCPS: OBJ color palette spec — accessible on all GBC hardware
                 return gb_model == MODEL_GBC ? (RAM[0xFF6A] | 0x40u) : 0xFF;
             case 0xFF6B:
-                // OCPD: OBJ color palette data (stub → 0xFF for now)
+                // OCPD: OBJ color palette data — read from palette RAM in CGB color mode
+                if (CGB_COLOR_MODE()) {
+                    uint8_t idx = RAM[0xFF6A] & 0x3F;
+                    return cgb_obj_pal[idx];
+                }
                 return gb_model == MODEL_GBC ? 0xFF : 0xFF;
             case 0xFF6C:
                 // OPRI: OBJ priority mode — only in CGB color mode; $FF in DMG compat
@@ -1885,6 +2046,17 @@ void mem_write(int pos, byte data) {
     // Echo RAM: $E000-$FDFF mirrors WRAM $C000-$DDFF (write through)
     if (pos >= 0xE000 && pos < 0xFE00) {
         pos -= 0x2000;
+    }
+    // CGB WRAM banking: intercept $C000-$DFFF before the switch statement
+    if (gb_model == MODEL_GBC) {
+        if (pos >= 0xC000 && pos <= 0xCFFF) {
+            cgb_wram[pos - 0xC000] = data;
+            return;
+        }
+        if (pos >= 0xD000 && pos <= 0xDFFF) {
+            cgb_wram[cgb_wram_bank * 0x1000 + (pos - 0xD000)] = data;
+            return;
+        }
     }
     // OAM bus is locked during DMA — CPU writes to OAM are blocked
     if (dma_active && pos >= 0xFE00 && pos <= 0xFE9F) return;
@@ -2014,10 +2186,30 @@ void mem_write(int pos, byte data) {
             if (gb_model == MODEL_GBC)
                 cgb_vram_bank = data & 0x01;
             break;
-        case 0xFF51: case 0xFF52: case 0xFF53: case 0xFF54: case 0xFF55:
-            // HDMA1-5: DMA registers (CGB color mode only)
+        case 0xFF51: case 0xFF52: case 0xFF53: case 0xFF54:
+            // HDMA1-4: DMA source/dest (CGB color mode only)
             if (CGB_COLOR_MODE())
                 RAM[pos] = data;
+            break;
+        case 0xFF55:
+            // HDMA5: General DMA (GDMA) or H-Blank DMA (HDMA) trigger (CGB color mode)
+            if (CGB_COLOR_MODE()) {
+                uint16_t src  = (uint16_t)((uint16_t)((unsigned)RAM[0xFF51] << 8u) | ((unsigned)RAM[0xFF52] & 0xF0u));
+                uint16_t dst  = (uint16_t)(0x8000u | (uint16_t)((unsigned)(RAM[0xFF53] & 0x1F) << 8u) | ((unsigned)RAM[0xFF54] & 0xF0u));
+                int      len  = (int)((data & 0x7F) + 1) * 16; // length in bytes
+                bool     hdma = (data & 0x80) != 0;            // bit 7: 0=GDMA, 1=HDMA
+                if (!hdma) {
+                    // GDMA: transfer all bytes immediately
+                    for (int i = 0; i < len; i++) {
+                        byte b = mem_read((src + i) & 0xFFFF);
+                        gpu_write((dst + i) & 0x9FFF, b);
+                    }
+                    RAM[0xFF55] = 0xFF;  // transfer complete
+                } else {
+                    // HDMA: store length for H-Blank DMA (not yet fully implemented; stub)
+                    RAM[0xFF55] = data & 0x7F;  // remaining blocks
+                }
+            }
             break;
         case 0xFF56:
             // RP: infrared (CGB color mode only)
@@ -2026,23 +2218,33 @@ void mem_write(int pos, byte data) {
             break;
         case 0xFF68:
             // BCPS: BG color palette spec (CGB color mode only)
-            if (CGB_COLOR_MODE())
-                RAM[0xFF68] = data;
+            if (gb_model == MODEL_GBC)
+                RAM[0xFF68] = data & 0xBF;  // bit 6 always 0 on write; bit 7=auto-incr
             break;
         case 0xFF69:
-            // BCPD: BG color palette data (CGB color mode only)
-            if (CGB_COLOR_MODE())
-                RAM[0xFF69] = data;
+            // BCPD: BG color palette data — write to palette RAM with optional auto-increment
+            if (gb_model == MODEL_GBC) {
+                uint8_t idx = RAM[0xFF68] & 0x3F;
+                cgb_bg_pal[idx] = data;
+                if (RAM[0xFF68] & 0x80) {  // auto-increment
+                    RAM[0xFF68] = (RAM[0xFF68] & 0x80) | ((idx + 1) & 0x3F);
+                }
+            }
             break;
         case 0xFF6A:
             // OCPS: OBJ color palette spec (CGB color mode only)
-            if (CGB_COLOR_MODE())
-                RAM[0xFF6A] = data;
+            if (gb_model == MODEL_GBC)
+                RAM[0xFF6A] = data & 0xBF;
             break;
         case 0xFF6B:
-            // OCPD: OBJ color palette data (CGB color mode only)
-            if (CGB_COLOR_MODE())
-                RAM[0xFF6B] = data;
+            // OCPD: OBJ color palette data — write to palette RAM with optional auto-increment
+            if (gb_model == MODEL_GBC) {
+                uint8_t idx = RAM[0xFF6A] & 0x3F;
+                cgb_obj_pal[idx] = data;
+                if (RAM[0xFF6A] & 0x80) {  // auto-increment
+                    RAM[0xFF6A] = (RAM[0xFF6A] & 0x80) | ((idx + 1) & 0x3F);
+                }
+            }
             break;
         case 0xFF6C:
             // OPRI: OBJ priority mode (CGB hardware)
@@ -2151,19 +2353,21 @@ void mem_write(int pos, byte data) {
                 if (vram_write_accessible(proj))
                     gpu_write(pos, data);
             } else if (pos >= 0xA000 && pos <= 0xBFFF) {
-                int ram_bank = is_mbc3() ? cart_ram_bank : (cart_mbc1_mode == 1 ? cart_mbc1_upper : 0);
-                int idx = ram_bank * 0x2000 + (pos - 0xA000);
-                ext_ram[idx] = data;
-                ext_ram_dirty = true;
-                // Detect blargg test completion: A000 written with non-0x80 value
-                // when magic bytes DE B0 61 are present at A001-A003
-                if (pos == 0xA000 && data != 0x80 &&
-                    ext_ram[1] == 0xDE && ext_ram[2] == 0xB0 && ext_ram[3] == 0x61) {
-                    blargg_done = true;
+                // MBC3 RTC register write (bank select 0x08-0x0C): ignore writes to RTC
+                if (is_mbc3() && cart_ram_bank >= 0x08) {
+                    /* RTC register write — stubbed, ignore */
+                } else {
+                    int ram_bank = is_mbc3() ? (cart_ram_bank & 0x03) : (cart_mbc1_mode == 1 ? cart_mbc1_upper : 0);
+                    int idx = ram_bank * 0x2000 + (pos - 0xA000);
+                    ext_ram[idx] = data;
+                    ext_ram_dirty = true;
+                    // Detect blargg test completion: A000 written with non-0x80 value
+                    // when magic bytes DE B0 61 are present at A001-A003
+                    if (pos == 0xA000 && data != 0x80 &&
+                        ext_ram[1] == 0xDE && ext_ram[2] == 0xB0 && ext_ram[3] == 0x61) {
+                        blargg_done = true;
+                    }
                 }
-                // In headless mode, drain the blargg text buffer when the blargg
-                // No per-write drain check needed here; drain is triggered in the
-                // main loop by monitoring the $D883/$D884 text pointer value.
             } else {
                 RAM[pos] = data;
             }
@@ -2178,6 +2382,10 @@ char *serial_get_output(void) {
 void mem_init(void){
     memset(RAM, 0, 0xffff + 1);
     memset(ext_ram, 0, sizeof(ext_ram));
+    memset(VRAM1, 0, sizeof(VRAM1));
+    memset(cgb_wram, 0, sizeof(cgb_wram));
+    memset(cgb_bg_pal, 0xFF, sizeof(cgb_bg_pal));   // palette RAM powers on as $FF
+    memset(cgb_obj_pal, 0xFF, sizeof(cgb_obj_pal));
     serial_buf_len = 0;
     serial_buf[0] = '\0';
     serial_sb = 0;

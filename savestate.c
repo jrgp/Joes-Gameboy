@@ -99,6 +99,12 @@ extern byte  LCDC_REG;
 extern byte  BGP_REG;
 extern byte  VRAM[0x2000];
 
+/* CGB extra data */
+extern byte     VRAM1[0x2000];      /* VRAM bank 1 */
+extern uint8_t  cgb_wram[8 * 4096]; /* CGB WRAM banks 0-7 */
+extern uint8_t  cgb_bg_pal[64];     /* CGB BG palette RAM */
+extern uint8_t  cgb_obj_pal[64];    /* CGB OBJ palette RAM */
+
 /* GPU internals (static in gb.c — accessed via helper accessors below) */
 /* We export these via save/load accessor pairs defined near them in gb.c */
 
@@ -292,7 +298,7 @@ static void get_string(const cbor_item_t *map, const char *key,
 }
 
 /* ---- Number of fields in the map — keep in sync with MAP_* calls below ---- */
-#define SS_MAP_SIZE 76
+#define SS_MAP_SIZE 80  /* 76 base + 4 CGB fields (vram1, cgb_wram, cgb_bg_pal, cgb_obj_pal) */
 
 /* ---- save_state_internal: shared implementation ---- */
 
@@ -399,6 +405,12 @@ static bool save_state_internal(const char *path, const char *slot_name) {
     MAP_BOOL(map, "dbl_spd",     double_speed);
     MAP_U8  (map, "joypad",      joypad);
     MAP_BOOL(map, "in_bios",     inBios);
+
+    /* CGB extended state (optional — missing on load uses defaults) */
+    MAP_BYTES(map, "vram1",      VRAM1, 0x2000);
+    MAP_BYTES(map, "cgb_wram",   cgb_wram, 8 * 4096);
+    MAP_BYTES(map, "cgb_bg_pal", cgb_bg_pal, 64);
+    MAP_BYTES(map, "cgb_obj_pal",cgb_obj_pal, 64);
 
     /* Optional slot metadata (only written when slot_name is non-empty) */
     if (has_meta) {
@@ -608,6 +620,12 @@ bool load_state(const char *path) {
     double_speed = get_bool(root, "dbl_spd", false);
     joypad       = get_u8  (root, "joypad",  0x3F);
     inBios       = get_bool(root, "in_bios", false);
+
+    /* CGB extended state (optional; missing in old saves → keep defaults) */
+    get_bytes(root, "vram1",      VRAM1,      0x2000);
+    get_bytes(root, "cgb_wram",   cgb_wram,   8 * 4096);
+    get_bytes(root, "cgb_bg_pal", cgb_bg_pal, 64);
+    get_bytes(root, "cgb_obj_pal",cgb_obj_pal,64);
 
     cbor_decref(&root);
 
