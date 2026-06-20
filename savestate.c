@@ -139,6 +139,12 @@ extern int  apu_ch1_length;
 extern bool apu_ch2_active;
 extern bool apu_ch2_length_enable;
 extern int  apu_ch2_length;
+extern bool apu_ch3_active;
+extern bool apu_ch3_length_enable;
+extern int  apu_ch3_length;
+extern bool apu_ch4_active;
+extern bool apu_ch4_length_enable;
+extern int  apu_ch4_length;
 extern int  apu_length_cycles;
 
 /* Misc */
@@ -306,7 +312,7 @@ static void get_string(const cbor_item_t *map, const char *key,
 }
 
 /* ---- Number of fields in the map — keep in sync with MAP_* calls below ---- */
-#define SS_MAP_SIZE 84  /* 76 base + 4 CGB fields (vram1/wram/pals) + 4 HDMA fields */
+#define SS_MAP_SIZE 90  /* 76 base + 6 ch3/ch4 APU + 4 CGB fields + 4 HDMA fields */
 
 /* ---- save_state_internal: shared implementation ---- */
 
@@ -407,6 +413,12 @@ static bool save_state_internal(const char *path, const char *slot_name) {
     MAP_BOOL(map, "apu_ch2_on",      apu_ch2_active);
     MAP_BOOL(map, "apu_ch2_len_en",  apu_ch2_length_enable);
     MAP_INT (map, "apu_ch2_len",     apu_ch2_length);
+    MAP_BOOL(map, "apu_ch3_on",      apu_ch3_active);
+    MAP_BOOL(map, "apu_ch3_len_en",  apu_ch3_length_enable);
+    MAP_INT (map, "apu_ch3_len",     apu_ch3_length);
+    MAP_BOOL(map, "apu_ch4_on",      apu_ch4_active);
+    MAP_BOOL(map, "apu_ch4_len_en",  apu_ch4_length_enable);
+    MAP_INT (map, "apu_ch4_len",     apu_ch4_length);
     MAP_INT (map, "apu_cyc",         apu_length_cycles);
 
     /* Misc */
@@ -626,6 +638,12 @@ bool load_state(const char *path) {
     apu_ch2_active        = get_bool(root, "apu_ch2_on",     false);
     apu_ch2_length_enable = get_bool(root, "apu_ch2_len_en", false);
     apu_ch2_length        = (int)get_int(root,  "apu_ch2_len",   0);
+    apu_ch3_active        = get_bool(root, "apu_ch3_on",     false);
+    apu_ch3_length_enable = get_bool(root, "apu_ch3_len_en", false);
+    apu_ch3_length        = (int)get_int(root,  "apu_ch3_len",   0);
+    apu_ch4_active        = get_bool(root, "apu_ch4_on",     false);
+    apu_ch4_length_enable = get_bool(root, "apu_ch4_len_en", false);
+    apu_ch4_length        = (int)get_int(root,  "apu_ch4_len",   0);
     apu_length_cycles     = (int)get_int(root,  "apu_cyc",       0);
 
     /* Misc */

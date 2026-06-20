@@ -122,6 +122,13 @@ int  apu_ch1_length = 0;   // remaining length ticks
 bool apu_ch2_active = false;
 bool apu_ch2_length_enable = false;
 int  apu_ch2_length = 0;   // remaining length ticks
+// Channels 3 (wave) and 4 (noise) — minimal status tracking for NR52/length-counter accuracy
+bool apu_ch3_active = false;
+bool apu_ch3_length_enable = false;
+int  apu_ch3_length = 0;
+bool apu_ch4_active = false;
+bool apu_ch4_length_enable = false;
+int  apu_ch4_length = 0;
 int  apu_length_cycles = 0;
 
 typedef struct {
@@ -1798,11 +1805,19 @@ void apu_step(int cpu_cycles) {
         // On DMG, length only clocks while the channel is active.
         bool ch1_len = apu_ch1_length_enable && (apu_ch1_active || gb_model == MODEL_GBC);
         bool ch2_len = apu_ch2_length_enable && (apu_ch2_active || gb_model == MODEL_GBC);
+        bool ch3_len = apu_ch3_length_enable && (apu_ch3_active || gb_model == MODEL_GBC);
+        bool ch4_len = apu_ch4_length_enable && (apu_ch4_active || gb_model == MODEL_GBC);
         if (ch1_len) {
             if (--apu_ch1_length <= 0) apu_ch1_active = false;
         }
         if (ch2_len) {
             if (--apu_ch2_length <= 0) apu_ch2_active = false;
+        }
+        if (ch3_len) {
+            if (--apu_ch3_length <= 0) apu_ch3_active = false;
+        }
+        if (ch4_len) {
+            if (--apu_ch4_length <= 0) apu_ch4_active = false;
         }
     }
 }
@@ -2003,6 +2018,8 @@ byte mem_read(int pos) {
                 return (RAM[0xFF26] & 0x80) |
                        (apu_ch1_active ? 0x01 : 0x00) |
                        (apu_ch2_active ? 0x02 : 0x00) |
+                       (apu_ch3_active ? 0x04 : 0x00) |
+                       (apu_ch4_active ? 0x08 : 0x00) |
                        0x70; // unused bits read as 1
             case INTERRUPT_FLAGS: {
                 // DMG: upper 3 bits of IF are always 1.
@@ -2104,9 +2121,15 @@ void mem_write(int pos, byte data) {
         if (gb_model == MODEL_GBC &&
             (pos == 0xFF11 || pos == 0xFF16 || pos == 0xFF1B || pos == 0xFF20)) {
             /* Length counter bits writable on CGB even with APU off */
-            RAM[pos] = data & 0x3F;
-            if (pos == 0xFF11) apu_ch1_length = 64 - (int)(data & 0x3Fu);
-            if (pos == 0xFF16) apu_ch2_length = 64 - (int)(data & 0x3Fu);
+            if (pos == 0xFF1B) {
+                RAM[pos] = data;                        // NR31: all 8 bits
+                apu_ch3_length = 256 - (int)data;
+            } else {
+                RAM[pos] = data & 0x3F;
+                if (pos == 0xFF11) apu_ch1_length = 64 - (int)(data & 0x3Fu);
+                if (pos == 0xFF16) apu_ch2_length = 64 - (int)(data & 0x3Fu);
+                if (pos == 0xFF20) apu_ch4_length = 64 - (int)(data & 0x3Fu);
+            }
         }
         return; /* ignore all other APU writes while power is off */
     }
@@ -2358,6 +2381,42 @@ void mem_write(int pos, byte data) {
                 apu_length_cycles = 0; // sync phase on trigger
             }
             break;
+        // APU channel 3 (wave) registers — minimal status tracking
+        case 0xFF1A: // NR30: DAC enable (bit 7)
+            RAM[pos] = data;
+            if (!(data & 0x80)) apu_ch3_active = false; // DAC off → deactivate
+            break;
+        case 0xFF1B: // NR31: length (all 8 bits)
+            RAM[pos] = data;
+            apu_ch3_length = 256 - data;
+            break;
+        case 0xFF1E: // NR34: trigger + length enable
+            RAM[pos] = data;
+            apu_ch3_length_enable = (data >> 6) & 1;
+            if (data & 0x80) { // trigger
+                if (RAM[0xFF1A] & 0x80) apu_ch3_active = true; // DAC must be on
+                if (apu_ch3_length == 0) apu_ch3_length = 256;
+                apu_length_cycles = 0;
+            }
+            break;
+        // APU channel 4 (noise) registers — minimal status tracking
+        case 0xFF20: // NR41: length (bits 5:0)
+            RAM[pos] = data & 0x3F; // only bits 5:0 writable
+            apu_ch4_length = 64 - (data & 0x3F);
+            break;
+        case 0xFF21: // NR42: volume/envelope
+            RAM[pos] = data;
+            if ((data & 0xF8) == 0) apu_ch4_active = false; // DAC off
+            break;
+        case 0xFF23: // NR44: trigger + length enable
+            RAM[pos] = data;
+            apu_ch4_length_enable = (data >> 6) & 1;
+            if (data & 0x80) { // trigger
+                if (RAM[0xFF21] & 0xF8) apu_ch4_active = true; // DAC must be on
+                if (apu_ch4_length == 0) apu_ch4_length = 64;
+                apu_length_cycles = 0;
+            }
+            break;
         case 0xFF26: // NR52: sound master on/off
             RAM[pos] = data & 0x80;
             if (!(data & 0x80)) {
@@ -2365,6 +2424,8 @@ void mem_write(int pos, byte data) {
                 // On both DMG and CGB, all NRxy regs read as $00 when APU is off.
                 apu_ch1_active = false; apu_ch1_length_enable = false; apu_ch1_length = 0;
                 apu_ch2_active = false; apu_ch2_length_enable = false; apu_ch2_length = 0;
+                apu_ch3_active = false; apu_ch3_length_enable = false; apu_ch3_length = 0;
+                apu_ch4_active = false; apu_ch4_length_enable = false; apu_ch4_length = 0;
                 apu_length_cycles = 0;
                 // Clear NR10-NR51 (FF10-FF25)
                 for (int r = 0xFF10; r <= 0xFF25; r++) RAM[r] = 0;
@@ -2452,6 +2513,12 @@ void mem_init(void){
     apu_ch2_active = false;
     apu_ch2_length_enable = false;
     apu_ch2_length = 0;
+    apu_ch3_active = false;
+    apu_ch3_length_enable = false;
+    apu_ch3_length = 0;
+    apu_ch4_active = false;
+    apu_ch4_length_enable = false;
+    apu_ch4_length = 0;
     apu_length_cycles = 0;
     inBios = true;
     bailAfterBios = true;
