@@ -481,6 +481,23 @@ static int callback_gb(struct lws *wsi, enum lws_callback_reasons reason,
     return lws_callback_http_dummy(wsi, reason, user, in, len);
 }
 
+/* ---- WebSocket extensions ---- */
+
+/* Offer permessage-deflate (RFC 7692) to all WebSocket clients.
+ * This is negotiated in the WS handshake via:
+ *   Sec-WebSocket-Extensions: permessage-deflate
+ * LWS handles deflate/inflate transparently — no wire format changes needed.
+ * client_no_context_takeover: each message compressed independently (lower
+ * memory, negligible penalty for our large binary frames). */
+static const struct lws_extension g_extensions[] = {
+    {
+        "permessage-deflate",
+        lws_extension_callback_pm_deflate,
+        "permessage-deflate; client_no_context_takeover; server_no_context_takeover"
+    },
+    { NULL, NULL, NULL }
+};
+
 /* ---- Protocol table ---- */
 
 static struct lws_protocols protocols[] = {
@@ -502,10 +519,11 @@ bool ws_server_init(const char *bind_addr, int port)
 
     struct lws_context_creation_info info;
     memset(&info, 0, sizeof(info));
-    info.port      = port;
-    info.iface     = bind_addr;
-    info.protocols = protocols;
-    info.options   = 0;
+    info.port       = port;
+    info.iface      = bind_addr;
+    info.protocols  = protocols;
+    info.extensions = g_extensions;  /* enable permessage-deflate */
+    info.options    = 0;
 
     g_context = lws_create_context(&info);
     if (!g_context) {
@@ -515,7 +533,7 @@ bool ws_server_init(const char *bind_addr, int port)
     g_main_protocol = &protocols[0];
 
     g_stats.last_log = time(NULL);
-    fprintf(stderr, "[ws] listening on port %d\n", port);
+    fprintf(stderr, "[ws] listening on port %d (permessage-deflate enabled)\n", port);
     return true;
 }
 
