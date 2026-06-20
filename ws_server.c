@@ -4,44 +4,31 @@
  * One LWS protocol handles both HTTP (serving the page) and WebSocket
  * (streaming frames + receiving input/commands).
  *
- * Transport modes (per connection, selected by client via message 0x07):
+ * Rendering modes:
+ *   DMG mode — optimized monochrome transport; client applies palette.
+ *   CGB mode — server sends true RGB colors; client displays them directly.
+ *
+ * Transport modes (per connection, DMG mode only, selected by client via 0x07):
  *   TRANSPORT_RELIABLE — always send full framebuffers (default).
- *                        Best for LAN and low-latency links.
  *   TRANSPORT_FAST     — tile-diff with periodic keyframes.
- *                        Best for VPN and bandwidth-constrained links.
  *
  * Wire protocol (binary WebSocket messages):
  *   Server → Client:
- *     [0x01] + 5760 bytes
- *         Full framebuffer, 2bpp packed, 4 pixels/byte, MSB-first.
- *         Palette indices 0-3: 0=white(FF), 1=lt-grey(AA), 2=dk-grey(55), 3=black(00).
- *         Always sent in TRANSPORT_RELIABLE mode.
- *         Sent in TRANSPORT_FAST mode on connection, forced keyframe events
- *         (reset, load-state), periodic keyframe interval, or when
- *         >TILE_FULL_THRESHOLD tiles changed in one frame.
- *
- *     [0x10] + [count_lo, count_hi: uint16 LE] + count × tile_entry
- *         Tile update batch.  Only changed 8×8 tiles are sent.
- *         tile_entry = [tile_x: u8, tile_y: u8] + 16 bytes of 2bpp tile data
- *                      (8 rows × 2 bytes/row; same 2bpp encoding as full frame).
- *         The client patches each tile into its local framebuffer copy.
- *         Sent only in TRANSPORT_FAST mode when ≤ TILE_FULL_THRESHOLD tiles changed.
+ *     [0x01] + 5760 bytes      — DMG full frame (2bpp, palette indices 0-3).
+ *     [0x10] + count16 + tiles — DMG tile update batch (Fast transport only).
+ *     [0x11] + 69120 bytes     — CGB full frame (RGB888, 160×144×3 bytes, R-G-B order).
+ *     [0x12] + JSON            — Slot info update.
+ *     [0x13, mode]             — Mode announcement (0=DMG, 1=CGB); sent on connect.
  *
  *   Client → Server:
- *     [0x02, bitmask]   — joypad update (bit0=RIGHT,1=LEFT,2=UP,3=DOWN,
- *                                         bit4=A,5=B,6=SELECT,7=START)
+ *     [0x02, bitmask]   — joypad
  *     [0x03]            — save state
- *     [0x04]            — load state  (server sends a keyframe on next frame)
- *     [0x05]            — reset       (server sends a keyframe on next frame)
+ *     [0x04]            — load state
+ *     [0x05]            — reset
  *     [0x06]            — fast-mode toggle
- *     [0x07, mode]      — set transport mode: 0=RELIABLE (full frames), 1=FAST (tile-diff)
- *     [0x08, slot, name_len, ...name]
- *                       — save to slot N (1-5); name is UTF-8, name_len=0 for unnamed
- *     [0x09, slot]      — load from slot N (1-5)
- *
- *   Server → Client (new):
- *     [0x12] + JSON     — slot info update (sent on connect, after save/load)
- *                         JSON: [{slot,exists,name,ts}, ...] for all SS_NUM_SLOTS slots
+ *     [0x07, mode]      — set transport mode: 0=RELIABLE, 1=FAST (DMG only)
+ *     [0x08, slot, name_len, ...name] — save to slot N
+ *     [0x09, slot]      — load from slot N
  */
 
 #include "ws_server.h"
@@ -62,6 +49,7 @@
 extern void gb_set_button(int bit, bool pressed);
 extern void gb_reset(void);
 extern char savestate_rom_path[4096];
+extern bool gb_is_cgb_mode(void);
 
 /* ---- Embedded HTML frontend (generated from frontend/index.html) ---- */
 
@@ -84,8 +72,10 @@ extern char savestate_rom_path[4096];
  * 180 frames ≈ 3 seconds at 60 fps.                                      */
 #define KEYFRAME_INTERVAL_FRAMES 180
 
-#define MSG_FULL_FRAME  0x01
-#define MSG_TILE_BATCH  0x10
+#define MSG_FULL_FRAME  0x01   /* DMG: 2bpp full frame                      */
+#define MSG_TILE_BATCH  0x10   /* DMG: tile-diff update batch                */
+#define MSG_CGB_FRAME   0x11   /* CGB: RGB888 full frame (160×144×3 bytes)   */
+#define MSG_MODE_INFO   0x13   /* mode announcement: [0x13, mode] (0=DMG,1=CGB) */
 
 /* ---- Wire format sizes ---- */
 
@@ -97,14 +87,25 @@ extern char savestate_rom_path[4096];
 #define WS_TILE_BATCH_HDR    3                               /* type+count16 */
 #define WS_TILE_BATCH_MAX    (WS_TILE_BATCH_HDR + TILE_FULL_THRESHOLD * WS_TILE_ENTRY_BYTES)
 
-/* Send buffer: large enough for either message type */
+/* ---- Wire size constants ---- */
+/* DMG send buffer covers both full-frame and tile-batch */
 #define WS_SEND_BUF_MAX  WS_FRAME_BYTES   /* 5761 > WS_TILE_BATCH_MAX(5403) */
+
+/* CGB full frame: type byte + 160×144×3 bytes of RGB888 */
+#define WS_CGB_PIXELS    (160 * 144 * 3)       /* 69120 bytes */
+#define WS_CGB_FRAME_BYTES (1 + WS_CGB_PIXELS) /* 69121 bytes */
 
 /* ---- Global framebuffer state ---- */
 
-/* Current and previous 2bpp encoded frames for tile diffing */
+/* DMG: current and previous 2bpp encoded frames for tile diffing */
 static uint8_t g_curr_2bpp[WS_FRAME_2BPP_PAYLOAD];
 static uint8_t g_prev_2bpp[WS_FRAME_2BPP_PAYLOAD];
+
+/* CGB: current RGB888 frame (R,G,B triples, row-major) */
+static uint8_t g_curr_rgb[WS_CGB_PIXELS];
+
+/* Current rendering mode (updated in ws_server_notify_frame) */
+static bool g_is_cgb = false;
 
 /* Tile-batch buffer (payload ready for lws_write, including type+count bytes) */
 static uint8_t g_tile_batch[WS_TILE_BATCH_MAX];
@@ -132,8 +133,10 @@ static uint32_t      g_slot_info_version = 1; /* incremented when slots change *
 static void ws_build_slot_info(void);
 static void ws_notify_all_slot_info(void);
 
-/* Send buffer (LWS_PRE headroom + payload) */
-static unsigned char g_send_buf[LWS_PRE + WS_SEND_BUF_MAX];
+/* Send buffers (LWS_PRE headroom + payload) */
+static unsigned char g_send_buf[LWS_PRE + WS_SEND_BUF_MAX];         /* DMG frames  */
+static unsigned char g_cgb_send_buf[LWS_PRE + WS_CGB_FRAME_BYTES];  /* CGB frames  */
+static unsigned char g_mode_buf[LWS_PRE + 2];                        /* mode announ */
 
 static struct lws_context *g_context = NULL;
 static const struct lws_protocols *g_main_protocol = NULL;  /* set in ws_server_init */
@@ -163,9 +166,10 @@ typedef struct {
     bool             is_ws;
     bool             html_sent;
     uint32_t         last_sent_seq;
-    bool             needs_keyframe;    /* FAST mode: send full frame next tick    */
-    transport_mode_t transport;         /* per-connection transport selection      */
-    uint32_t         last_slot_version; /* 0 on new conn → triggers slot info send */
+    bool             needs_keyframe;       /* FAST mode: send full frame next tick   */
+    bool             needs_mode_announce;  /* true until 0x13 mode msg is sent       */
+    transport_mode_t transport;            /* per-connection transport selection     */
+    uint32_t         last_slot_version;    /* 0 on new conn → triggers slot info send */
 } per_session_t;
 
 /* ---- Forward declarations ---- */
@@ -289,12 +293,13 @@ static int callback_gb(struct lws *wsi, enum lws_callback_reasons reason,
     /* ---- WebSocket: connection established ---- */
     case LWS_CALLBACK_ESTABLISHED: {
         if (pss) {
-            pss->is_ws          = true;
-            pss->last_sent_seq  = 0;
-            pss->needs_keyframe = true;    /* always send full frame on connect */
-            pss->transport      = TRANSPORT_RELIABLE;
-            pss->last_slot_version = 0;    /* ensures slot info is sent on first writeable */
-            ws_build_slot_info();          /* refresh from disk for this connection */
+            pss->is_ws               = true;
+            pss->last_sent_seq       = 0;
+            pss->needs_keyframe      = true;    /* always send full frame on connect */
+            pss->needs_mode_announce = true;    /* announce DMG/CGB mode first       */
+            pss->transport           = TRANSPORT_RELIABLE;
+            pss->last_slot_version   = 0;       /* ensures slot info is sent on first writeable */
+            ws_build_slot_info();               /* refresh from disk for this connection */
             lws_callback_on_writable(wsi);
         }
         char peer[64] = "?";
@@ -415,9 +420,17 @@ static int callback_gb(struct lws *wsi, enum lws_callback_reasons reason,
     case LWS_CALLBACK_SERVER_WRITEABLE: {
         if (!pss || !pss->is_ws) return 0;
 
-        /* Slot info takes priority — send first if client is out of date.
-         * lws_write is called at most once per WRITEABLE; if frame data is
-         * also pending we request another writable callback afterwards.    */
+        /* Priority 1: mode announcement (once per connection, before anything else). */
+        if (pss->needs_mode_announce) {
+            pss->needs_mode_announce = false;
+            g_mode_buf[LWS_PRE]     = MSG_MODE_INFO;
+            g_mode_buf[LWS_PRE + 1] = g_is_cgb ? 1 : 0;
+            lws_write(wsi, g_mode_buf + LWS_PRE, 2, LWS_WRITE_BINARY);
+            lws_callback_on_writable(wsi);
+            return 0;
+        }
+
+        /* Priority 2: slot info if client is out of date. */
         if (pss->last_slot_version != g_slot_info_version && g_slot_info_len > 0) {
             lws_write(wsi, g_slot_info_buf + LWS_PRE,
                       (size_t)g_slot_info_len, LWS_WRITE_BINARY);
@@ -429,14 +442,18 @@ static int callback_gb(struct lws *wsi, enum lws_callback_reasons reason,
 
         if (pss->last_sent_seq == g_frame_seq) return 0;
 
-        if (pss->transport == TRANSPORT_RELIABLE) {
-            /* Reliable mode: always send the complete framebuffer. */
+        if (g_is_cgb) {
+            /* CGB mode: always send full RGB888 frame. */
+            lws_write(wsi, g_cgb_send_buf + LWS_PRE,
+                      (size_t)WS_CGB_FRAME_BYTES, LWS_WRITE_BINARY);
+        } else if (pss->transport == TRANSPORT_RELIABLE) {
+            /* DMG reliable mode: always send the complete framebuffer. */
             g_send_buf[LWS_PRE] = MSG_FULL_FRAME;
             memcpy(g_send_buf + LWS_PRE + 1, g_curr_2bpp, WS_FRAME_2BPP_PAYLOAD);
             lws_write(wsi, g_send_buf + LWS_PRE,
                       (size_t)WS_FRAME_BYTES, LWS_WRITE_BINARY);
         } else {
-            /* Fast mode: use tile-diff; full frame on keyframe events or threshold. */
+            /* DMG fast mode: use tile-diff; full frame on keyframe events or threshold. */
             bool send_full = g_send_full_frame || pss->needs_keyframe;
 
             if (send_full) {
@@ -510,117 +527,129 @@ static void ws_server_force_keyframe(void)
 
 void ws_server_notify_frame(const uint32_t *pixels, int w, int h)
 {
-    /* --- Step 1: Encode full frame to g_curr_2bpp ---
-     * R channel (byte 0 of uint32) identifies shade; G=B=R for greyscale. */
-    int n = w * h;
-    for (int i = 0; i < n; i += 4) {
-        uint8_t byte = 0;
-        for (int j = 0; j < 4; j++) {
-            uint8_t r = (uint8_t)(pixels[i + j] & 0xFFu);
-            uint8_t idx;
-            if      (r == 0xFFu) idx = 0;
-            else if (r == 0xAAu) idx = 1;
-            else if (r == 0x55u) idx = 2;
-            else                 idx = 3;
-            byte |= (uint8_t)(idx << (6 - j * 2));
-        }
-        g_curr_2bpp[i / 4] = byte;
-    }
+    /* Update the rendering mode flag each frame. */
+    g_is_cgb = gb_is_cgb_mode();
 
-    /* --- Step 2: Determine what to send --- */
-    if (g_force_keyframe || g_frames_since_keyframe >= KEYFRAME_INTERVAL_FRAMES) {
-        /* Forced or periodic keyframe: send full frame to all clients */
-        g_send_full_frame        = true;
-        g_tile_batch_len         = 0;
-        g_force_keyframe         = false;
-        g_frames_since_keyframe  = 0;
+    if (g_is_cgb) {
+        /* --- CGB mode: encode pixels as RGB888 --- */
+        int n = w * h;
+        for (int i = 0; i < n; i++) {
+            uint32_t px = pixels[i];
+            g_curr_rgb[i * 3]     = (uint8_t)(px & 0xFFu);        /* R */
+            g_curr_rgb[i * 3 + 1] = (uint8_t)((px >> 8) & 0xFFu); /* G */
+            g_curr_rgb[i * 3 + 2] = (uint8_t)((px >> 16) & 0xFFu);/* B */
+        }
+        /* Build the CGB send buffer once (shared across all connections). */
+        g_cgb_send_buf[LWS_PRE] = MSG_CGB_FRAME;
+        memcpy(g_cgb_send_buf + LWS_PRE + 1, g_curr_rgb, WS_CGB_PIXELS);
+
         g_stats.full_frames++;
-        g_stats.bytes_out += WS_FRAME_BYTES;
+        g_stats.bytes_out += (uint64_t)WS_CGB_FRAME_BYTES;
     } else {
-        /* Tile diff: find changed 8×8 tiles */
-        uint16_t changed[WS_TILES_TOTAL];
-        int changed_count = 0;
-
-        for (int ty = 0; ty < WS_TILES_Y; ty++) {
-            for (int tx = 0; tx < WS_TILES_X; tx++) {
-                bool dirty = false;
-                for (int r = 0; r < 8 && !dirty; r++) {
-                    int off = (ty * 8 + r) * WS_ROW_BYTES + tx * 2;
-                    if (g_curr_2bpp[off]   != g_prev_2bpp[off] ||
-                        g_curr_2bpp[off+1] != g_prev_2bpp[off+1])
-                        dirty = true;
-                }
-                if (dirty)
-                    changed[changed_count++] = (uint16_t)(ty * WS_TILES_X + tx);
+        /* --- DMG mode: encode pixels as 2bpp --- */
+        int n = w * h;
+        for (int i = 0; i < n; i += 4) {
+            uint8_t byte = 0;
+            for (int j = 0; j < 4; j++) {
+                uint8_t r = (uint8_t)(pixels[i + j] & 0xFFu);
+                uint8_t idx;
+                if      (r == 0xFFu) idx = 0;
+                else if (r == 0xAAu) idx = 1;
+                else if (r == 0x55u) idx = 2;
+                else                 idx = 3;
+                byte |= (uint8_t)(idx << (6 - j * 2));
             }
+            g_curr_2bpp[i / 4] = byte;
         }
 
-        if (changed_count == 0) {
-            /* Nothing changed */
-            g_send_full_frame = false;
-            g_tile_batch_len  = 0;
-            g_stats.no_change++;
-        } else if (changed_count > TILE_FULL_THRESHOLD) {
-            /* Too many tiles — full frame is cheaper; also resets keyframe counter */
+        /* Determine what to send (same tile-diff logic as before). */
+        if (g_force_keyframe || g_frames_since_keyframe >= KEYFRAME_INTERVAL_FRAMES) {
             g_send_full_frame        = true;
             g_tile_batch_len         = 0;
+            g_force_keyframe         = false;
             g_frames_since_keyframe  = 0;
             g_stats.full_frames++;
             g_stats.bytes_out += WS_FRAME_BYTES;
         } else {
-            /* Build tile-batch payload */
-            g_send_full_frame   = false;
-            g_tile_batch[0]     = MSG_TILE_BATCH;
-            g_tile_batch[1]     = (uint8_t)(changed_count & 0xFF);
-            g_tile_batch[2]     = (uint8_t)(changed_count >> 8);
-            int pos = WS_TILE_BATCH_HDR;
+            uint16_t changed[WS_TILES_TOTAL];
+            int changed_count = 0;
 
-            for (int i = 0; i < changed_count; i++) {
-                int tx = changed[i] % WS_TILES_X;
-                int ty = changed[i] / WS_TILES_X;
-                g_tile_batch[pos++] = (uint8_t)tx;
-                g_tile_batch[pos++] = (uint8_t)ty;
-                for (int r = 0; r < 8; r++) {
-                    int off = (ty * 8 + r) * WS_ROW_BYTES + tx * 2;
-                    g_tile_batch[pos++] = g_curr_2bpp[off];
-                    g_tile_batch[pos++] = g_curr_2bpp[off + 1];
+            for (int ty = 0; ty < WS_TILES_Y; ty++) {
+                for (int tx = 0; tx < WS_TILES_X; tx++) {
+                    bool dirty = false;
+                    for (int r = 0; r < 8 && !dirty; r++) {
+                        int off = (ty * 8 + r) * WS_ROW_BYTES + tx * 2;
+                        if (g_curr_2bpp[off]   != g_prev_2bpp[off] ||
+                            g_curr_2bpp[off+1] != g_prev_2bpp[off+1])
+                            dirty = true;
+                    }
+                    if (dirty)
+                        changed[changed_count++] = (uint16_t)(ty * WS_TILES_X + tx);
                 }
             }
-            g_tile_batch_len = pos;
-            g_stats.tile_batches++;
-            g_stats.tiles_sent += (uint64_t)changed_count;
-            g_stats.bytes_out  += (uint64_t)pos;
+
+            if (changed_count == 0) {
+                g_send_full_frame = false;
+                g_tile_batch_len  = 0;
+                g_stats.no_change++;
+            } else if (changed_count > TILE_FULL_THRESHOLD) {
+                g_send_full_frame        = true;
+                g_tile_batch_len         = 0;
+                g_frames_since_keyframe  = 0;
+                g_stats.full_frames++;
+                g_stats.bytes_out += WS_FRAME_BYTES;
+            } else {
+                g_send_full_frame   = false;
+                g_tile_batch[0]     = MSG_TILE_BATCH;
+                g_tile_batch[1]     = (uint8_t)(changed_count & 0xFF);
+                g_tile_batch[2]     = (uint8_t)(changed_count >> 8);
+                int pos = WS_TILE_BATCH_HDR;
+
+                for (int i = 0; i < changed_count; i++) {
+                    int tx = changed[i] % WS_TILES_X;
+                    int ty = changed[i] / WS_TILES_X;
+                    g_tile_batch[pos++] = (uint8_t)tx;
+                    g_tile_batch[pos++] = (uint8_t)ty;
+                    for (int r = 0; r < 8; r++) {
+                        int off = (ty * 8 + r) * WS_ROW_BYTES + tx * 2;
+                        g_tile_batch[pos++] = g_curr_2bpp[off];
+                        g_tile_batch[pos++] = g_curr_2bpp[off + 1];
+                    }
+                }
+                g_tile_batch_len = pos;
+                g_stats.tile_batches++;
+                g_stats.tiles_sent += (uint64_t)changed_count;
+                g_stats.bytes_out  += (uint64_t)pos;
+            }
         }
+
+        memcpy(g_prev_2bpp, g_curr_2bpp, WS_FRAME_2BPP_PAYLOAD);
+        g_frames_since_keyframe++;
     }
 
-    /* --- Step 3: Roll prev frame --- */
-    memcpy(g_prev_2bpp, g_curr_2bpp, WS_FRAME_2BPP_PAYLOAD);
-    g_frames_since_keyframe++;
     g_frame_seq++;
     g_stats.frame_count++;
 
-    /* --- Step 4: Periodic bandwidth stats --- */
+    /* Periodic bandwidth stats */
     time_t now = time(NULL);
     if (now - g_stats.last_log >= 10 && g_stats.frame_count > 0) {
         double avg = (double)g_stats.bytes_out / g_stats.frame_count;
-        double reduction = 100.0 * (1.0 - avg / WS_FRAME_BYTES);
+        double baseline = g_is_cgb ? (double)WS_CGB_FRAME_BYTES : (double)WS_FRAME_BYTES;
+        double reduction = 100.0 * (1.0 - avg / baseline);
         fprintf(stderr,
-            "[ws-stats] frames=%u full=%u tile-batches=%u no-change=%u "
-            "avg-tiles=%.1f avg-bytes/frame=%.0f vs-full=%.0f savings=%.1f%%\n",
+            "[ws-stats] mode=%s frames=%u full=%u tile-batches=%u no-change=%u "
+            "avg-bytes/frame=%.0f savings=%.1f%%\n",
+            g_is_cgb ? "CGB" : "DMG",
             g_stats.frame_count,
             g_stats.full_frames,
             g_stats.tile_batches,
             g_stats.no_change,
-            g_stats.tile_batches > 0
-                ? (double)g_stats.tiles_sent / g_stats.tile_batches : 0.0,
             avg,
-            (double)WS_FRAME_BYTES,
             reduction);
         memset(&g_stats, 0, sizeof(g_stats));
         g_stats.last_log = now;
     }
 
-    /* --- Step 5: Schedule writeable callbacks --- */
     if (g_context)
         lws_callback_on_writable_all_protocol(g_context, &protocols[0]);
 }

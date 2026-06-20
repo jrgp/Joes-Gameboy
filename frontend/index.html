@@ -53,11 +53,12 @@ canvas{display:block;image-rendering:pixelated;image-rendering:crisp-edges;backg
   <button class='tb' id='brs'>Reset</button>
   <button class='tb' id='bft'>Fast</button>
   <button class='tb' id='brm' style='display:none'>Load ROM</button>
+  <span id='gmode' style='display:none;font-size:10px;padding:3px 6px;border-radius:3px;font-weight:bold'></span>
   <span id='st'>Connecting…</span>
 </div>
 <!-- Settings drawer (toggled by ☰) -->
 <div id='sdrawer'>
-  <div class='sdr-row'>
+  <div class='sdr-row' id='palette-row'>
     <label>Palette</label>
     <select class='tb' id='bpal' title='Palette'></select>
   </div>
@@ -86,7 +87,7 @@ canvas{display:block;image-rendering:pixelated;image-rendering:crisp-edges;backg
 </div>
 <div id='sw'><canvas id='screen' width='160' height='144'></canvas></div>
 <canvas id='ctrl-canvas'></canvas>
-<div id='hint'>Arrows: D-Pad &nbsp; A: A &nbsp; S: B &nbsp; Enter: Start &nbsp; Shift: Select &nbsp; F5: Quick Save &nbsp; F8: Quick Load &nbsp; F: Fast &nbsp; F6/⇧F6: Palette</div>
+<div id='hint'>Arrows: D-Pad &nbsp; A: A &nbsp; S: B &nbsp; Enter: Start &nbsp; Shift: Select &nbsp; F5: Quick Save &nbsp; F8: Quick Load &nbsp; F: Fast &nbsp; F6/⇧F6: Palette (DMG only)</div>
 <script>
 'use strict';
 
@@ -122,12 +123,14 @@ class RemoteBackend {
   constructor(url) {
     this.onframe = null;
     this.onstatus = null;
+    this.onmode = null;       /* called with true=CGB, false=DMG */
     this._url = url;
     this._ws = null;
     this._g_px = new Uint8ClampedArray(160 * 144 * 4);
     this._curr_2bpp = new Uint8Array(5760);      /* local framebuffer copy for tile-diff and re-palette */
     this._PALETTE = new Uint8Array([255,255,255,170,170,170,85,85,85,0,0,0]);
     this._transportMode = 0;   /* 0=RELIABLE, 1=FAST */
+    this._isCgb = false;
     this._connect();
   }
   /* Decode a full 5760-byte 2bpp buffer into _g_px using current palette. */
@@ -140,6 +143,15 @@ class RemoteBackend {
       x=((b>>4)&3)*3; this._g_px[bi++]=this._PALETTE[x];this._g_px[bi++]=this._PALETTE[x+1];this._g_px[bi++]=this._PALETTE[x+2];this._g_px[bi++]=255;
       x=((b>>2)&3)*3; this._g_px[bi++]=this._PALETTE[x];this._g_px[bi++]=this._PALETTE[x+1];this._g_px[bi++]=this._PALETTE[x+2];this._g_px[bi++]=255;
       x=(b&3)*3;      this._g_px[bi++]=this._PALETTE[x];this._g_px[bi++]=this._PALETTE[x+1];this._g_px[bi++]=this._PALETTE[x+2];this._g_px[bi++]=255;
+    }
+  }
+  /* Decode a 69120-byte RGB888 buffer into _g_px (CGB mode). */
+  _decodeRGB888(src) {
+    for (let i = 0, di = 0; i < 69120; i += 3, di += 4) {
+      this._g_px[di]   = src[i];     /* R */
+      this._g_px[di+1] = src[i+1];   /* G */
+      this._g_px[di+2] = src[i+2];   /* B */
+      this._g_px[di+3] = 255;
     }
   }
   /* Patch a single 8x8 tile (tx,ty) from 16 bytes of 2bpp data into _curr_2bpp and _g_px. */
@@ -180,12 +192,12 @@ class RemoteBackend {
     this._ws.onmessage = (e) => {
       const d = new Uint8Array(e.data);
       if (d[0] === 0x01 && d.length === 5761) {
-        /* Full framebuffer */
+        /* DMG full framebuffer (2bpp) */
         this._curr_2bpp.set(d.subarray(1, 5761));
         this._decode2bpp(this._curr_2bpp);
         if (this.onframe) this.onframe(this._g_px);
       } else if (d[0] === 0x10 && d.length >= 3) {
-        /* Tile update batch */
+        /* DMG tile update batch */
         const count = d[1] | (d[2] << 8);
         let pos = 3;
         for (let i = 0; i < count; i++) {
@@ -195,12 +207,21 @@ class RemoteBackend {
           pos += 16;
         }
         if (this.onframe) this.onframe(this._g_px);
+      } else if (d[0] === 0x11 && d.length === 69121) {
+        /* CGB full frame (RGB888) — display server-rendered colors directly */
+        this._decodeRGB888(d.subarray(1));
+        if (this.onframe) this.onframe(this._g_px);
       } else if (d[0] === 0x12) {
         /* Slot info update */
         try {
           const info = JSON.parse(new TextDecoder().decode(d.subarray(1)));
           if (this.onslotinfo) this.onslotinfo(info);
         } catch(_) {}
+      } else if (d[0] === 0x13 && d.length >= 2) {
+        /* Mode announcement: 0=DMG, 1=CGB */
+        const cgb = d[1] === 1;
+        this._isCgb = cgb;
+        if (this.onmode) this.onmode(cgb);
       }
     };
   }
@@ -230,6 +251,7 @@ class RemoteBackend {
   }
   sendLoadSlot(slot) { this._snd(0x09, slot); }
   setPalette(idx) {
+    if (this._isCgb) return;  /* Ignore palette changes in CGB mode */
     const pal = PALETTES[idx] || PALETTES[0];
     for (let i = 0; i < 4; i++) {
       this._PALETTE[i * 3]     = pal.c[i * 3];
@@ -664,6 +686,26 @@ class WasmBackend {
       brom.style.display = 'none';
       document.getElementById('bslots').style.display = '';
       backend.onslotinfo = info => { slotData = info; renderSlots(); };
+      /* Mode change: show/hide palette selector and update mode badge */
+      backend.onmode = (cgb) => {
+        const palRow = document.getElementById('palette-row');
+        const modeBadge = document.getElementById('gmode');
+        if (cgb) {
+          palRow.style.display = 'none';
+          modeBadge.textContent = 'GBC';
+          modeBadge.style.display = '';
+          modeBadge.style.background = '#1a4a2a';
+          modeBadge.style.color = '#6dff8a';
+          modeBadge.style.border = '1px solid #2a7a4a';
+        } else {
+          palRow.style.display = '';
+          modeBadge.textContent = 'DMG';
+          modeBadge.style.display = '';
+          modeBadge.style.background = '#2a2a1a';
+          modeBadge.style.color = '#cccc6d';
+          modeBadge.style.border = '1px solid #6a6a2a';
+        }
+      };
     }
     backend.onframe = renderFrame;
     backend.onstatus = updateStatus;
@@ -686,6 +728,15 @@ class WasmBackend {
       e.preventDefault();
       if (!isWasm) doLoadSlot(activeSlot);
       else if (backend) backend.sendLoad();
+      return;
+    }
+    if (e.key === 'F6' && !isWasm) {
+      e.preventDefault();
+      /* Cycle palette (DMG only; ignored in CGB mode via setPalette guard) */
+      const next = e.shiftKey
+        ? (paletteIdx - 1 + PALETTES.length) % PALETTES.length
+        : (paletteIdx + 1) % PALETTES.length;
+      applyPalette(next);
       return;
     }
     if (e.key === 'f' || e.key === 'F') {

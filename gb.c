@@ -6102,6 +6102,11 @@ void ss_post_load(void) {
 
 /* ---- Public APIs for the WebSocket server layer ---- */
 
+/* Returns true when the current cartridge runs in Game Boy Color mode. */
+bool gb_is_cgb_mode(void) {
+    return gb_model == MODEL_GBC && (cart_cgb_flag & 0x80u);
+}
+
 bool gb_set_model(const char *name) {
     if (strcmp(name, "dmg") == 0 || strcmp(name, "dmgABC") == 0) gb_model = MODEL_DMG;
     else if (strcmp(name, "dmg0") == 0) gb_model = MODEL_DMG0;
