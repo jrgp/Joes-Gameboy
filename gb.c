@@ -1440,6 +1440,126 @@ byte ext_ram[0x8000];    // 32KB external RAM (up to 4 banks × 8KB)
 int  cart_ram_size = 0;  // actual cartridge RAM in bytes (from header byte $0149)
 bool ext_ram_dirty = false; /* set on any ext_ram write; cleared after sav_save */
 
+/* ---- MBC3 Real-Time Clock (RTC) ---- */
+/*
+ * Five RTC registers exposed at $A000 when cart_ram_bank = 0x08–0x0C:
+ *   0x08 = RTC S  (seconds 0–59)
+ *   0x09 = RTC M  (minutes 0–59)
+ *   0x0A = RTC H  (hours   0–23)
+ *   0x0B = RTC DL (day counter bits 7:0)
+ *   0x0C = RTC DH (bit 0 = day bit 8, bit 6 = halt, bit 7 = day carry)
+ *
+ * Progression: each call to rtc_tick(cpu_cycles) adds GPU-equivalent cycles
+ * (cpu_cycles/2 in double-speed) to rtc_cycles.  When rtc_cycles >= 4194304
+ * (1 s at 4 MHz), the seconds counter increments and the carry chain updates.
+ * In fast mode the server runs more frames/s → more cycles fed → faster clock.
+ */
+
+/* Live RTC registers */
+uint8_t rtc_s  = 0;   /* seconds   0–59  */
+uint8_t rtc_m  = 0;   /* minutes   0–59  */
+uint8_t rtc_h  = 0;   /* hours     0–23  */
+uint8_t rtc_dl = 0;   /* day low   0–255 */
+uint8_t rtc_dh = 0;   /* day high: bit0=day8, bit6=halt, bit7=carry */
+
+/* Latched (snapshot) copies — read by the game after the latch sequence */
+uint8_t rtc_ls  = 0;
+uint8_t rtc_lm  = 0;
+uint8_t rtc_lh  = 0;
+uint8_t rtc_ldl = 0;
+uint8_t rtc_ldh = 0;
+
+/* Sub-second cycle accumulator (4194304 cycles = 1 RTC second) */
+uint64_t rtc_cycles = 0;
+
+/* Latch protocol: game writes 0x00 then 0x01 to $6000-$7FFF */
+uint8_t rtc_latch_prev = 0xFF; /* last value written; 0xFF = no prior write */
+
+static bool cart_has_rtc(void) {
+    return cart_type == 0x0F || cart_type == 0x10;
+}
+
+/* Advance RTC by one second (carry chain update). */
+static void rtc_tick_second(void) {
+    if (++rtc_s < 60) return;
+    rtc_s = 0;
+    if (++rtc_m < 60) return;
+    rtc_m = 0;
+    if (++rtc_h < 24) return;
+    rtc_h = 0;
+    /* Increment 9-bit day counter */
+    uint16_t day = (uint16_t)rtc_dl | (uint16_t)((rtc_dh & 0x01) << 8);
+    day++;
+    rtc_dl = (uint8_t)(day & 0xFF);
+    rtc_dh = (uint8_t)((rtc_dh & 0xFE) | ((day >> 8) & 0x01));
+    if (day >= 512) {
+        /* Day counter overflowed: set carry bit, reset counter */
+        rtc_dh |= 0x80; /* day carry */
+        rtc_dl   = 0;
+        rtc_dh  &= (uint8_t)~0x01; /* clear day bit 8 */
+    }
+}
+
+/* Called each instruction with the emulated CPU cycle count. */
+void rtc_tick(int cpu_cycles) {
+    if (!cart_has_rtc()) return;
+    if (rtc_dh & 0x40) return; /* halted */
+    /* Convert to 4 MHz GPU-equivalent cycles so RTC tracks wall time.
+     * In double-speed mode the CPU runs at 8 MHz but the real-time clock
+     * still advances at the 4 MHz rate, so we halve the cycle count.
+     * In fast mode the emulator runs more frames/second → RTC advances
+     * proportionally faster, which is the desired behaviour. */
+    uint64_t gpu_cyc = (uint64_t)(double_speed ? (cpu_cycles >> 1) : cpu_cycles);
+    rtc_cycles += gpu_cyc;
+    while (rtc_cycles >= 4194304ULL) {
+        rtc_cycles -= 4194304ULL;
+        rtc_tick_second();
+    }
+}
+
+/* Snapshot live registers into latched registers. */
+static void rtc_do_latch(void) {
+    rtc_ls  = rtc_s;
+    rtc_lm  = rtc_m;
+    rtc_lh  = rtc_h;
+    rtc_ldl = rtc_dl;
+    rtc_ldh = rtc_dh;
+}
+
+/* Read latched RTC register (called when cart_ram_bank = 0x08–0x0C). */
+uint8_t rtc_read(int reg) {
+    switch (reg) {
+        case 0x08: return rtc_ls;
+        case 0x09: return rtc_lm;
+        case 0x0A: return rtc_lh;
+        case 0x0B: return rtc_ldl;
+        case 0x0C: return rtc_ldh;
+        default:   return 0xFF;
+    }
+}
+
+/* Write live RTC register (called when cart_ram_bank = 0x08–0x0C). */
+void rtc_write(int reg, uint8_t data) {
+    switch (reg) {
+        case 0x08: rtc_s  = data & 0x3F; break; /* 0–63 (hardware clamps at 59) */
+        case 0x09: rtc_m  = data & 0x3F; break;
+        case 0x0A: rtc_h  = data & 0x1F; break; /* 0–31 */
+        case 0x0B: rtc_dl = data;         break;
+        case 0x0C: rtc_dh = data & 0xC1; break; /* bits 7, 6, 0 are R/W */
+    }
+    /* Do NOT reset rtc_cycles — the sub-second accumulator must continue
+     * uninterrupted so the clock ticks at a steady rate even when games
+     * write to RTC registers during initialization or time-setting. */
+}
+
+/* Reset all RTC state (called from mem_init). */
+static void rtc_reset(void) {
+    rtc_s = rtc_m = rtc_h = rtc_dl = rtc_dh = 0;
+    rtc_ls = rtc_lm = rtc_lh = rtc_ldl = rtc_ldh = 0;
+    rtc_cycles = 0;
+    rtc_latch_prev = 0xFF;
+}
+
 /* Cart types that have a battery-backed RAM chip */
 static bool cart_has_battery(void) {
     switch (cart_type) {
@@ -1546,7 +1666,12 @@ void cart_write(int pos, byte data) {
             return;
         }
         if (pos <= 0x7FFF) {
-            // MBC3: RTC latch — ignored
+            /* MBC3: RTC latch — writing 0x00 followed by 0x01 snapshots the RTC */
+            if (cart_has_rtc()) {
+                if (rtc_latch_prev == 0x00 && data == 0x01)
+                    rtc_do_latch();
+                rtc_latch_prev = data;
+            }
             return;
         }
         return;
@@ -1874,7 +1999,7 @@ byte mem_read(int pos) {
     } else if (pos >= 0xA000 && pos <= 0xBFFF) {
         // MBC3 RTC register access (bank select 0x08-0x0C)
         if (is_mbc3() && cart_ram_bank >= 0x08) {
-            return 0x00;  // RTC stub: return 0 for all RTC registers
+            return cart_has_rtc() ? rtc_read(cart_ram_bank) : 0xFF;
         }
         int ram_bank = is_mbc3() ? (cart_ram_bank & 0x03) : (cart_mbc1_mode == 1 ? cart_mbc1_upper : 0);
         return ext_ram[ram_bank * 0x2000 + (pos - 0xA000)];
@@ -2472,9 +2597,9 @@ void mem_write(int pos, byte data) {
                 if (vram_write_accessible(proj))
                     gpu_write(pos, data);
             } else if (pos >= 0xA000 && pos <= 0xBFFF) {
-                // MBC3 RTC register write (bank select 0x08-0x0C): ignore writes to RTC
+                // MBC3 RTC register write (bank select 0x08-0x0C)
                 if (is_mbc3() && cart_ram_bank >= 0x08) {
-                    /* RTC register write — stubbed, ignore */
+                    if (cart_has_rtc()) rtc_write(cart_ram_bank, (uint8_t)data);
                 } else {
                     int ram_bank = is_mbc3() ? (cart_ram_bank & 0x03) : (cart_mbc1_mode == 1 ? cart_mbc1_upper : 0);
                     int idx = ram_bank * 0x2000 + (pos - 0xA000);
@@ -2533,6 +2658,7 @@ void mem_init(void){
     apu_ch4_length_enable = false;
     apu_ch4_length = 0;
     apu_length_cycles = 0;
+    rtc_reset();
     inBios = true;
     bailAfterBios = true;
     bailAfterBios = false;
@@ -5951,7 +6077,8 @@ bool frame_headless(void){
             // Timer always advances at full CPU rate (double-speed CGB behavior: DIV/TIMA 2× faster)
             timer_step(cpu_cycles - instr_timer_cycles);
             dma_step(cpu_cycles);
-            instruction_count++;
+            rtc_tick(cpu_cycles);
+instruction_count++;
 
             // Safety check for infinite loops
             if (instruction_count > 200000) {
@@ -6023,6 +6150,7 @@ void headless_main_impl(void) {
         timer_step(cpu_cycles - instr_timer_cycles);
         apu_step(cpu_cycles);
         dma_step(cpu_cycles - instr_timer_cycles);
+        rtc_tick(cpu_cycles);
         total_cycles += cpu_cycles;
     }
     // If cycle limit hit but A000 output present, still print it

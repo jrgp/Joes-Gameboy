@@ -688,8 +688,14 @@ void ws_server_notify_frame(const uint32_t *pixels, int w, int h)
 
 void ws_server_service(void)
 {
-    if (g_context)
+    if (g_context) {
+        /* Wake up the LWS poll loop so lws_service returns promptly.
+         * In LWS 4.x, lws_service(ctx, 0) ignores the timeout and may block
+         * for ~30 seconds if no network activity is pending.  lws_cancel_service
+         * posts a cancellation token so the poll returns immediately. */
+        lws_cancel_service(g_context);
         lws_service(g_context, 0);
+    }
 }
 
 void ws_server_destroy(void)

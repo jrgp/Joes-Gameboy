@@ -165,6 +165,12 @@ extern uint16_t hdma_dst;
 extern int cgb_vram_bank;
 extern int cgb_wram_bank;
 
+/* MBC3 RTC */
+extern uint8_t  rtc_s, rtc_m, rtc_h, rtc_dl, rtc_dh;
+extern uint8_t  rtc_ls, rtc_lm, rtc_lh, rtc_ldl, rtc_ldh;
+extern uint64_t rtc_cycles;
+extern uint8_t  rtc_latch_prev;
+
 /* ROM path (set by cart_load, accessed here) */
 extern char savestate_rom_path[4096];
 
@@ -312,7 +318,7 @@ static void get_string(const cbor_item_t *map, const char *key,
 }
 
 /* ---- Number of fields in the map — keep in sync with MAP_* calls below ---- */
-#define SS_MAP_SIZE 90  /* 76 base + 6 ch3/ch4 APU + 4 CGB fields + 4 HDMA fields */
+#define SS_MAP_SIZE 102 /* 76 base + 6 ch3/ch4 APU + 4 CGB fields + 4 HDMA + 12 RTC */
 
 /* ---- save_state_internal: shared implementation ---- */
 
@@ -435,6 +441,20 @@ static bool save_state_internal(const char *path, const char *slot_name) {
     MAP_INT  (map, "hdma_rem",   hdma_remaining);
     MAP_INT  (map, "hdma_src",   (int)hdma_src);
     MAP_INT  (map, "hdma_dst",   (int)hdma_dst);
+
+    /* MBC3 RTC (optional — only meaningful for MBC3+TIMER carts) */
+    MAP_INT  (map, "rtc_s",      (int)rtc_s);
+    MAP_INT  (map, "rtc_m",      (int)rtc_m);
+    MAP_INT  (map, "rtc_h",      (int)rtc_h);
+    MAP_INT  (map, "rtc_dl",     (int)rtc_dl);
+    MAP_INT  (map, "rtc_dh",     (int)rtc_dh);
+    MAP_INT  (map, "rtc_ls",     (int)rtc_ls);
+    MAP_INT  (map, "rtc_lm",     (int)rtc_lm);
+    MAP_INT  (map, "rtc_lh",     (int)rtc_lh);
+    MAP_INT  (map, "rtc_ldl",    (int)rtc_ldl);
+    MAP_INT  (map, "rtc_ldh",    (int)rtc_ldh);
+    MAP_INT  (map, "rtc_cyc",    (int64_t)rtc_cycles);
+    MAP_INT  (map, "rtc_lat",    (int)rtc_latch_prev);
 
     /* Optional slot metadata (only written when slot_name is non-empty) */
     if (has_meta) {
@@ -660,6 +680,20 @@ bool load_state(const char *path) {
     hdma_remaining = (int)get_int(root, "hdma_rem", 0);
     hdma_src       = (uint16_t)get_int(root, "hdma_src", 0);
     hdma_dst       = (uint16_t)get_int(root, "hdma_dst", 0);
+
+    /* MBC3 RTC (optional; missing in old saves → defaults) */
+    rtc_s          = (uint8_t)get_int(root, "rtc_s",   0);
+    rtc_m          = (uint8_t)get_int(root, "rtc_m",   0);
+    rtc_h          = (uint8_t)get_int(root, "rtc_h",   0);
+    rtc_dl         = (uint8_t)get_int(root, "rtc_dl",  0);
+    rtc_dh         = (uint8_t)get_int(root, "rtc_dh",  0);
+    rtc_ls         = (uint8_t)get_int(root, "rtc_ls",  0);
+    rtc_lm         = (uint8_t)get_int(root, "rtc_lm",  0);
+    rtc_lh         = (uint8_t)get_int(root, "rtc_lh",  0);
+    rtc_ldl        = (uint8_t)get_int(root, "rtc_ldl", 0);
+    rtc_ldh        = (uint8_t)get_int(root, "rtc_ldh", 0);
+    rtc_cycles     = (uint64_t)get_int(root, "rtc_cyc", 0);
+    rtc_latch_prev = (uint8_t)get_int(root, "rtc_lat", 0xFF);
 
     cbor_decref(&root);
 
