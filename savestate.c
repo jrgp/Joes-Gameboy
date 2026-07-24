@@ -123,10 +123,6 @@ extern byte RAM[0xffff + 1];
 /* Cartridge */
 extern byte  cart_type;
 extern int   cart_rom_banks;
-extern int   cart_rom_bank;
-extern int   cart_mbc1_upper;
-extern int   cart_mbc1_mode;
-extern int   cart_ram_bank;
 extern byte  ext_ram[0x8000];
 
 /* Serial */
@@ -196,6 +192,11 @@ extern bool ss_get_serial_active(void);
 extern int  ss_get_serial_bits_remaining(void);
 extern byte ss_get_serial_out_byte(void);
 extern int  ss_get_gb_model(void);
+extern int  ss_get_mbc_rom_bank(void);
+extern int  ss_get_mbc_rom_hi(void);
+extern int  ss_get_mbc_ram_bank(void);
+extern int  ss_get_mbc_upper(void);
+extern int  ss_get_mbc_mode(void);
 
 extern void ss_set_stat_irq_line(bool v);
 extern void ss_set_lcd_off_lyc_flag(bool v);
@@ -215,6 +216,11 @@ extern void ss_set_serial_active(bool v);
 extern void ss_set_serial_bits_remaining(int v);
 extern void ss_set_serial_out_byte(byte v);
 extern void ss_set_gb_model(int v);
+extern void ss_set_mbc_rom_bank(int v);
+extern void ss_set_mbc_rom_hi(int v);
+extern void ss_set_mbc_ram_bank(int v);
+extern void ss_set_mbc_upper(int v);
+extern void ss_set_mbc_mode(int v);
 
 /* Called after load to rebuild derived state (gpu_control, etc.) */
 extern void gpu_parse_control(byte control);
@@ -400,10 +406,11 @@ static bool save_state_internal(const char *path, const char *slot_name) {
     /* Cartridge */
     MAP_U8  (map, "cart_type",   cart_type);
     MAP_INT (map, "rom_banks",   cart_rom_banks);
-    MAP_INT (map, "rom_bank",    cart_rom_bank);
-    MAP_INT (map, "mbc1_upper",  cart_mbc1_upper);
-    MAP_INT (map, "mbc1_mode",   cart_mbc1_mode);
-    MAP_INT (map, "ram_bank",    cart_ram_bank);
+    MAP_INT (map, "rom_bank",    ss_get_mbc_rom_bank());
+    MAP_INT (map, "mbc_rom_hi",  ss_get_mbc_rom_hi());
+    MAP_INT (map, "mbc1_upper",  ss_get_mbc_upper());
+    MAP_INT (map, "mbc1_mode",   ss_get_mbc_mode());
+    MAP_INT (map, "ram_bank",    ss_get_mbc_ram_bank());
     MAP_INT (map, "model",       ss_get_gb_model());
 
     /* Serial */
@@ -639,10 +646,11 @@ bool load_state(const char *path) {
     /* Cartridge banking */
     cart_type     = get_u8 (root, "cart_type",  0);
     cart_rom_banks= (int)get_int(root, "rom_banks",  1);
-    cart_rom_bank = (int)get_int(root, "rom_bank",   1);
-    cart_mbc1_upper= (int)get_int(root, "mbc1_upper", 0);
-    cart_mbc1_mode = (int)get_int(root, "mbc1_mode",  0);
-    cart_ram_bank  = (int)get_int(root, "ram_bank",   0);
+    ss_set_mbc_rom_bank((int)get_int(root, "rom_bank",   1));
+    ss_set_mbc_rom_hi  ((int)get_int(root, "mbc_rom_hi", 0));
+    ss_set_mbc_upper   ((int)get_int(root, "mbc1_upper", 0));
+    ss_set_mbc_mode    ((int)get_int(root, "mbc1_mode",  0));
+    ss_set_mbc_ram_bank((int)get_int(root, "ram_bank",   0));
     ss_set_gb_model((int)get_int(root, "model",       0));
 
     /* Serial */

@@ -1432,13 +1432,30 @@ byte cart_type;
 byte cart_cgb_flag;  // cart header byte $0143: $80=CGB enhanced, $C0=CGB only
 byte *cart_data;
 int cart_rom_banks;      // total number of 16KB ROM banks
-int cart_rom_bank = 1;   // current switchable ROM bank (for $4000-$7FFF)
-int cart_mbc1_upper = 0; // upper 2 bits written to $4000-$5FFF (ROM bank bits 5-6 or RAM bank)
-int cart_mbc1_mode = 0;  // 0=ROM banking mode (default), 1=RAM banking mode
-int cart_ram_bank = 0;   // current RAM bank (MBC3 uses this; MBC1 uses mbc1_upper)
-byte ext_ram[0x8000];    // 32KB external RAM (up to 4 banks × 8KB)
+byte ext_ram[0x8000];    // 32KB external RAM (max 4 banks × 8KB; larger carts clamped)
 int  cart_ram_size = 0;  // actual cartridge RAM in bytes (from header byte $0149)
 bool ext_ram_dirty = false; /* set on any ext_ram write; cleared after sav_save */
+
+/* ---- MBC abstraction (implementations follow RTC/battery helpers) -- */
+
+typedef struct {
+    int rom_bank;   /* active ROM bank mapped at $4000-$7FFF               */
+    int rom_hi;     /* MBC5 only: bit 8 of 9-bit ROM bank number            */
+    int ram_bank;   /* active RAM bank / MBC3 RTC-register select           */
+    int upper;      /* MBC1 only: upper 2 bits ($4000-$5FFF register)       */
+    int mode;       /* MBC1 only: banking mode (0 = ROM mode, 1 = RAM mode) */
+} mbc_state_t;
+
+typedef struct {
+    byte (*rom_read) (int pos);           /* handle read  $0000-$7FFF */
+    void (*write)    (int pos, byte data);/* handle write $0000-$7FFF */
+    byte (*ram_read) (int pos);           /* handle read  $A000-$BFFF */
+    void (*ram_write)(int pos, byte data);/* handle write $A000-$BFFF */
+    void (*reset)    (void);              /* called on cart_load / reset */
+} mbc_ops_t;
+
+static mbc_state_t mbc_s;
+static const mbc_ops_t *mbc; /* selected by cart_load() based on cart_type */
 
 /* ---- MBC3 Real-Time Clock (RTC) ---- */
 /*
@@ -1620,81 +1637,146 @@ void sav_save(const char *rom_path) {
         fprintf(stderr, "[sav] warning: wrote %zu/%d bytes to %s\n", n, cart_ram_size, path);
 }
 
-static bool is_mbc3(void) {
-    return cart_type >= 0x0F && cart_type <= 0x13;
+/* Clamp a RAM bank index to the number of 8KB banks actually present.
+ * ext_ram is fixed at 32KB, so the hard ceiling is 4 banks regardless
+ * of what the cart header declares for larger-RAM cartridges. */
+static int mbc_ram_idx(int bank) {
+    int max_banks = cart_ram_size / 0x2000;
+    if (max_banks < 1) max_banks = 1;
+    if (max_banks > 4) max_banks = 4; /* ext_ram ceiling */
+    return bank % max_banks;
 }
 
-byte cart_read(int pos) {
+/* ---- ROM-only (no mapper) ------------------------------------------ */
+
+static byte rom_only_rom_read(int pos) { return cart_data[pos]; }
+static void rom_only_write(int pos, byte data) { (void)pos; (void)data; }
+static byte rom_only_ram_read(int pos) {
+    if (cart_ram_size > 0) return ext_ram[pos - 0xA000];
+    return 0xFF;
+}
+static void rom_only_ram_write(int pos, byte data) {
+    if (cart_ram_size > 0) { ext_ram[pos - 0xA000] = data; ext_ram_dirty = true; }
+}
+static void rom_only_reset(void) { mbc_s.rom_bank = 0; }
+
+static const mbc_ops_t mbc_rom_only = {
+    rom_only_rom_read, rom_only_write,
+    rom_only_ram_read, rom_only_ram_write,
+    rom_only_reset
+};
+
+/* ---- MBC1 ----------------------------------------------------------- */
+
+static byte mbc1_rom_read(int pos) {
     if (pos < 0x4000) {
-        if (!is_mbc3() && cart_mbc1_mode == 1 && cart_rom_banks > 32) {
-            // MBC1 mode 1: upper bits remap bank 0
-            int bank0 = (cart_mbc1_upper << 5) & (cart_rom_banks - 1);
-            return cart_data[bank0 * 0x4000 + pos];
+        /* Mode 1 with large (>32 bank) ROM: upper bits remap bank 0 */
+        if (mbc_s.mode == 1 && cart_rom_banks > 32) {
+            int b0 = (mbc_s.upper << 5) % cart_rom_banks;
+            return cart_data[b0 * 0x4000 + pos];
         }
         return cart_data[pos];
     }
-    // $4000-$7FFF: switchable ROM bank
-    int bank;
-    if (is_mbc3()) {
-        bank = cart_rom_bank & 0x7F;
-        if (bank == 0) bank = 1;
-        bank &= (cart_rom_banks - 1);
-    } else {
-        // MBC1
-        bank = cart_rom_bank | (cart_mbc1_upper << 5);
-        bank &= (cart_rom_banks - 1);
-        if ((bank & 0x1F) == 0) bank |= 1;
-    }
+    int bank = (mbc_s.rom_bank | (mbc_s.upper << 5)) % cart_rom_banks;
+    if ((bank & 0x1F) == 0) bank |= 1; /* MBC1: banks $00,$20,$40,$60 → next */
     return cart_data[bank * 0x4000 + (pos - 0x4000)];
 }
-
-void cart_write(int pos, byte data) {
-    if (pos <= 0x1FFF) {
-        // RAM/RTC enable: ignored (we always allow access)
-        return;
-    }
-    if (is_mbc3()) {
-        if (pos <= 0x3FFF) {
-            // MBC3: ROM bank number (7 bits, 0→1)
-            cart_rom_bank = data & 0x7F;
-            if (cart_rom_bank == 0) cart_rom_bank = 1;
-            return;
-        }
-        if (pos <= 0x5FFF) {
-            // MBC3: RAM bank (0-3) or RTC select (0x08-0x0C)
-            cart_ram_bank = data;  // store full value including RTC register select (0x08-0x0C)
-            return;
-        }
-        if (pos <= 0x7FFF) {
-            /* MBC3: RTC latch — writing 0x00 followed by 0x01 snapshots the RTC */
-            if (cart_has_rtc()) {
-                if (rtc_latch_prev == 0x00 && data == 0x01)
-                    rtc_do_latch();
-                rtc_latch_prev = data;
-            }
-            return;
-        }
-        return;
-    }
-    // MBC1
-    if (pos <= 0x3FFF) {
-        // MBC1 ROM bank number (lower 5 bits)
-        cart_rom_bank = data & 0x1F;
-        if (cart_rom_bank == 0) cart_rom_bank = 1;
-        return;
-    }
-    if (pos <= 0x5FFF) {
-        // MBC1 upper bits: RAM bank number OR upper ROM bank bits
-        cart_mbc1_upper = data & 0x03;
-        return;
-    }
-    if (pos <= 0x7FFF) {
-        // MBC1 banking mode: 0=ROM (up to 2MB ROM, 8KB RAM), 1=RAM (512KB ROM, 32KB RAM)
-        cart_mbc1_mode = data & 0x01;
-        return;
-    }
-    // other cart writes: silently ignore
+static void mbc1_write(int pos, byte data) {
+    if (pos <= 0x1FFF) return;
+    if (pos <= 0x3FFF) { mbc_s.rom_bank = data & 0x1F; if (!mbc_s.rom_bank) mbc_s.rom_bank = 1; return; }
+    if (pos <= 0x5FFF) { mbc_s.upper = data & 0x03; return; }
+    if (pos <= 0x7FFF) { mbc_s.mode  = data & 0x01; return; }
 }
+static byte mbc1_ram_read(int pos) {
+    int bank = (mbc_s.mode == 1) ? mbc_s.upper : 0;
+    return ext_ram[mbc_ram_idx(bank) * 0x2000 + (pos - 0xA000)];
+}
+static void mbc1_ram_write(int pos, byte data) {
+    int bank = (mbc_s.mode == 1) ? mbc_s.upper : 0;
+    ext_ram[mbc_ram_idx(bank) * 0x2000 + (pos - 0xA000)] = data;
+    ext_ram_dirty = true;
+}
+static void mbc1_reset(void) { mbc_s.rom_bank = 1; mbc_s.upper = 0; mbc_s.mode = 0; }
+
+static const mbc_ops_t mbc_mbc1 = {
+    mbc1_rom_read, mbc1_write,
+    mbc1_ram_read, mbc1_ram_write,
+    mbc1_reset
+};
+
+/* ---- MBC3 ----------------------------------------------------------- */
+
+static byte mbc3_rom_read(int pos) {
+    if (pos < 0x4000) return cart_data[pos];
+    int bank = mbc_s.rom_bank & 0x7F;
+    if (!bank) bank = 1;
+    bank %= cart_rom_banks;
+    return cart_data[bank * 0x4000 + (pos - 0x4000)];
+}
+static void mbc3_write(int pos, byte data) {
+    if (pos <= 0x1FFF) return;
+    if (pos <= 0x3FFF) { mbc_s.rom_bank = data & 0x7F; if (!mbc_s.rom_bank) mbc_s.rom_bank = 1; return; }
+    if (pos <= 0x5FFF) { mbc_s.ram_bank = data; return; }
+    if (pos <= 0x7FFF) {
+        if (cart_has_rtc()) {
+            if (rtc_latch_prev == 0x00 && data == 0x01) rtc_do_latch();
+            rtc_latch_prev = data;
+        }
+        return;
+    }
+}
+static byte mbc3_ram_read(int pos) {
+    if (mbc_s.ram_bank >= 0x08)
+        return cart_has_rtc() ? rtc_read(mbc_s.ram_bank) : 0xFF;
+    return ext_ram[mbc_ram_idx(mbc_s.ram_bank & 0x03) * 0x2000 + (pos - 0xA000)];
+}
+static void mbc3_ram_write(int pos, byte data) {
+    if (mbc_s.ram_bank >= 0x08) {
+        if (cart_has_rtc()) rtc_write(mbc_s.ram_bank, (uint8_t)data);
+        return;
+    }
+    ext_ram[mbc_ram_idx(mbc_s.ram_bank & 0x03) * 0x2000 + (pos - 0xA000)] = data;
+    ext_ram_dirty = true;
+}
+static void mbc3_reset(void) { mbc_s.rom_bank = 1; mbc_s.ram_bank = 0; rtc_reset(); }
+
+static const mbc_ops_t mbc_mbc3 = {
+    mbc3_rom_read, mbc3_write,
+    mbc3_ram_read, mbc3_ram_write,
+    mbc3_reset
+};
+
+/* ---- MBC5 ----------------------------------------------------------- */
+
+static byte mbc5_rom_read(int pos) {
+    if (pos < 0x4000) return cart_data[pos];
+    /* 9-bit bank number; bank 0 is valid (no 0→1 aliasing unlike MBC1/MBC3) */
+    int bank = ((mbc_s.rom_hi << 8) | mbc_s.rom_bank) % cart_rom_banks;
+    return cart_data[bank * 0x4000 + (pos - 0x4000)];
+}
+static void mbc5_write(int pos, byte data) {
+    if (pos <= 0x1FFF) return;                                    /* RAM enable: ignored */
+    if (pos <= 0x2FFF) { mbc_s.rom_bank = data;        return; } /* ROM bank low 8 bits */
+    if (pos <= 0x3FFF) { mbc_s.rom_hi   = data & 0x01; return; } /* ROM bank bit 8      */
+    if (pos <= 0x5FFF) { mbc_s.ram_bank = data & 0x0F; return; } /* RAM bank (4-bit)    */
+}
+static byte mbc5_ram_read(int pos) {
+    return ext_ram[mbc_ram_idx(mbc_s.ram_bank) * 0x2000 + (pos - 0xA000)];
+}
+static void mbc5_ram_write(int pos, byte data) {
+    ext_ram[mbc_ram_idx(mbc_s.ram_bank) * 0x2000 + (pos - 0xA000)] = data;
+    ext_ram_dirty = true;
+}
+static void mbc5_reset(void) { mbc_s.rom_bank = 1; mbc_s.rom_hi = 0; mbc_s.ram_bank = 0; }
+
+static const mbc_ops_t mbc_mbc5 = {
+    mbc5_rom_read, mbc5_write,
+    mbc5_ram_read, mbc5_ram_write,
+    mbc5_reset
+};
+
+byte cart_read(int pos)             { return mbc->rom_read(pos); }
+void cart_write(int pos, byte data) { mbc->write(pos, data); }
 
 void cart_load(char *path) {
     /* Record the ROM path for save states */
@@ -1732,10 +1814,6 @@ void cart_load(char *path) {
     cart_type = cart_data[0x147];
     cart_cgb_flag = cart_data[0x143];
     cart_rom_banks = (int)filelen / 0x4000;
-    cart_rom_bank = 1;
-    cart_mbc1_upper = 0;
-    cart_mbc1_mode = 0;
-    cart_ram_bank = 0;
 
     /* Cartridge RAM size from header byte $0149 */
     static const int ram_size_table[] = { 0, 2048, 8192, 32768, 131072, 65536 };
@@ -1744,12 +1822,21 @@ void cart_load(char *path) {
     /* MBC2 has 512×4-bit internal RAM, conventionally stored as 512 bytes */
     if (cart_type == 0x05 || cart_type == 0x06) cart_ram_size = 512;
 
+    /* Select MBC implementation based on cartridge type */
+    if      (cart_type >= 0x19 && cart_type <= 0x1E) mbc = &mbc_mbc5;
+    else if (cart_type >= 0x0F && cart_type <= 0x13) mbc = &mbc_mbc3;
+    else if (cart_type >= 0x01 && cart_type <= 0x03) mbc = &mbc_mbc1;
+    else                                              mbc = &mbc_rom_only;
+    mbc->reset();
+
     printf("Loaded %s\n", cart_name);
 
-    // Support MBC1 (types 0-3) and MBC3 (types 0x0F-0x13) for Pokemon
-    if (cart_type > 3 && !(cart_type >= 0x0F && cart_type <= 0x13)) {
+    bool known = (cart_type <= 0x03) ||
+                 (cart_type >= 0x0F && cart_type <= 0x13) ||
+                 (cart_type >= 0x19 && cart_type <= 0x1E) ||
+                 (cart_type == 0x08 || cart_type == 0x09);
+    if (!known)
         printf("Warning: cart type 0x%02X not fully supported\n", cart_type);
-    }
 }
 
 //
@@ -1997,12 +2084,7 @@ byte mem_read(int pos) {
     } else if (pos >= 0x8000 && pos <= 0x9FFF) {
         return gpu_read(pos);
     } else if (pos >= 0xA000 && pos <= 0xBFFF) {
-        // MBC3 RTC register access (bank select 0x08-0x0C)
-        if (is_mbc3() && cart_ram_bank >= 0x08) {
-            return cart_has_rtc() ? rtc_read(cart_ram_bank) : 0xFF;
-        }
-        int ram_bank = is_mbc3() ? (cart_ram_bank & 0x03) : (cart_mbc1_mode == 1 ? cart_mbc1_upper : 0);
-        return ext_ram[ram_bank * 0x2000 + (pos - 0xA000)];
+        return mbc->ram_read(pos);
     } else if (pos >= 0xC000 && pos <= 0xCFFF) {
         // WRAM bank 0 (fixed)
         return gb_model == MODEL_GBC ? cgb_wram[pos - 0xC000] : RAM[pos];
@@ -2597,20 +2679,14 @@ void mem_write(int pos, byte data) {
                 if (vram_write_accessible(proj))
                     gpu_write(pos, data);
             } else if (pos >= 0xA000 && pos <= 0xBFFF) {
-                // MBC3 RTC register write (bank select 0x08-0x0C)
-                if (is_mbc3() && cart_ram_bank >= 0x08) {
-                    if (cart_has_rtc()) rtc_write(cart_ram_bank, (uint8_t)data);
-                } else {
-                    int ram_bank = is_mbc3() ? (cart_ram_bank & 0x03) : (cart_mbc1_mode == 1 ? cart_mbc1_upper : 0);
-                    int idx = ram_bank * 0x2000 + (pos - 0xA000);
-                    ext_ram[idx] = data;
-                    ext_ram_dirty = true;
-                    // Detect blargg test completion: A000 written with non-0x80 value
-                    // when magic bytes DE B0 61 are present at A001-A003
-                    if (pos == 0xA000 && data != 0x80 &&
-                        ext_ram[1] == 0xDE && ext_ram[2] == 0xB0 && ext_ram[3] == 0x61) {
-                        blargg_done = true;
-                    }
+                mbc->ram_write(pos, data);
+                /* Detect blargg test completion: A000 written with non-0x80 value
+                 * when magic bytes DE B0 61 are present at A001-A003.
+                 * Only fires on real ext-RAM writes; RTC writes go through mbc_ops
+                 * without touching ext_ram[0], so no false positives. */
+                if (pos == 0xA000 && data != 0x80 &&
+                    ext_ram[1] == 0xDE && ext_ram[2] == 0xB0 && ext_ram[3] == 0x61) {
+                    blargg_done = true;
                 }
             } else {
                 RAM[pos] = data;
@@ -6194,6 +6270,11 @@ bool     ss_get_serial_active(void)          { return serial_active; }
 int      ss_get_serial_bits_remaining(void)  { return serial_bits_remaining; }
 byte     ss_get_serial_out_byte(void)        { return serial_out_byte; }
 int      ss_get_gb_model(void)               { return (int)gb_model; }
+int      ss_get_mbc_rom_bank(void)           { return mbc_s.rom_bank; }
+int      ss_get_mbc_rom_hi(void)             { return mbc_s.rom_hi; }
+int      ss_get_mbc_ram_bank(void)           { return mbc_s.ram_bank; }
+int      ss_get_mbc_upper(void)              { return mbc_s.upper; }
+int      ss_get_mbc_mode(void)               { return mbc_s.mode; }
 
 void ss_set_stat_irq_line(bool v)          { stat_irq_line = v; }
 void ss_set_lcd_off_lyc_flag(bool v)       { lcd_off_lyc_flag = v; }
@@ -6213,6 +6294,11 @@ void ss_set_serial_active(bool v)          { serial_active = v; }
 void ss_set_serial_bits_remaining(int v)   { serial_bits_remaining = v; }
 void ss_set_serial_out_byte(byte v)        { serial_out_byte = v; }
 void ss_set_gb_model(int v)                { gb_model = (gb_model_t)v; }
+void ss_set_mbc_rom_bank(int v)            { mbc_s.rom_bank = v; }
+void ss_set_mbc_rom_hi(int v)              { mbc_s.rom_hi   = v & 0x01; }
+void ss_set_mbc_ram_bank(int v)            { mbc_s.ram_bank = v; }
+void ss_set_mbc_upper(int v)               { mbc_s.upper    = v & 0x03; }
+void ss_set_mbc_mode(int v)                { mbc_s.mode     = v & 0x01; }
 
 /* Called after all fields are loaded to rebuild any derived state */
 void ss_post_load(void) {
