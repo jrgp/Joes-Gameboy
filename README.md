@@ -44,6 +44,10 @@ Pokemon red with stock palette in SDL
 
 <img src="screenshots/pokemon red.png" width="400">
 
+Donkey Kong Country GBC in SDL
+
+<img src="screenshots/dkcountry in SDL.png" width="400">
+
 
 ## Frontends
 
