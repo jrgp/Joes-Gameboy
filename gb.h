@@ -49,3 +49,4 @@ void gb_set_button(int bit, bool pressed);
 
 /* Soft reset */
 void gb_reset(void);
+bool gb_is_cgb_mode(void);

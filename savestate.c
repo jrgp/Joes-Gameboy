@@ -156,6 +156,7 @@ extern bool     hdma_active;
 extern int      hdma_remaining;
 extern uint16_t hdma_src;
 extern uint16_t hdma_dst;
+extern int      hdma_vbk;
 
 /* CGB bank selection variables (derived from registers at load time) */
 extern int cgb_vram_bank;
@@ -448,6 +449,7 @@ static bool save_state_internal(const char *path, const char *slot_name) {
     MAP_INT  (map, "hdma_rem",   hdma_remaining);
     MAP_INT  (map, "hdma_src",   (int)hdma_src);
     MAP_INT  (map, "hdma_dst",   (int)hdma_dst);
+    MAP_INT  (map, "hdma_vbk",   hdma_vbk);
 
     /* MBC3 RTC (optional — only meaningful for MBC3+TIMER carts) */
     MAP_INT  (map, "rtc_s",      (int)rtc_s);
@@ -688,6 +690,7 @@ bool load_state(const char *path) {
     hdma_remaining = (int)get_int(root, "hdma_rem", 0);
     hdma_src       = (uint16_t)get_int(root, "hdma_src", 0);
     hdma_dst       = (uint16_t)get_int(root, "hdma_dst", 0);
+    hdma_vbk       = (int)get_int(root, "hdma_vbk", 0);
 
     /* MBC3 RTC (optional; missing in old saves → defaults) */
     rtc_s          = (uint8_t)get_int(root, "rtc_s",   0);

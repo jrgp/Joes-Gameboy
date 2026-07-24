@@ -99,10 +99,13 @@ uint8_t cgb_obj_pal[64];  // OBJ palette RAM
 // hdma_active: true when an H-Blank DMA transfer is in progress (triggered by FF55 bit7=1).
 // hdma_remaining: number of 16-byte blocks remaining (0x00-0x7F).
 // hdma_src / hdma_dst: current source/destination pointers (advanced after each block).
+// hdma_vbk: VRAM bank latched at HDMA trigger time; used by H-Blank fire to write to the
+//           correct bank even if the CPU switches VBK before the first H-Blank fires.
 bool     hdma_active    = false;
 int      hdma_remaining = 0;
 uint16_t hdma_src       = 0;
 uint16_t hdma_dst       = 0;
+int      hdma_vbk       = 0;
 
 // Forward declaration needed by CGB rendering helpers defined below.
 extern byte cart_cgb_flag;
@@ -767,8 +770,11 @@ byte gpu_read(int pos){
 
 void gpu_write(int pos, byte data){
     if (pos >= 0x8000 && pos <= 0x9FFF) {
-        if (cgb_vram_bank) VRAM1[pos - 0x8000] = data;
-        else               VRAM[pos - 0x8000] = data;
+        if (cgb_vram_bank) {
+            VRAM1[pos - 0x8000] = data;
+        } else {
+            VRAM[pos - 0x8000] = data;
+        }
     }
     if (pos == STAT) {
         // Bits 3-6 are writable; bits 0-2 are read-only
@@ -1018,7 +1024,10 @@ void gpu_draw_bg(byte ly){
             int map_x = ((SCX_REG / 8) + tile) & 31;
             int map_y = ((ly + SCY_REG) / 8) & 31;
             int map_addr = gpu_control.bgtilemap + (map_y * 32) + map_x;
-            int tileIndex = mem_read(map_addr);
+            // The PPU always reads the tile index from VRAM bank 0 regardless of the VBK
+            // register.  Use direct array access instead of mem_read() so that the CPU's
+            // current bank selection does not pollute the rendering path.
+            int tileIndex = VRAM[map_addr & 0x1FFF];
             if (cgb) {
                 // Attribute byte lives in VRAM bank 1 at the same tilemap address
                 byte attr = vram1_read(map_addr);
@@ -1050,7 +1059,8 @@ void gpu_draw_window(byte ly){
         int map_x = tile & 31;
         int map_y = (window_line / 8) & 31;
         int map_addr = gpu_control.windowtilemap + (map_y * 32) + map_x;
-        int tileIndex = mem_read(map_addr);
+        // PPU always reads tile index from VRAM bank 0 (VBK does not affect PPU reads)
+        int tileIndex = VRAM[map_addr & 0x1FFF];
         if (cgb) {
             byte attr = vram1_read(map_addr);
             gpu_render_tile_cgb(ly, xpos, fine_y, (byte)tileIndex,
@@ -1247,12 +1257,18 @@ void gpu_step(int _cycles){
         // CGB H-Blank DMA: transfer one 16-byte block each time mode 0 starts
         // (only during the active display area, not during VBlank scanlines).
         if (new_mode == 0 && hdma_active && real_ly < 144) {
+            // Use the VRAM bank latched at HDMA trigger time, not the current VBK.
+            // Games often switch VBK back to 0 immediately after arming an HDMA, so
+            // the current cgb_vram_bank may already be 0 when the first H-Blank fires.
+            int saved_vbk = cgb_vram_bank;
+            cgb_vram_bank = hdma_vbk;
             for (int i = 0; i < 16; i++) {
                 byte b = mem_read((hdma_src + (uint16_t)i) & 0xFFFF);
                 // Destination wraps within VRAM ($8000-$9FFF = 8KB)
                 uint16_t dst_addr = (uint16_t)(0x8000u + ((hdma_dst - 0x8000u + (uint16_t)i) & 0x1FFFu));
                 gpu_write(dst_addr, b);
             }
+            cgb_vram_bank = saved_vbk;
             hdma_src = (uint16_t)(hdma_src + 16);
             // Advance dst, wrapping within VRAM ($8000-$9FFF)
             hdma_dst = (uint16_t)(0x8000u + ((hdma_dst - 0x8000u + 16u) & 0x1FFFu));
@@ -2489,11 +2505,15 @@ void mem_write(int pos, byte data) {
                         hdma_active = false;
                         RAM[0xFF55] = (byte)(hdma_remaining | 0x80);
                     } else {
-                        // Start new HDMA transfer; transfer one block per H-Blank
+                        // Start new HDMA transfer; transfer one block per H-Blank.
+                        // Latch the current VRAM bank so that H-Blank blocks always go to
+                        // the bank that was active when the game armed the transfer, even if
+                        // the CPU switches VBK before the first H-Blank fires.
                         hdma_active    = true;
                         hdma_remaining = (byte)(data & 0x7F);
                         hdma_src       = src;
                         hdma_dst       = dst;
+                        hdma_vbk       = cgb_vram_bank;
                         RAM[0xFF55]    = (byte)(hdma_remaining); // bit7=0 = active
                     }
                 }
@@ -2721,6 +2741,7 @@ void mem_init(void){
     hdma_remaining = 0;
     hdma_src       = 0;
     hdma_dst       = 0;
+    hdma_vbk       = 0;
     apu_ch1_active = false;
     apu_ch1_length_enable = false;
     apu_ch1_length = 0;
@@ -6214,7 +6235,8 @@ void headless_main_impl(void) {
         do_interrupts();
         int dispatch_cycles = cycles - prevcycles;
         if (dispatch_cycles > 0) {
-            gpu_step(dispatch_cycles);
+            int dc_gpu = double_speed ? (dispatch_cycles >> 1) : dispatch_cycles;
+            gpu_step(dc_gpu);
             timer_step(dispatch_cycles - instr_timer_cycles);
             dma_step(dispatch_cycles);
             instr_timer_cycles = 0;
@@ -6222,7 +6244,8 @@ void headless_main_impl(void) {
         exec_next_start_cycles = cycles;
         exec_next();
         int cpu_cycles = cycles - prevcycles - dispatch_cycles;
-        gpu_step(cpu_cycles);
+        int gc_gpu = double_speed ? (cpu_cycles >> 1) : cpu_cycles;
+        gpu_step(gc_gpu);
         timer_step(cpu_cycles - instr_timer_cycles);
         apu_step(cpu_cycles);
         dma_step(cpu_cycles - instr_timer_cycles);
