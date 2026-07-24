@@ -43,6 +43,7 @@ bool frame_headless(void);
 /* Headless test runner (blargg/cycle-limited) */
 void headless_main_impl(void);
 void headless_print_blargg_a000(void);
+void gb_dump_state(void);
 
 /* Joypad: bit 0=RIGHT,1=LEFT,2=UP,3=DOWN,4=A,5=B,6=SELECT,7=START */
 void gb_set_button(int bit, bool pressed);

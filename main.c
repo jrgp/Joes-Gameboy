@@ -34,6 +34,8 @@ int main(int argc, char **argv) {
     int server_port = 8080;
     const char *server_bind = NULL;
     const char *ppm_path = NULL;
+    int frame_count_limit = -1;       // --frame-count N: run exactly N frames, then save --ppm
+    bool dump_state = false;          // --dump-state: print VRAM/palette state after run
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--headless") == 0) {
@@ -71,6 +73,15 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Unknown model: %s\n", m);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--dump-state") == 0) {
+            dump_state = true;
+        } else if (strcmp(argv[i], "--frame-count") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for --frame-count\n");
+                return 1;
+            }
+            frame_count_limit = atoi(argv[++i]);
+            headless = true;
         } else if (strcmp(argv[i], "--ppm") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "Missing value for --ppm\n");
@@ -149,6 +160,12 @@ int main(int argc, char **argv) {
         }
         server_main_impl();
         ws_server_destroy();
+    } else if (headless && frame_count_limit > 0) {
+        // Frame-based mode: run exactly N frames via frame_headless()
+        for (int f = 0; f < frame_count_limit; f++)
+            frame_headless();
+        if (dump_state)
+            gb_dump_state();
     } else if (headless) {
         headless_main_impl();
     } else {

@@ -55,6 +55,7 @@ bool headless = false;
 bool g_fast_mode = false; /* when true, sleep 1/4 of normal — runs at ~4× speed */
 long long max_cycles = 0;
 bool gbmicrotest_mode = false; // read 0xFF82 for pass/fail after cycle limit
+int g_frame_count = 0;           // incremented by frame_headless() each frame
 
 /* ROM path stored here so savestate.c can read it */
 char savestate_rom_path[4096] = {0};
@@ -770,10 +771,11 @@ byte gpu_read(int pos){
 
 void gpu_write(int pos, byte data){
     if (pos >= 0x8000 && pos <= 0x9FFF) {
+        int vram_offset = pos - 0x8000;
         if (cgb_vram_bank) {
-            VRAM1[pos - 0x8000] = data;
+            VRAM1[vram_offset] = data;
         } else {
-            VRAM[pos - 0x8000] = data;
+            VRAM[vram_offset] = data;
         }
     }
     if (pos == STAT) {
@@ -814,6 +816,9 @@ void gpu_write(int pos, byte data){
         gpu_parse_control(data);
         if (!was_enabled && now_enabled) {
             // LCD just turned on: start from beginning of frame.
+            LY_REG = 0;
+            real_ly = 0;
+            gpu_cycles = 0;
             LY_REG = 0;
             real_ly = 0;
             gpu_cycles = 0;
@@ -2188,8 +2193,10 @@ byte mem_read(int pos) {
                 // HDMA1-4: DMA source/dest (CGB color mode only; reads return 0xFF)
                 return CGB_COLOR_MODE() ? 0xFF : 0xFF;
             case 0xFF55:
-                // HDMA5: DMA length/mode/start; $FF = no active transfer
-                return CGB_COLOR_MODE() ? (byte)(RAM[0xFF55] | 0x80) : 0xFF;
+                // HDMA5: DMA length/mode/start; when HDMA is active, bit7=0 (in progress);
+                // when idle/complete, bit7=1.  The raw RAM[0xFF55] is maintained by the HDMA
+                // state machine (bit7=0 when active, 0xFF when done), so return it directly.
+                return CGB_COLOR_MODE() ? RAM[0xFF55] : 0xFF;
             case 0xFF56:
                 // RP: infrared (CGB color mode only; stub)
                 return CGB_COLOR_MODE() ? 0x02 : 0xFF;
@@ -2488,34 +2495,35 @@ void mem_write(int pos, byte data) {
                 int      blocks = (int)(data & 0x7F) + 1; // number of 16-byte blocks
                 bool     is_hdma = (data & 0x80) != 0;    // bit 7: 0=GDMA, 1=HDMA
                 if (!is_hdma) {
-                    // GDMA: transfer all bytes immediately
-                    int len = blocks * 16;
-                    for (int i = 0; i < len; i++) {
-                        byte b = mem_read((src + (uint16_t)i) & 0xFFFF);
-                        // Destination wraps within VRAM ($8000-$9FFF = 8KB)
-                        uint16_t dst_addr = (uint16_t)(0x8000u + ((dst - 0x8000u + (uint16_t)i) & 0x1FFFu));
-                        gpu_write(dst_addr, b);
-                    }
-                    hdma_active    = false;
-                    RAM[0xFF55]    = 0xFF; // transfer complete
-                } else {
-                    // HDMA: write data & 0x80 == 0 cancels an in-progress HDMA
+                    // Check if this is a GDMA while HDMA is active (cancel case, not GDMA!)
                     if (hdma_active) {
-                        // Cancel: write $80 stops transfer; HDMA5 shows remaining | $80 → but bit7=1 means stopped
+                        // Per Pan Docs: writing bit7=0 to FF55 while HDMA is active cancels the HDMA
+                        // Do NOT run a GDMA here!
                         hdma_active = false;
-                        RAM[0xFF55] = (byte)(hdma_remaining | 0x80);
+                        RAM[0xFF55] = (byte)(hdma_remaining | 0x80); // bit7=1 means stopped
                     } else {
-                        // Start new HDMA transfer; transfer one block per H-Blank.
-                        // Latch the current VRAM bank so that H-Blank blocks always go to
-                        // the bank that was active when the game armed the transfer, even if
-                        // the CPU switches VBK before the first H-Blank fires.
-                        hdma_active    = true;
-                        hdma_remaining = (byte)(data & 0x7F);
-                        hdma_src       = src;
-                        hdma_dst       = dst;
-                        hdma_vbk       = cgb_vram_bank;
-                        RAM[0xFF55]    = (byte)(hdma_remaining); // bit7=0 = active
+                        // GDMA: transfer all bytes immediately
+                        int len = blocks * 16;
+                        for (int i = 0; i < len; i++) {
+                            byte b = mem_read((src + (uint16_t)i) & 0xFFFF);
+                            // Destination wraps within VRAM ($8000-$9FFF = 8KB)
+                            uint16_t dst_addr = (uint16_t)(0x8000u + ((dst - 0x8000u + (uint16_t)i) & 0x1FFFu));
+                            gpu_write(dst_addr, b);
+                        }
+                        hdma_active    = false;
+                        RAM[0xFF55]    = 0xFF; // transfer complete
                     }
+                } else {
+                    // HDMA: start or restart (re-arm) transfer; one block per H-Blank.
+                    // Latch the current VRAM bank so that H-Blank blocks always go to
+                    // the bank that was active when the game armed the transfer, even if
+                    // the CPU switches VBK before the first H-Blank fires.
+                    hdma_active    = true;
+                    hdma_remaining = (byte)(data & 0x7F);
+                    hdma_src       = src;
+                    hdma_dst       = dst;
+                    hdma_vbk       = cgb_vram_bank;
+                    RAM[0xFF55]    = (byte)(hdma_remaining); // bit7=0 = active
                 }
             }
             break;
@@ -6136,6 +6144,7 @@ void pixels_init(void){
 bool frame_headless(void){
     static int frame_count = 0;
     frame_count++;
+    g_frame_count = frame_count;
 
     if (bailAfterBios && !inBios) {
 
@@ -6271,7 +6280,54 @@ void headless_main_impl(void) {
     }
 }
 
-/* ---- Save-state integration ---- */
+void gb_dump_state(void) {
+    fprintf(stderr, "[LCDC] = 0x%02X  [VBK] = %d  [LY] = %d  [SCX] = %d  [SCY] = %d\n",
+        RAM[0xFF40], cgb_vram_bank, RAM[0xFF44], RAM[0xFF43], RAM[0xFF42]);
+    // BG palettes
+    for (int p = 0; p < 8; p++) {
+        fprintf(stderr, "  bgpal%d:", p);
+        for (int c = 0; c < 4; c++) {
+            int idx = p * 8 + c * 2;
+            uint16_t rgb = (uint16_t)(cgb_bg_pal[idx] | ((uint16_t)cgb_bg_pal[idx+1] << 8));
+            fprintf(stderr, " [%d,%d,%d]", (rgb&0x1F)*8, ((rgb>>5)&0x1F)*8, ((rgb>>10)&0x1F)*8);
+        }
+        fprintf(stderr, "\n");
+    }
+    // Tilemap all 18 visible rows + 9C00 map
+    fprintf(stderr, "[VRAM0-MAP 0x9800] all 18 rows:\n");
+    for (int row = 0; row < 18; row++) {
+        fprintf(stderr, "  r%02d:", row);
+        for (int col = 0; col < 32; col++) fprintf(stderr, " %02X", VRAM[0x1800 + row*32 + col]);
+        fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "[VRAM1-ATTR 0x9800] all 18 rows:\n");
+    for (int row = 0; row < 18; row++) {
+        fprintf(stderr, "  r%02d:", row);
+        for (int col = 0; col < 32; col++) fprintf(stderr, " %02X", VRAM1[0x1800 + row*32 + col]);
+        fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "[SCX=%d SCY=%d] → visible region starts at tile row=%d col=%d\n",
+        RAM[0xFF43], RAM[0xFF42], RAM[0xFF42]/8, RAM[0xFF43]/8);
+    // Also dump 9C00 tilemap first row
+    fprintf(stderr, "[VRAM0-MAP 0x9C00 first row]:");
+    for (int i = 0; i < 32; i++) fprintf(stderr, " %02X", VRAM[0x1C00+i]);
+    fprintf(stderr, "\n");
+    // Tile 0x58 in both addressing modes
+    fprintf(stderr, "[tile0x57] VRAM0[0x1570]: ");
+    for (int i = 0; i < 16; i++) fprintf(stderr, "%02X ", VRAM[0x1570+i]);
+    fprintf(stderr, "\n[tile0x58] VRAM0[0x1580]: ");
+    for (int i = 0; i < 16; i++) fprintf(stderr, "%02X ", VRAM[0x1580+i]);
+    fprintf(stderr, "\n[tile0x58] VRAM1[0x1580] (VRAM1 tile 0x58 signed): ");
+    for (int i = 0; i < 16; i++) fprintf(stderr, "%02X ", VRAM1[0x1580+i]);
+    // Tile 0 in signed mode = 0x9000 = VRAM offset 0x1000
+    fprintf(stderr, "\n[tile00-signed] VRAM0[0x1000]: ");
+    for (int i = 0; i < 16; i++) fprintf(stderr, "%02X ", VRAM[0x1000+i]);
+    fprintf(stderr, "\n[tile00-signed] VRAM1[0x1000]: ");
+    for (int i = 0; i < 16; i++) fprintf(stderr, "%02X ", VRAM1[0x1000+i]);
+    fprintf(stderr, "\n");
+}
+
+
 #include "savestate.h"
 
 /* Accessors/mutators for static variables needed by savestate.c */
